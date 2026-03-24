@@ -918,6 +918,20 @@ def _deconvolve_deconwolf(
         cmd += [img_path, psf_path]
         logger.info("dw command: %s", " ".join(cmd))
         proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        # Fallback: if --gpu failed due to OpenCL, retry without it
+        if proc.returncode != 0 and gpu and (
+            "cl_util.c" in proc.stderr or proc.returncode < 0
+        ):
+            logger.warning(
+                "dw --gpu failed (OpenCL/signal error, rc=%d), "
+                "retrying without --gpu",
+                proc.returncode,
+            )
+            cmd = [c for c in cmd if c != "--gpu"]
+            logger.info("dw command (cpu fallback): %s", " ".join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+
         if proc.returncode != 0:
             raise RuntimeError(f"dw failed (rc={proc.returncode}): {proc.stderr}")
 

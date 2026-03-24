@@ -5,6 +5,9 @@ services:
     volumes:
       - ./data:/app/data:ro
       - ./output:/app/output
+    # Expose all NVIDIA driver capabilities (compute + OpenCL + utility)
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=all
     # NVIDIA GPU access
     deploy:
       resources:

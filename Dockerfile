@@ -36,12 +36,18 @@ FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
 
 # --- Runtime system packages ---
+# pocl-opencl-icd: CPU OpenCL backend for deconwolf SHB
+#   (WSL2 NVIDIA driver does not provide libnvidia-opencl.so.1)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless \
         libfftw3-3 libgsl27 libtiff5 libpng16-16 \
-        ocl-icd-libopencl1 \
+        ocl-icd-libopencl1 pocl-opencl-icd \
         wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# --- Register NVIDIA OpenCL ICD (driver is mounted by nvidia-container-toolkit) ---
+RUN mkdir -p /etc/OpenCL/vendors \
+    && echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
 
 # --- Install Miniforge (conda-forge only, no Anaconda ToS) ---
 RUN wget -q -O /tmp/miniforge.sh \
@@ -64,8 +70,11 @@ ENV CONDA_DEFAULT_ENV=deconv
 # --- Copy deconwolf binaries and libraries from builder ---
 COPY --from=builder /usr/local/bin/dw /usr/local/bin/dw
 COPY --from=builder /usr/local/bin/dw_bw /usr/local/bin/dw_bw
-COPY --from=builder /usr/local/lib/libtrafo* /usr/local/lib/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libtrafo.so /usr/lib/x86_64-linux-gnu/libtrafo.so
 RUN ldconfig
+
+# --- Create VkFFT kernel cache directory for deconwolf ---
+RUN mkdir -p /root/.config/deconwolf
 
 # --- Download ImageJ JAR (required by DeconvolutionLab2) ---
 RUN mkdir -p /app/bin \
@@ -95,5 +104,9 @@ RUN mkdir -p /root/.m2/repository/net/imagej/ij/1.51h \
 
 # Volumes for data (input) and output (results)
 VOLUME ["/app/data", "/app/output"]
+
+# Expose all NVIDIA driver capabilities so OpenCL libraries are mounted
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
 
 CMD ["python", "benchmark.py"]
