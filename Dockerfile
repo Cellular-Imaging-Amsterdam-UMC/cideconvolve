@@ -61,9 +61,11 @@ RUN conda create -n deconv python=3.11 -y \
 ENV PATH="/opt/conda/envs/deconv/bin:${PATH}"
 ENV CONDA_DEFAULT_ENV=deconv
 
-# --- Copy deconwolf binaries from builder ---
+# --- Copy deconwolf binaries and libraries from builder ---
 COPY --from=builder /usr/local/bin/dw /usr/local/bin/dw
 COPY --from=builder /usr/local/bin/dw_bw /usr/local/bin/dw_bw
+COPY --from=builder /usr/local/lib/libtrafo* /usr/local/lib/
+RUN ldconfig
 
 # --- Download ImageJ JAR (required by DeconvolutionLab2) ---
 RUN mkdir -p /app/bin \
