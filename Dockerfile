@@ -1,10 +1,15 @@
 # ===========================================================================
-# CIDeconvolve Benchmark — GPU-enabled Docker image
+# CIDeconvolve — BIAFLOWS-compatible GPU-enabled Docker image
 # ===========================================================================
 # Base: NVIDIA CUDA 12.6 devel (needed for OpenCL headers to build deconwolf
 #        with GPU support and for redlionfish OpenCL runtime).
 # Includes: Python 3.11, Java 17 (for DeconvolutionLab2), deconwolf (built
 #           from source), and all Python dependencies.
+#
+# BIAFLOWS convention: images in /data/in, results in /data/out,
+# ground truth in /data/gt.  The entrypoint is wrapper.py which
+# parses --infolder / --outfolder / --gtfolder and descriptor.json
+# parameters, then delegates to cidecon.py.
 # ===========================================================================
 
 FROM nvidia/cuda:12.6.0-devel-ubuntu22.04 AS builder
@@ -36,8 +41,6 @@ FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
 
 # --- Runtime system packages ---
-# pocl-opencl-icd: CPU OpenCL backend for deconwolf SHB
-#   (WSL2 NVIDIA driver does not provide libnvidia-opencl.so.1)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless \
         libfftw3-3 libgsl27 libtiff5 libpng16-16 \
@@ -45,7 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Register NVIDIA OpenCL ICD (driver is mounted by nvidia-container-toolkit) ---
+# --- Register NVIDIA OpenCL ICD ---
 RUN mkdir -p /etc/OpenCL/vendors \
     && echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
 
@@ -63,7 +66,6 @@ RUN conda create -n deconv python=3.11 -y \
     && conda install -n deconv -c conda-forge pycudadecon=0.5.1 -y \
     && conda clean -afy
 
-# Activate the conda env for all subsequent RUN commands
 ENV PATH="/opt/conda/envs/deconv/bin:${PATH}"
 ENV CONDA_DEFAULT_ENV=deconv
 
@@ -94,19 +96,20 @@ RUN pip install --no-cache-dir --upgrade pip \
 # --- Application code ---
 COPY vendor/ /app/vendor/
 COPY deconvolve.py /app/deconvolve.py
-COPY benchmark.py /app/benchmark.py
+COPY cidecon.py /app/cidecon.py
+COPY bioflows_local.py /app/bioflows_local.py
+COPY wrapper.py /app/wrapper.py
+COPY descriptor.json /app/descriptor.json
 
-# --- Set ImageJ JAR path for deconvolve.py (it checks ~/.m2 by default) ---
-# We place ij JAR in /app/bin/ alongside DL2 JAR. deconvolve.py resolves
-# _IJ_JAR via $HOME/.m2/...; create a symlink so it's found.
+# --- Set ImageJ JAR path for deconvolve.py ---
 RUN mkdir -p /root/.m2/repository/net/imagej/ij/1.51h \
     && ln -s /app/bin/ij-1.51h.jar /root/.m2/repository/net/imagej/ij/1.51h/ij-1.51h.jar
 
-# Volumes for data (input) and output (results)
-VOLUME ["/app/data", "/app/output"]
+# --- BIAFLOWS data directories ---
+RUN mkdir -p /data/in /data/out /data/gt
 
 # Expose all NVIDIA driver capabilities so OpenCL libraries are mounted
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
-CMD ["python", "benchmark.py"]
+ENTRYPOINT ["python", "/app/wrapper.py"]

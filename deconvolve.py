@@ -1722,6 +1722,57 @@ def save_result(
     resolution_unit = 1  # No standard unit in basic TIFF; OME handles it
 
     if not mip_only:
+        # Build rich OME metadata from the result metadata dict
+        channel_names = metadata.get("channel_names") or [
+            f"Ch{i}" for i in range(len(channels_data))
+        ]
+        # Ensure we have enough names for all channels
+        while len(channel_names) < len(channels_data):
+            channel_names.append(f"Ch{len(channel_names)}")
+
+        ome_meta: dict[str, Any] = {
+            "axes": axes,
+            "PhysicalSizeX": px_x,
+            "PhysicalSizeY": px_y,
+            "PhysicalSizeZ": px_z,
+            "PhysicalSizeXUnit": "µm",
+            "PhysicalSizeYUnit": "µm",
+            "PhysicalSizeZUnit": "µm",
+            "Channel": {"Name": channel_names[:len(channels_data)]},
+        }
+
+        # Add per-channel emission/excitation wavelengths if available
+        ch_info = metadata.get("channels", [])
+        if ch_info:
+            em_wavelengths = []
+            ex_wavelengths = []
+            for i, ch in enumerate(ch_info[:len(channels_data)]):
+                em = ch.get("emission_wavelength")
+                ex = ch.get("excitation_wavelength")
+                if em is not None:
+                    em_wavelengths.append(float(em))
+                if ex is not None:
+                    ex_wavelengths.append(float(ex))
+            if em_wavelengths:
+                ome_meta["Channel"]["EmissionWavelength"] = em_wavelengths
+            if ex_wavelengths:
+                ome_meta["Channel"]["ExcitationWavelength"] = ex_wavelengths
+
+        # Add objective / instrument metadata as OME Description
+        desc_parts = []
+        if metadata.get("na") is not None:
+            desc_parts.append(f"NA={metadata['na']}")
+        if metadata.get("refractive_index") is not None:
+            desc_parts.append(f"RI={metadata['refractive_index']}")
+        if metadata.get("microscope_type"):
+            desc_parts.append(f"Microscope={metadata['microscope_type']}")
+        if metadata.get("magnification") is not None:
+            desc_parts.append(f"Magnification={metadata['magnification']}x")
+        if metadata.get("immersion"):
+            desc_parts.append(f"Immersion={metadata['immersion']}")
+        if desc_parts:
+            ome_meta["Description"] = "; ".join(desc_parts)
+
         tifffile.imwrite(
             str(output_path),
             stack.astype(np.float32),
@@ -1730,20 +1781,7 @@ def save_result(
             compression="zlib" if compress else None,
             resolution=resolution,
             resolutionunit=resolution_unit,
-            metadata={
-                "axes": axes,
-                "PhysicalSizeX": px_x,
-                "PhysicalSizeY": px_y,
-                "PhysicalSizeZ": px_z,
-                "PhysicalSizeXUnit": "µm",
-                "PhysicalSizeYUnit": "µm",
-                "PhysicalSizeZUnit": "µm",
-                "Channel": {
-                    "Name": [
-                        f"Ch{i}" for i in range(len(channels_data))
-                    ]
-                },
-            },
+            metadata=ome_meta,
         )
         logger.info("Saved deconvolved result to %s", output_path)
 

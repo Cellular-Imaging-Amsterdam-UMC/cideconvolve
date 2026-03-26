@@ -1,0 +1,107 @@
+{
+  "name": "W_CIDeconvolve",
+  "description": "3D Richardson-Lucy deconvolution for widefield and confocal microscopy images with multiple algorithm backends (sdeconv, pycudadecon, deconwolf, DeconvolutionLab2, redlionfish, scikit-image). Supports GPU acceleration via CUDA and OpenCL.",
+  "container-image": {
+    "image": "cellularimagingcf/w_cideconvolve",
+    "type": "singularity"
+  },
+  "command-line": "python wrapper.py --iterations @iterations --blocks @blocks --method @method --device @device --benchmark @benchmark --projection @projection --psf @psf",
+  "inputs": [
+    {
+      "id": "iterations",
+      "value-key": "@iterations",
+      "command-line-flag": "--iterations",
+      "name": "RL iterations",
+      "description": "Number of Richardson-Lucy iterations to run",
+      "default-value": 40,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "integer": true,
+      "minimum": 1,
+      "maximum": 500
+    },
+    {
+      "id": "blocks",
+      "value-key": "@blocks",
+      "command-line-flag": "--blocks",
+      "name": "Tile blocks",
+      "description": "Block tiling mode. 'auto': calculate minimum blocks so each tile fits in memory. 0 or 1: no tiling. >1: explicit block count.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "method",
+      "value-key": "@method",
+      "command-line-flag": "--method",
+      "name": "Deconvolution method",
+      "description": "Which deconvolution backend to use.",
+      "default-value": "sdeconv_rl",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": [
+        "sdeconv_rl",
+        "sdeconv_wiener",
+        "sdeconv_spitfire",
+        "pycudadecon_rl_cuda",
+        "deconwolf_rl",
+        "deconwolf_shb",
+        "deconvlab2_rl",
+        "deconvlab2_rltv",
+        "redlionfish_rl",
+        "skimage_rl",
+        "skimage_cucim_rl"
+      ]
+    },
+    {
+      "id": "device",
+      "value-key": "@device",
+      "command-line-flag": "--device",
+      "name": "Compute device",
+      "description": "Force compute device for sdeconv/deconwolf/redlionfish backends. 'auto' uses CUDA if available, otherwise CPU.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": ["auto", "cpu", "cuda"]
+    },
+    {
+      "id": "benchmark",
+      "value-key": "@benchmark",
+      "command-line-flag": "--benchmark",
+      "name": "Benchmark mode",
+      "description": "If true, centre-crop the image to tile-size limits and only save montage images.",
+      "default-value": false,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
+      "id": "projection",
+      "value-key": "@projection",
+      "command-line-flag": "--projection",
+      "name": "Z-projection",
+      "description": "Output a 2D Z-projection instead of the full 3D stack. 'mip': maximum intensity projection, 'sum': sum projection (converted to float32 if needed), 'none': keep full 3D stack. Ignored for 2D input images.",
+      "default-value": "none",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": ["none", "mip", "sum"]
+    },
+    {
+      "id": "psf",
+      "value-key": "@psf",
+      "command-line-flag": "--psf",
+      "name": "Save PSF",
+      "description": "If true, save PSF montage PNG (XY and XZ MIP) in the output folder.",
+      "default-value": false,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Boolean"
+    }
+  ],
+  "schema-version": "cytomine-0.1"
+}
