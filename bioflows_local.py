@@ -181,6 +181,16 @@ def _collect_images(directory: Path, suffixes: Optional[Sequence[str]]) -> List[
         return []
     records: List[ImageResource] = []
     for entry in sorted(directory.iterdir()):
+        # OME-Zarr stores are directories ending in .zarr
+        if entry.is_dir() and entry.suffix.lower() == ".zarr":
+            records.append(
+                ImageResource(
+                    filename=entry.name,
+                    filename_original=entry.name,
+                    filepath=entry,
+                )
+            )
+            continue
         if not entry.is_file():
             continue
         if suffixes and entry.suffix.lower() not in suffixes:

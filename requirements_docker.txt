@@ -20,9 +20,10 @@ scipy==1.15.3
 Pillow==10.4.0
 scikit-image==0.24.0
 
-# OME-TIFF reading
+# OME-TIFF and OME-Zarr reading
 bioio==3.2.0
 bioio-ome-tiff==1.4.0
+bioio-ome-zarr==3.3.0
 
 # PSF generation (vendored sdeconv & psf_generator use these)
 zernikepy==0.0.5

@@ -286,11 +286,35 @@ def load_image(
     if companion_path is not None:
         meta = _parse_ome_xml(companion_path)
 
+    # OME-Zarr stores are directories — handle separately
+    _is_zarr = path.is_dir() and path.suffix.lower() == ".zarr"
+
     # Read image data via bioio or tifffile
     try:
         from bioio import BioImage
 
-        if companion_path is not None and path.suffix == ".ome":
+        if _is_zarr:
+            import bioio_ome_zarr
+            img = BioImage(path, reader=bioio_ome_zarr.Reader)
+            # If there are multiple images (scenes) take only the first
+            if len(img.scenes) > 1:
+                logger.info(
+                    "OME-Zarr contains %d images (scenes); using first: %s",
+                    len(img.scenes), img.scenes[0],
+                )
+                img.set_scene(img.scenes[0])
+            bioio_meta = _extract_bioio_metadata(img)
+            for k, v in bioio_meta.items():
+                if k not in meta or meta[k] is None:
+                    meta[k] = v
+            for c in range(img.dims.C):
+                if img.dims.Z > 1:
+                    channel_data = img.get_image_data("ZYX", T=0, C=c)
+                else:
+                    channel_data = img.get_image_data("YX", T=0, C=c)
+                images.append(np.asarray(channel_data, dtype=np.float32))
+
+        elif companion_path is not None and path.suffix == ".ome":
             # Find the associated TIFF files from the companion
             tiff_files = sorted(path.parent.glob("*.ome.tiff")) + sorted(
                 path.parent.glob("*.ome.tif")
@@ -337,6 +361,11 @@ def load_image(
                 images.append(np.asarray(channel_data, dtype=np.float32))
 
     except ImportError:
+        if _is_zarr:
+            raise ImportError(
+                "bioio-ome-zarr is required to read OME-Zarr files. "
+                "Install with: pip install bioio-ome-zarr"
+            )
         logger.warning("bioio not available, falling back to tifffile")
         if companion_path is not None and path.suffix == ".ome":
             tiff_files = sorted(path.parent.glob("*.ome.tiff")) + sorted(
@@ -410,7 +439,7 @@ def load_image(
         _em_defaulted = True
     # Fill in missing emission wavelengths with a default
     for ch in meta["channels"]:
-        if "emission_wavelength" not in ch:
+        if ch.get("emission_wavelength") is None:
             ch["emission_wavelength"] = 520.0
             _em_defaulted = True
     if _em_defaulted:
@@ -601,6 +630,7 @@ METHODS = {
     "deconvlab2_rltv": {"memory_factor": 4, "description": "DeconvolutionLab2 RL-Total Variation (CLI)"},
     "redlionfish_rl": {"memory_factor": 4, "description": "RedLionfish RL (OpenCL GPU + CPU fallback)"},
     "skimage_rl": {"memory_factor": 4, "description": "scikit-image Richardson-Lucy (CPU)"},
+    "skimage_unsupervised_wiener": {"memory_factor": 3, "description": "scikit-image Unsupervised Wiener-Hunt (CPU)"},
     "skimage_cucim_rl": {"memory_factor": 4, "description": "cuCIM Richardson-Lucy (CUDA GPU)"},
 }
 
@@ -1016,6 +1046,9 @@ def deconvolve(
 
     if method == "skimage_rl":
         return _deconvolve_skimage_rl(image, psf, niter=niter)
+
+    if method == "skimage_unsupervised_wiener":
+        return _deconvolve_skimage_unsupervised_wiener(image, psf, niter=niter)
 
     if method == "skimage_cucim_rl":
         return _deconvolve_cucim_rl(image, psf, niter=niter)
@@ -1440,6 +1473,50 @@ def _deconvolve_skimage_rl(
     return np.clip(result.astype(np.float32), 0, None)
 
 
+def _deconvolve_skimage_unsupervised_wiener(
+    image: np.ndarray,
+    psf: np.ndarray,
+    niter: int = 30,
+) -> np.ndarray:
+    """Deconvolve using scikit-image Unsupervised Wiener-Hunt (CPU).
+
+    The algorithm is 2-D only, so 3-D stacks are processed plane-by-plane.
+    Hyperparameters (noise and prior precision) are estimated automatically
+    via Gibbs sampling.
+    """
+    from skimage.restoration import unsupervised_wiener
+
+    user_params = {"max_num_iter": niter}
+
+    def _wiener_2d(plane: np.ndarray) -> np.ndarray:
+        # Normalise to [0, 1] for skimage pipeline compatibility
+        lo, hi = plane.min(), plane.max()
+        if hi > lo:
+            plane_norm = (plane - lo) / (hi - lo)
+        else:
+            plane_norm = np.zeros_like(plane)
+        result, _ = unsupervised_wiener(
+            plane_norm.astype(np.float64),
+            psf_2d.astype(np.float64),
+            user_params=user_params,
+            clip=False,
+        )
+        # Rescale back
+        result = result.astype(np.float32) * (hi - lo) + lo
+        return np.clip(result, 0, None)
+
+    if image.ndim == 2:
+        psf_2d = psf if psf.ndim == 2 else psf[psf.shape[0] // 2]
+        return _wiener_2d(image)
+
+    # 3-D: process each Z plane with the central PSF slice
+    psf_2d = psf[psf.shape[0] // 2] if psf.ndim == 3 else psf
+    result = np.empty_like(image, dtype=np.float32)
+    for z in range(image.shape[0]):
+        result[z] = _wiener_2d(image[z])
+    return result
+
+
 def _deconvolve_cucim_rl(
     image: np.ndarray,
     psf: np.ndarray,
@@ -1700,6 +1777,21 @@ def save_mip_png(
     if channel_indices is None:
         channel_indices = list(range(n_ch))
 
+    # Resolve colours for each channel; if they are all identical fall back
+    # to a Blue-Green-Red-Cyan-Yellow-Magenta cycle so channels are
+    # distinguishable.
+    _BGRCYM = [
+        (0, 0, 255),      # Blue
+        (0, 255, 0),      # Green
+        (255, 0, 0),      # Red
+        (0, 255, 255),    # Cyan
+        (255, 255, 0),    # Yellow
+        (255, 0, 255),    # Magenta
+    ]
+    colors = [_channel_color(metadata, channel_indices[i]) for i in range(n_ch)]
+    if n_ch > 1 and len(set(colors)) == 1:
+        colors = [_BGRCYM[i % len(_BGRCYM)] for i in range(n_ch)]
+
     # Build RGB canvas by additive blending of coloured channels
     canvas = np.zeros((h, w, 3), dtype=np.float64)
     for i in range(n_ch):
@@ -1709,7 +1801,7 @@ def save_mip_png(
             ch_img = (ch_img - lo) / (hi - lo)
         else:
             ch_img = np.zeros_like(ch_img)
-        rgb = _channel_color(metadata, channel_indices[i])
+        rgb = colors[i]
         for c_idx in range(3):
             canvas[:, :, c_idx] += ch_img * (rgb[c_idx] / 255.0)
 

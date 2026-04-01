@@ -138,7 +138,8 @@ def _method_device(method: str) -> str:
         "pycudadecon_rl_cuda", "skimage_cucim_rl",
     }
     _CPU_METHODS = {
-        "skimage_rl", "deconvlab2_rl", "deconvlab2_rltv",
+        "skimage_rl", "skimage_unsupervised_wiener",
+        "deconvlab2_rl", "deconvlab2_rltv",
         "deconwolf_rl", "deconwolf_shb",
     }
     if method in _GPU_METHODS:
@@ -452,7 +453,7 @@ def main(argv):
         max_tile_z = int(_lim_parts[1]) if len(_lim_parts) >= 2 else MAX_TILE_Z
 
         print("=" * 70)
-        print("CIDeconvolve — BIAFLOWS Workflow")
+        print("CIDeconvolve - BIAFLOWS Workflow")
         print("=" * 70)
         print(f"  Input dir    : {bj.input_dir}")
         print(f"  Output dir   : {bj.output_dir}")
@@ -468,11 +469,11 @@ def main(argv):
         if na_override is not None:
             print(f"  NA           : {na_override}")
         if ri_override is not None:
-            print(f"  Immersion    : {ri_raw} → RI {ri_override}")
+            print(f"  Immersion    : {ri_raw} -> RI {ri_override}")
         if sample_ri_parsed is not None:
-            print(f"  Sample medium: {sample_ri_raw} → RI {sample_ri}")
+            print(f"  Sample medium: {sample_ri_raw} -> RI {sample_ri}")
         else:
-            print(f"  Sample medium: auto → vectashield (RI {sample_ri})")
+            print(f"  Sample medium: auto -> vectashield (RI {sample_ri})")
         if micro_override is not None:
             print(f"  Microscope   : {micro_override}")
         if em_override is not None:
@@ -504,9 +505,9 @@ def main(argv):
 
         for img_resource in in_imgs:
             img_path = Path(in_path) / img_resource.filename
-            print(f"\n{'─' * 60}")
+            print(f"\n{'=' * 60}")
             print(f"Processing: {img_resource.filename}")
-            print(f"{'─' * 60}")
+            print(f"{'=' * 60}")
 
             t0 = time.time()
 
@@ -546,12 +547,12 @@ def main(argv):
                     for png in tmp_work.glob("decon_benchmark_*.png"):
                         dest = Path(out_path) / png.name
                         shutil.move(str(png), str(dest))
-                        print(f"  → {dest.name}")
+                        print(f"  -> {dest.name}")
                     # Move metrics CSV from tmp to output
                     for csvf in tmp_work.glob("benchmark_metrics_*.csv"):
                         dest = Path(out_path) / csvf.name
                         shutil.move(str(csvf), str(dest))
-                        print(f"  → {dest.name}")
+                        print(f"  -> {dest.name}")
                 else:
                     # ----- Normal single-method path -----
                     result = deconvolve_image(
@@ -638,8 +639,10 @@ def main(argv):
 def _stem(filename: str) -> str:
     """Derive a clean output stem from an image filename."""
     stem = Path(filename).stem
-    if stem.lower().endswith(".ome"):
-        stem = stem[:-4]
+    # Strip layered suffixes: .ome.tiff.zarr → .ome.tiff → .ome → clean
+    for ext in (".tiff", ".tif", ".ome"):
+        if stem.lower().endswith(ext):
+            stem = stem[: -len(ext)]
     return stem
 
 
@@ -819,12 +822,6 @@ def _make_benchmark_montage(
     meta_x = cell_w + padding
     meta_y = padding
     montage.paste(meta_panel, (meta_x, meta_y))
-    meta_label = "PSF Parameters"
-    bbox = draw.textbbox((0, 0), meta_label, font=font)
-    tw = bbox[2] - bbox[0]
-    tx = meta_x + (meta_w - tw) // 2
-    ty = meta_y + max_h + padding
-    draw.text((tx, ty), meta_label, fill=(255, 255, 255), font=font)
 
     montage_path = out_dir / f"decon_benchmark_{stem}.png"
     montage.save(str(montage_path))
@@ -979,12 +976,6 @@ def _make_per_channel_montages(
         meta_x = cell_w + padding
         meta_y = padding
         montage.paste(meta_panel, (meta_x, meta_y))
-        meta_label = "PSF Parameters"
-        bbox = draw.textbbox((0, 0), meta_label, font=font)
-        tw = bbox[2] - bbox[0]
-        tx = meta_x + (meta_w - tw) // 2
-        ty = meta_y + max_h + padding
-        draw.text((tx, ty), meta_label, fill=(255, 255, 255), font=font)
 
         ch_path = out_dir / f"decon_benchmark_{stem}_ch{ch_idx}.png"
         montage.save(str(ch_path))
@@ -1010,7 +1001,7 @@ def _write_metrics_csv(csv_path: Path, all_metrics: dict[str, dict]):
             for k in fieldnames[2:]:
                 row[k] = f"{m[k]:.2f}"
             writer.writerow(row)
-    print(f"\n  Metrics CSV saved → {csv_path}")
+    print(f"\n  Metrics CSV saved -> {csv_path}")
 
 
 def _run_benchmark(
@@ -1098,7 +1089,7 @@ def _run_benchmark(
                 y0, x0 = (H - ny) // 2, (W - nx) // 2
                 img = img[y0:y0+ny, x0:x0+nx]
             cropped.append(img)
-        print(f"  Benchmark crop: {images[0].shape} → {cropped[0].shape}")
+        print(f"  Benchmark crop: {images[0].shape} -> {cropped[0].shape}")
 
         # Write cropped OME-TIFF with full metadata
         stack = np.stack(cropped, axis=0)
@@ -1123,18 +1114,22 @@ def _run_benchmark(
                 "PhysicalSizeYUnit": "µm",
                 "PhysicalSizeZUnit": "µm",
                 "Channel": {
-                    "Name": [
-                        ch.get("name", f"Ch{i}")
-                        for i, ch in enumerate(meta.get("channels", []))
-                    ],
-                    "EmissionWavelength": [
-                        ch.get("emission_wavelength")
-                        for ch in meta.get("channels", [])
-                    ],
-                    "ExcitationWavelength": [
-                        ch.get("excitation_wavelength")
-                        for ch in meta.get("channels", [])
-                    ],
+                    k: v
+                    for k, v in {
+                        "Name": [
+                            ch.get("name", f"Ch{i}")
+                            for i, ch in enumerate(meta.get("channels", []))
+                        ],
+                        "EmissionWavelength": [
+                            ch.get("emission_wavelength")
+                            for ch in meta.get("channels", [])
+                        ] if all(ch.get("emission_wavelength") is not None for ch in meta.get("channels", [])) else None,
+                        "ExcitationWavelength": [
+                            ch.get("excitation_wavelength")
+                            for ch in meta.get("channels", [])
+                        ] if all(ch.get("excitation_wavelength") is not None for ch in meta.get("channels", [])) else None,
+                    }.items()
+                    if v is not None
                 },
             },
         )
@@ -1173,17 +1168,17 @@ def _run_benchmark(
             print(f"  Skipping {m}: {reason}")
 
     if not available_methods:
-        print("  No benchmark methods available — skipping.")
+        print("  No benchmark methods available -- skipping.")
         return
 
-    print(f"\n  Benchmarking {len(available_methods)} method(s) × "
+    print(f"\n  Benchmarking {len(available_methods)} method(s) x "
           f"{len(bench_iterations)} iteration count(s)")
 
     # --- Run all method × iteration combinations ---
     for m in available_methods:
         for nit in bench_iterations:
             label = f"{m}_{nit}i"
-            print(f"\n  ── {m}, {nit} iterations ──")
+            print(f"\n  -- {m}, {nit} iterations --")
             try:
                 # sdeconv methods: pick CUDA if available, otherwise CPU
                 if m.startswith("sdeconv_"):
@@ -1205,9 +1200,9 @@ def _run_benchmark(
                     all_metrics[key] = metrics
                     gpu_d = metrics['torch_gpu_delta_mb']
                     print(f"    {dev_val}: {metrics['time_s']:.1f}s"
-                          f"  RAM Δ{_format_bytes(metrics['ram_delta_peak_mb'])}"
-                          f"  Alloc Δ{_format_bytes(gpu_d)}"
-                          f" → {out_name}")
+                          f"  RAM d{_format_bytes(metrics['ram_delta_peak_mb'])}"
+                          f"  Alloc d{_format_bytes(gpu_d)}"
+                          f" -> {out_name}")
                     del result
                 else:
                     monitor = _MetricsMonitor()
@@ -1224,9 +1219,9 @@ def _run_benchmark(
                     metrics["device"] = _method_device(m)
                     all_metrics[label] = metrics
                     print(f"    {metrics['time_s']:.1f}s"
-                          f"  RAM Δ{_format_bytes(metrics['ram_delta_peak_mb'])}"
-                          f"  Alloc Δ{_format_bytes(metrics['gpu_mem_delta_peak_mb'])}"
-                          f" → {out_name}")
+                          f"  RAM d{_format_bytes(metrics['ram_delta_peak_mb'])}"
+                          f"  Alloc d{_format_bytes(metrics['gpu_mem_delta_peak_mb'])}"
+                          f" -> {out_name}")
                     del result
 
                 gc.collect()
