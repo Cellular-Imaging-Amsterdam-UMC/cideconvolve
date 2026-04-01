@@ -42,6 +42,15 @@ DEFAULT_SUFFIXES = (
 )
 
 
+def _str_to_bool(value: str) -> bool:
+    """Convert a string to a boolean for argparse."""
+    if value.lower() in ("true", "1", "yes"):
+        return True
+    if value.lower() in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{value}'")
+
+
 def _load_descriptor_inputs() -> List[dict]:
     """Return parameter definitions declared in descriptor.json if available."""
     descriptor_path = Path(__file__).with_name("descriptor.json")
@@ -248,12 +257,11 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         kwargs = {"default": default, "help": inp.get("description", "")}
 
         if param_type == "Boolean":
-            if default is True:
-                kwargs["action"] = "store_false"
-                flag = f"--no-{param_id.replace('_', '-')}"
-            else:
-                kwargs["action"] = "store_true"
-            kwargs.pop("default", None)
+            kwargs["nargs"] = "?"
+            kwargs["const"] = True
+            kwargs["default"] = bool(default) if default is not None else False
+            kwargs["type"] = _str_to_bool
+            kwargs["metavar"] = "BOOL"
         elif param_type == "Number":
             is_int = inp.get("integer", False)
             kwargs["type"] = int if is_int else float

@@ -103,6 +103,15 @@ _SAMPLE_RI = {
 _SAMPLE_RI_DEFAULT = 1.45  # Vectashield
 
 
+def _to_bool(value) -> bool:
+    """Convert a value to bool, handling string 'True'/'False' from CLI."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
 def _parse_ri_choice(raw: str, lookup: dict[str, float]) -> float | None:
     """Parse a RI choice string like 'oil (1.515)' or a bare float.
 
@@ -430,17 +439,17 @@ def main(argv):
             else [float(x.strip()) for x in ex_raw.split(",") if x.strip()]
         ) or None
 
-        benchmark_mode = bool(getattr(parameters, "benchmark", False))
+        benchmark_mode = _to_bool(getattr(parameters, "benchmark", False))
         projection = str(getattr(parameters, "projection", "none")).lower()
-        save_psf = bool(getattr(parameters, "psf", False))
+        save_psf = _to_bool(getattr(parameters, "psf", False))
 
         # Benchmark-specific parameters
         bench_iter_raw = str(getattr(parameters, "bench_iterations", "20, 40, 60"))
         bench_iterations = [int(x.strip()) for x in bench_iter_raw.split(",") if x.strip()]
         bench_methods_key = str(getattr(parameters, "bench_methods", "fast")).lower()
         bench_methods = BENCH_METHOD_SETS.get(bench_methods_key, _BENCH_BASE)
-        bench_crop = bool(getattr(parameters, "bench_crop", True))
-        bench_one_image = bool(getattr(parameters, "bench_one_image", True))
+        bench_crop = _to_bool(getattr(parameters, "bench_crop", True))
+        bench_one_image = _to_bool(getattr(parameters, "bench_one_image", True))
 
         # Parse tiling
         tiling = str(tiling_raw).strip().lower()
