@@ -65,9 +65,12 @@ _OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
 # ---------------------------------------------------------------------------
 
 _DECONVLAB2_JAR = Path(__file__).parent / "bin" / "DeconvolutionLab_2.jar"
-_IJ_JAR = Path(
-    os.environ.get("USERPROFILE") or os.environ.get("HOME") or ""
-) / ".m2" / "repository" / "net" / "imagej" / "ij" / "1.51h" / "ij-1.51h.jar"
+_IJ_JAR_CANDIDATES = [
+    Path(__file__).parent / "bin" / "ij-1.51h.jar",  # Docker: /app/bin/
+    Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or "")
+    / ".m2" / "repository" / "net" / "imagej" / "ij" / "1.51h" / "ij-1.51h.jar",
+]
+_IJ_JAR = next((p for p in _IJ_JAR_CANDIDATES if p.is_file()), _IJ_JAR_CANDIDATES[-1])
 _BIN_DIR = Path(__file__).parent / "bin"
 _DW_EXE = str(_BIN_DIR / "dw.exe") if (_BIN_DIR / "dw.exe").is_file() else (shutil.which("dw") or "")
 _DW_BW_EXE = str(_BIN_DIR / "dw_bw.exe") if (_BIN_DIR / "dw_bw.exe").is_file() else (shutil.which("dw_bw") or "")

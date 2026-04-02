@@ -1,9 +1,9 @@
 {
   "values": {
-    "iterations": 40,
+    "iterations": 20,
     "tiling": "custom",
     "tile_limits": "512, 64",
-    "method": "sdeconv_rl",
+    "method": "deconvlab2_rl",
     "device": "auto",
     "na": "auto",
     "refractive_index": "auto",
@@ -12,11 +12,12 @@
     "emission_wl": "auto",
     "excitation_wl": "auto",
     "projection": "none",
-    "benchmark": true,
-    "bench_iterations": "10, 20",
-    "bench_methods": "sdeconv_rl, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, redlionfish_rl",
+    "benchmark": false,
+    "bench_iterations": "20, 40, 60",
+    "bench_methods": "sdeconv_rl, pycudadecon_rl_cuda",
     "bench_crop": true,
-    "bench_one_image": true
+    "bench_one_image": true,
+    "log": false
   },
   "folders": {
     "infolder": "C:\\rahoebe\\Python\\CIDeconvolve\\infolder",
