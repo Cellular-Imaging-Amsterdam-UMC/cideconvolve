@@ -1,6 +1,6 @@
 {
   "values": {
-    "iterations": 20,
+    "iterations": 10,
     "tiling": "custom",
     "tile_limits": "512, 64",
     "method": "deconvlab2_rl",
