@@ -198,7 +198,7 @@ class LauncherWindow(QMainWindow):
         # -- Command preview --
         self.cmd_preview = QTextEdit()
         self.cmd_preview.setReadOnly(True)
-        self.cmd_preview.setMaximumHeight(104)
+        self.cmd_preview.setMaximumHeight(163)
         self.cmd_preview.setFont(QFont("Consolas", 9))
         self.cmd_preview.setStyleSheet("background: #1e1e1e; color: #dcdcdc;")
         layout.addWidget(QLabel("Command preview:"))
@@ -422,6 +422,11 @@ def main():
     app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = LauncherWindow()
     window.show()
+    screen = app.primaryScreen().availableGeometry()
+    window.move(
+        (screen.width() - window.frameGeometry().width()) // 2,
+        (screen.height() - window.frameGeometry().height()) // 2,
+    )
     app.exec()
 
 

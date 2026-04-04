@@ -472,9 +472,12 @@ def generate_psf(
 ) -> np.ndarray:
     """Generate a physically accurate PSF from microscopy metadata.
 
-    Uses psf_generator's propagation models. For high-NA objectives (>=0.9),
-    a vectorial model is used; otherwise scalar. For confocal microscopes,
-    the PSF intensity is squared (standard confocal approximation).
+    Uses the CI Richards-Wolf / Kirchhoff PSF model with correct
+    ``sqrt(cos θ)`` apodization and azimuthal averaging.  Vectorial
+    for NA ≥ 0.9, scalar otherwise.  Gibson-Lanni correction is
+    applied automatically when a refractive-index mismatch is detected.
+    Confocal PSFs multiply emission × excitation (or square the
+    emission PSF when no excitation wavelength is available).
 
     Parameters
     ----------
@@ -493,10 +496,7 @@ def generate_psf(
     numpy.ndarray
         Normalized PSF, shape (Z,Y,X) for 3D or (Y,X) for 2D. Sum = 1.
     """
-    from vendor.psf_generator import (
-        ScalarSphericalPropagator,
-        VectorialSphericalPropagator,
-    )
+    from deconvolve_ci import ci_generate_psf
 
     na = metadata["na"]
     ri = metadata["refractive_index"]
@@ -504,13 +504,14 @@ def generate_psf(
     pix_xy_um = metadata["pixel_size_x"]
     pix_z_um = metadata.get("pixel_size_z", 0.3)
     n_z = metadata.get("size_z", 1)
-    is_confocal = metadata.get("microscope_type", "widefield") == "confocal"
+    microscope_type = metadata.get("microscope_type", "widefield")
 
     # Channel wavelength
     ch = metadata["channels"][channel_idx]
     wavelength_nm = ch.get("emission_wavelength", 520.0)
+    excitation_nm = ch.get("excitation_wavelength")
 
-    # Convert units: psf_generator uses nm
+    # Convert units to nm
     pix_xy_nm = pix_xy_um * 1000.0
     pix_z_nm = pix_z_um * 1000.0
 
@@ -527,90 +528,25 @@ def generate_psf(
     # 3D vs 2D
     is_3d = n_z > 1
     n_defocus = max(2 * n_z - 1, 1) if is_3d else 1
-    defocus_step = pix_z_nm if is_3d else 0.0
 
-    # psf_generator has device-placement bugs when using CUDA (tensors end
-    # up on mixed devices), so always generate on CPU — PSFs are small.
-    device = "cpu"
-
-    # Choose propagator based on NA
-    PropClass = (
-        VectorialSphericalPropagator if na >= 0.9 else ScalarSphericalPropagator
+    psf = ci_generate_psf(
+        na=na,
+        wavelength_nm=wavelength_nm,
+        pixel_size_xy_nm=pix_xy_nm,
+        pixel_size_z_nm=pix_z_nm,
+        n_xy=psf_size_xy,
+        n_z=n_defocus,
+        ri_immersion=ri,
+        ri_sample=sample_ri,
+        ri_immersion_design=ri,
+        microscope_type=microscope_type,
+        excitation_nm=excitation_nm,
+        n_pupil=n_pix_pupil,
     )
 
-    propagator_kwargs: dict[str, Any] = {
-        "n_pix_pupil": n_pix_pupil,
-        "n_pix_psf": psf_size_xy,
-        "na": na,
-        "wavelength": wavelength_nm,
-        "pix_size": pix_xy_nm,
-        "defocus_step": defocus_step,
-        "n_defocus": n_defocus,
-        "device": device,
-        "gibson_lanni": True,
-        "n_i": ri,        # immersion medium RI
-        "n_i0": ri,       # design immersion RI
-        "n_s": sample_ri, # sample RI
-        "n_g": 1.5,       # coverslip RI
-        "n_g0": 1.5,      # design coverslip RI
-        "t_g": 170e3,     # coverslip thickness (nm)
-        "t_g0": 170e3,    # design coverslip thickness (nm)
-    }
-
-    logger.info(
-        "Generating PSF: %s, NA=%.2f, λ=%d nm, size=%dx%dx%d, device=%s",
-        PropClass.__name__,
-        na,
-        wavelength_nm,
-        psf_size_xy,
-        psf_size_xy,
-        n_defocus,
-        device,
-    )
-
-    propagator = PropClass(**propagator_kwargs)
-    field = propagator.compute_focus_field()
-
-    # Extract intensity |E|^2
-    # Vectorial propagator returns shape (n_defocus, 3, ny, nx)
-    # Scalar propagator returns shape (n_defocus, ny, nx)
-    if field.dim() == 4:
-        # Vectorial: sum |E|^2 over the 3 polarization components (axis 1)
-        intensity = (torch.abs(field) ** 2).sum(dim=1)
-    else:
-        # Scalar: shape (n_defocus, ny, nx)
-        intensity = torch.abs(field) ** 2
-
-    # Confocal PSF: multiply emission × excitation PSFs when excitation
-    # wavelength is available; fall back to squaring the emission PSF.
-    if is_confocal:
-        exc_wl = ch.get("excitation_wavelength")
-        if exc_wl is not None and exc_wl != wavelength_nm:
-            exc_kwargs = dict(propagator_kwargs)
-            exc_kwargs["wavelength"] = float(exc_wl)
-            exc_propagator = PropClass(**exc_kwargs)
-            exc_field = exc_propagator.compute_focus_field()
-            if exc_field.dim() == 4:
-                intensity_exc = (torch.abs(exc_field) ** 2).sum(dim=1)
-            else:
-                intensity_exc = torch.abs(exc_field) ** 2
-            intensity = intensity * intensity_exc
-            logger.info("  Confocal PSF: emission %.0f nm × excitation %.0f nm",
-                        wavelength_nm, exc_wl)
-        else:
-            intensity = intensity ** 2
-            logger.info("  Confocal PSF: squared (no excitation wavelength)")
-
-    psf = intensity.cpu().numpy().astype(np.float32)
-
-    # Squeeze to 2D if single plane
+    # ci_generate_psf always returns 3D (n_z, n_xy, n_xy) — squeeze for 2D
     if not is_3d:
         psf = psf.squeeze(axis=0)
-
-    # Normalize to sum = 1
-    psf_sum = psf.sum()
-    if psf_sum > 0:
-        psf = psf / psf_sum
 
     logger.info("PSF generated: shape=%s, sum=%.6f", psf.shape, psf.sum())
     return psf
@@ -635,6 +571,8 @@ METHODS = {
     "skimage_rl": {"memory_factor": 4, "description": "scikit-image Richardson-Lucy (CPU)"},
     "skimage_unsupervised_wiener": {"memory_factor": 3, "description": "scikit-image Unsupervised Wiener-Hunt (CPU)"},
     "skimage_cucim_rl": {"memory_factor": 4, "description": "cuCIM Richardson-Lucy (CUDA GPU)"},
+    "ci_rl": {"memory_factor": 8, "description": "CI SHB-accelerated RL (PyTorch GPU)"},
+    "ci_rl_tv": {"memory_factor": 8, "description": "CI SHB-accelerated RL + TV (PyTorch GPU)"},
 }
 
 
@@ -1020,6 +958,13 @@ def deconvolve(
             psf = psf[tuple(slices)].copy()
             logger.info("PSF cropped to image size: %s", psf.shape)
 
+    if method in ("ci_rl", "ci_rl_tv"):
+        return _deconvolve_ci_rl(
+            image, psf, niter=niter,
+            tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
+            background=background, device=device,
+        )
+
     if method == "pycudadecon_rl_cuda":
         return _deconvolve_pycudadecon(
             image, psf, niter=niter, dzdata=dzdata, dxdata=dxdata,
@@ -1060,6 +1005,30 @@ def deconvolve(
         image, psf, method=method, niter=niter, beta=beta, weight=weight,
         reg=reg, pad=pad, plane_by_plane=plane_by_plane, device=device,
     )
+
+
+# ---------------------------------------------------------------------------
+# CI RL backend (deconvolve_ci module)
+# ---------------------------------------------------------------------------
+
+def _deconvolve_ci_rl(
+    image: np.ndarray,
+    psf: np.ndarray,
+    *,
+    niter: int = 50,
+    tv_lambda: float = 0.0,
+    background: Union[int, str] = "auto",
+    device: Optional[str] = None,
+) -> np.ndarray:
+    from deconvolve_ci import ci_rl_deconvolve
+    result = ci_rl_deconvolve(
+        image, psf,
+        niter=niter,
+        tv_lambda=tv_lambda,
+        background=background,
+        device=device,
+    )
+    return result["result"]
 
 
 def _deconvolve_sdeconv(
@@ -1157,7 +1126,10 @@ def _deconvolve_pycudadecon(
                 dzdata=dzdata or 0.1, dxdata=dxdata or 0.1,
                 n_iters=niter, background=background,
             )
-            result_slices.append(np.asarray(out, dtype=np.float32)[0])
+            sl = np.asarray(out, dtype=np.float32)[0]
+            if sl.shape != image.shape[1:]:
+                sl = _pad_to_shape(sl, image.shape[1:])
+            result_slices.append(sl)
         return np.clip(np.stack(result_slices, axis=0), 0, None)
 
     if image.ndim != 3:
@@ -1175,7 +1147,17 @@ def _deconvolve_pycudadecon(
         n_iters=niter,
         background=background,
     )
-    return np.clip(np.asarray(result, dtype=np.float32), 0, None)
+    result = np.clip(np.asarray(result, dtype=np.float32), 0, None)
+
+    # pycudadecon may trim to FFT-friendly dimensions — pad back to input shape
+    if result.shape != image.shape:
+        logger.debug(
+            "pycudadecon output %s != input %s; padding to match.",
+            result.shape, image.shape,
+        )
+        result = _pad_to_shape(result, image.shape)
+
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 {
   "name": "W_CIDeconvolve",
-  "description": "3D/2D deconvolution for widefield and confocal microscopy images with multiple algorithm backends (sdeconv, pycudadecon, deconwolf, DeconvolutionLab2, redlionfish, scikit-image). Supports optional GPU acceleration via CUDA and OpenCL.",
+  "description": "3D/2D deconvolution for widefield and confocal microscopy images with multiple algorithm backends (sdeconv, CI SHB-RL, pycudadecon, deconwolf, DeconvolutionLab2, redlionfish, scikit-image). Supports optional GPU acceleration via CUDA and OpenCL.",
   "container-image": {
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
@@ -58,6 +58,8 @@
         "sdeconv_rl",
         "sdeconv_wiener",
         "sdeconv_spitfire",
+        "ci_rl",
+        "ci_rl_tv",
         "pycudadecon_rl_cuda",
         "deconwolf_rl",
         "deconwolf_shb",
@@ -198,15 +200,15 @@
       "command-line-flag": "--bench_methods",
       "name": "Benchmark methods",
       "description": "Which set of methods to benchmark. Each tier adds methods to the previous. 'all' includes every available backend. Only used when Perform Benchmark is enabled.",
-      "default-value": "sdeconv_rl, pycudadecon_rl_cuda",
+      "default-value": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
-        "sdeconv_rl, pycudadecon_rl_cuda",
-        "sdeconv_rl, pycudadecon_rl_cuda, redlionfish_rl",
-        "sdeconv_rl, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, redlionfish_rl",
-        "sdeconv_rl, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, redlionfish_rl",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, redlionfish_rl",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl",
         "all"
       ]
     },

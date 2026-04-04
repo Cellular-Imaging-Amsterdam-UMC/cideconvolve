@@ -96,6 +96,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 # --- Application code ---
 COPY vendor/ /app/vendor/
 COPY deconvolve.py /app/deconvolve.py
+COPY deconvolve_ci.py /app/deconvolve_ci.py
 COPY bioflows_local.py /app/bioflows_local.py
 COPY wrapper.py /app/wrapper.py
 COPY descriptor.json /app/descriptor.json
