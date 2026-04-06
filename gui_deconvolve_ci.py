@@ -27,8 +27,8 @@ if sys.platform == "win32":
         "ci.gui_deconvolve_ci"
     )
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QIcon, QImage, QPixmap
+from PyQt6.QtCore import Qt, QRectF, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QIcon, QImage, QPainter, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -36,6 +36,9 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -130,6 +133,91 @@ def _resolve_channel_colors(
     if n_ch > 1 and len(set(colors)) == 1:
         colors = [_BGRCYM[i % len(_BGRCYM)] for i in range(n_ch)]
     return colors
+
+
+# ---------------------------------------------------------------------------
+# Zoomable image view (QGraphicsView with wheel-zoom and pan)
+# ---------------------------------------------------------------------------
+
+class ZoomableImageView(QGraphicsView):
+    """QGraphicsView that supports mouse-wheel zoom and middle-button pan.
+
+    Multiple views can be linked via ``link_to()`` so that zoom level
+    and scroll position stay synchronised.
+    """
+
+    _ZOOM_FACTOR = 1.15
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pixmap_item: QGraphicsPixmapItem | None = None
+        self._linked: list[ZoomableImageView] = []
+        self._syncing = False
+
+        self.setRenderHints(
+            self.renderHints()
+            | QPainter.RenderHint.Antialiasing
+            | QPainter.RenderHint.SmoothPixmapTransform
+        )
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setMinimumSize(256, 256)
+        self.setStyleSheet("background-color: #1a1a1a; border: none;")
+
+    # --- linking ---
+    def link_to(self, other: "ZoomableImageView"):
+        """Bidirectionally link two views so zoom/pan stay in sync."""
+        if other not in self._linked:
+            self._linked.append(other)
+        if self not in other._linked:
+            other._linked.append(self)
+
+    # --- public API ---
+    def set_pixmap(self, pix: QPixmap | None):
+        self._scene.clear()
+        self._pixmap_item = None
+        if pix is not None and not pix.isNull():
+            self._pixmap_item = self._scene.addPixmap(pix)
+            self._scene.setSceneRect(QRectF(pix.rect()))
+
+    def clear(self):
+        self._scene.clear()
+        self._pixmap_item = None
+
+    def fit_in_view(self):
+        if self._pixmap_item is not None:
+            self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    # --- zoom ---
+    def wheelEvent(self, event: QWheelEvent):
+        degrees = event.angleDelta().y() / 8
+        steps = degrees / 15
+        factor = self._ZOOM_FACTOR ** steps
+        self.scale(factor, factor)
+        self._sync_transform()
+
+    def _sync_transform(self):
+        if self._syncing:
+            return
+        self._syncing = True
+        t = self.transform()
+        cx = self.horizontalScrollBar().value()
+        cy = self.verticalScrollBar().value()
+        for v in self._linked:
+            v._syncing = True
+            v.setTransform(t)
+            v.horizontalScrollBar().setValue(cx)
+            v.verticalScrollBar().setValue(cy)
+            v._syncing = False
+        self._syncing = False
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        if not self._syncing:
+            self._sync_transform()
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +634,7 @@ class DeconvolveCIWindow(QMainWindow):
         ml.addRow("BG value:", self._sp_bg_value)
 
         self._conv_combo = QComboBox()
-        self._conv_combo.addItems(["fixed", "auto"])
+        self._conv_combo.addItems(["auto", "fixed"])
         self._conv_combo.currentTextChanged.connect(self._on_conv_changed)
         ml.addRow("Convergence:", self._conv_combo)
 
@@ -554,8 +642,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_rel_thresh.setRange(1e-8, 1.0)
         self._sp_rel_thresh.setDecimals(6)
         self._sp_rel_thresh.setSingleStep(0.0001)
-        self._sp_rel_thresh.setValue(0.001)
-        self._sp_rel_thresh.setEnabled(False)
+        self._sp_rel_thresh.setValue(0.005)
         ml.addRow("Rel. threshold:", self._sp_rel_thresh)
 
         self._sp_check_every = QSpinBox()
@@ -766,22 +853,19 @@ class DeconvolveCIWindow(QMainWindow):
         # Input panel
         inp_vl = QVBoxLayout()
         inp_vl.addWidget(QLabel("Input"))
-        self._lbl_input = QLabel()
-        self._lbl_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_input.setMinimumSize(256, 256)
-        self._lbl_input.setStyleSheet("background-color: #1a1a1a;")
-        inp_vl.addWidget(self._lbl_input, stretch=1)
+        self._view_input = ZoomableImageView()
+        inp_vl.addWidget(self._view_input, stretch=1)
         panels.addLayout(inp_vl)
 
         # Output panel
         out_vl = QVBoxLayout()
         out_vl.addWidget(QLabel("Output"))
-        self._lbl_output = QLabel()
-        self._lbl_output.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_output.setMinimumSize(256, 256)
-        self._lbl_output.setStyleSheet("background-color: #1a1a1a;")
-        out_vl.addWidget(self._lbl_output, stretch=1)
+        self._view_output = ZoomableImageView()
+        out_vl.addWidget(self._view_output, stretch=1)
         panels.addLayout(out_vl)
+
+        # Link zoom/pan between both panels
+        self._view_input.link_to(self._view_output)
 
         # Z-slider + projection toggle
         nav = QHBoxLayout()
@@ -1206,7 +1290,7 @@ class DeconvolveCIWindow(QMainWindow):
             return vol[z]
 
     def _composite_pixmap(
-        self, channels: list[np.ndarray], width: int
+        self, channels: list[np.ndarray]
     ) -> Optional[QPixmap]:
         """Build an RGB composite from enabled channels."""
         if not channels:
@@ -1222,25 +1306,24 @@ class DeconvolveCIWindow(QMainWindow):
                 slices.append((s, colors[i]))
         if not slices:
             return None
-        return _composite_to_pixmap(slices, width)
+        return _composite_to_pixmap(slices)
 
     def _update_viewer(self):
-        # Panel size for scaling
-        pw = max(self._lbl_input.width(), 256)
-
         # Input composite
-        pix_in = self._composite_pixmap(self._input_channels, pw)
+        pix_in = self._composite_pixmap(self._input_channels)
         if pix_in is not None:
-            self._lbl_input.setPixmap(pix_in)
+            self._view_input.set_pixmap(pix_in)
+            self._view_input.fit_in_view()
         else:
-            self._lbl_input.clear()
+            self._view_input.clear()
 
         # Output composite
-        pix_out = self._composite_pixmap(self._output_channels, pw)
+        pix_out = self._composite_pixmap(self._output_channels)
         if pix_out is not None:
-            self._lbl_output.setPixmap(pix_out)
+            self._view_output.set_pixmap(pix_out)
+            self._view_output.fit_in_view()
         else:
-            self._lbl_output.clear()
+            self._view_output.clear()
 
         # Z label
         if self._input_channels and self._input_channels[0].ndim == 3:
@@ -1252,7 +1335,8 @@ class DeconvolveCIWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._update_viewer()
+        self._view_input.fit_in_view()
+        self._view_output.fit_in_view()
 
 
 # ---------------------------------------------------------------------------
