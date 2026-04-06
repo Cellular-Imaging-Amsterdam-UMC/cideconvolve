@@ -921,8 +921,8 @@ class DeconvolveCIWindow(QMainWindow):
             def _bg(found: bool) -> str:
                 """Stylesheet snippet: green if from metadata, orange if default."""
                 if found:
-                    return "background-color: #e6ffe6; color: black;"   # pastel green
-                return "background-color: #fff0d0; color: black;"       # pastel orange
+                    return "background-color: #c8e6c9; color: black;"   # soft green
+                return "background-color: #ffe0b2; color: black;"       # soft orange
 
             if meta.get("na"):
                 self._sp_na.setValue(float(meta["na"]))
