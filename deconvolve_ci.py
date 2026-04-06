@@ -199,6 +199,199 @@ def _estimate_background(image: torch.Tensor) -> float:
     return float(lowest.median())
 
 # ---------------------------------------------------------------------------
+# XY tiling helpers (large image support)
+# ---------------------------------------------------------------------------
+
+MAX_TILE_Z = 64
+MAX_TILE_XY = 512
+TILE_MARGIN = 16
+
+
+def _auto_n_tiles(
+    shape: tuple[int, ...],
+    max_z: int = MAX_TILE_Z,
+    max_xy: int = MAX_TILE_XY,
+) -> int:
+    """Return the minimum number of XY tiles so each tile fits within limits."""
+    if len(shape) < 3:
+        return 1
+    Z, H, W = shape[:3]
+    ny = max(1, -(-H // max_xy))
+    nx = max(1, -(-W // max_xy))
+    n_tiles = ny * nx
+    return 1 if n_tiles <= 1 else n_tiles
+
+
+def _resolve_tiling(
+    tiling: str,
+    shape: tuple[int, ...],
+    max_xy: int = MAX_TILE_XY,
+    max_z: int = MAX_TILE_Z,
+) -> int:
+    """Resolve *tiling* mode to a concrete tile count."""
+    if isinstance(tiling, str):
+        mode = tiling.strip().lower()
+        if mode == "none":
+            return 1
+        if mode in ("custom", "auto"):
+            return _auto_n_tiles(shape, max_z=max_z, max_xy=max_xy)
+        raise ValueError(f"tiling must be 'none' or 'custom', got '{tiling}'")
+    return max(int(tiling), 1)
+
+
+def _compute_tile_grid(
+    shape_yx: tuple[int, int], n_tiles: int,
+) -> tuple[int, int]:
+    """Return (ny, nx) tile counts that best cover *shape_yx*."""
+    if n_tiles <= 1:
+        return (1, 1)
+    best = (1, n_tiles)
+    best_ratio = float("inf")
+    for ny in range(1, n_tiles + 1):
+        if n_tiles % ny != 0:
+            continue
+        nx = n_tiles // ny
+        tile_h = shape_yx[0] / ny
+        tile_w = shape_yx[1] / nx
+        ratio = max(tile_h, tile_w) / max(min(tile_h, tile_w), 1)
+        if ratio < best_ratio:
+            best_ratio = ratio
+            best = (ny, nx)
+    return best
+
+
+def _compute_tile_slices(
+    shape_zyx: tuple[int, int, int],
+    ny: int,
+    nx: int,
+    overlap: int,
+) -> list[dict]:
+    """Return a list of tile descriptors with overlap margins."""
+    _, H, W = shape_zyx
+    tile_h = H / ny
+    tile_w = W / nx
+    tiles = []
+    for iy in range(ny):
+        y0_core = round(iy * tile_h)
+        y1_core = round((iy + 1) * tile_h)
+        y0_ext = max(y0_core - overlap, 0)
+        y1_ext = min(y1_core + overlap, H)
+        ov_top = y0_core - y0_ext
+        ov_bot = y1_ext - y1_core
+        for ix in range(nx):
+            x0_core = round(ix * tile_w)
+            x1_core = round((ix + 1) * tile_w)
+            x0_ext = max(x0_core - overlap, 0)
+            x1_ext = min(x1_core + overlap, W)
+            ov_left = x0_core - x0_ext
+            ov_right = x1_ext - x1_core
+            tiles.append({
+                "extract": (slice(None), slice(y0_ext, y1_ext), slice(x0_ext, x1_ext)),
+                "insert":  (slice(None), slice(y0_core, y1_core), slice(x0_core, x1_core)),
+                "core":    (slice(None), slice(ov_top, ov_top + y1_core - y0_core),
+                             slice(ov_left, ov_left + x1_core - x0_core)),
+                "blend_y": (ov_top, ov_bot),
+                "blend_x": (ov_left, ov_right),
+            })
+    return tiles
+
+
+def _blend_tile(tile_result: np.ndarray, desc: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Apply linear ramp blending in overlap zones; return (weighted, weight)."""
+    ov_top, ov_bot = desc["blend_y"]
+    ov_left, ov_right = desc["blend_x"]
+
+    tile_h = tile_result.shape[1]
+    tile_w = tile_result.shape[2]
+    weight = np.ones((tile_h, tile_w), dtype=np.float32)
+
+    if ov_top > 0:
+        ramp = np.linspace(0, 1, ov_top + 1, dtype=np.float32)[1:]
+        weight[:ov_top, :] *= ramp[:, np.newaxis]
+    if ov_bot > 0:
+        ramp = np.linspace(1, 0, ov_bot + 1, dtype=np.float32)[:-1]
+        weight[tile_h - ov_bot:, :] *= ramp[:, np.newaxis]
+    if ov_left > 0:
+        ramp = np.linspace(0, 1, ov_left + 1, dtype=np.float32)[1:]
+        weight[:, :ov_left] *= ramp[np.newaxis, :]
+    if ov_right > 0:
+        ramp = np.linspace(1, 0, ov_right + 1, dtype=np.float32)[:-1]
+        weight[:, tile_w - ov_right:] *= ramp[np.newaxis, :]
+
+    weighted = tile_result * weight[np.newaxis, :, :]
+    return weighted, weight
+
+
+def _ci_deconvolve_tiled(
+    image: np.ndarray,
+    psf: np.ndarray,
+    n_tiles: int,
+    **kwargs,
+) -> dict[str, Any]:
+    """Split *image* into XY tiles, deconvolve each, and blend back."""
+    overlap = max(psf.shape[-1], psf.shape[-2]) // 2
+    margin = TILE_MARGIN
+
+    ny, nx = _compute_tile_grid(image.shape[1:], n_tiles)
+    min_tile_yx = min(image.shape[1] / ny, image.shape[2] / nx)
+    if min_tile_yx < max(psf.shape[-2:]):
+        log.warning(
+            "n_tiles=%d produces tiles smaller than PSF; falling back to "
+            "no tiling.", n_tiles,
+        )
+        return ci_rl_deconvolve(image, psf, tiling="none", **kwargs)
+
+    tiles = _compute_tile_slices(image.shape, ny, nx, overlap)
+    log.info(
+        "Tiled deconvolution: %d tiles (%d×%d grid), overlap=%d, margin=%d px",
+        n_tiles, ny, nx, overlap, margin,
+    )
+
+    Z, H, W = image.shape
+    numerator = np.zeros_like(image, dtype=np.float64)
+    denominator = np.zeros(image.shape, dtype=np.float64)
+
+    total_iterations = 0
+    all_convergence: list[float] = []
+
+    for idx, desc in enumerate(tiles):
+        _, ey, ex = desc["extract"]
+        y0_m = max(ey.start - margin, 0)
+        y1_m = min(ey.stop + margin, H)
+        x0_m = max(ex.start - margin, 0)
+        x1_m = min(ex.stop + margin, W)
+        tile_img = image[:, y0_m:y1_m, x0_m:x1_m].copy()
+
+        log.info("  Tile %d/%d  shape=%s", idx + 1, len(tiles), tile_img.shape)
+        tile_out = ci_rl_deconvolve(tile_img, psf, tiling="none", **kwargs)
+        tile_result = tile_out["result"]
+
+        total_iterations = max(total_iterations, tile_out["iterations_used"])
+        if tile_out["convergence"]:
+            all_convergence = tile_out["convergence"]
+
+        # Crop margin back to the original extract region
+        crop_y0 = ey.start - y0_m
+        crop_y1 = crop_y0 + (ey.stop - ey.start)
+        crop_x0 = ex.start - x0_m
+        crop_x1 = crop_x0 + (ex.stop - ex.start)
+        tile_cropped = tile_result[:, crop_y0:crop_y1, crop_x0:crop_x1]
+
+        weighted, weight = _blend_tile(tile_cropped, desc)
+        ext = desc["extract"]
+        numerator[ext] += weighted.astype(np.float64)
+        denominator[ext] += weight[np.newaxis, :, :].astype(np.float64)
+
+    denominator = np.maximum(denominator, 1e-12)
+    result = np.clip((numerator / denominator).astype(np.float32), 0, None)
+    return {
+        "result": result,
+        "convergence": all_convergence,
+        "iterations_used": total_iterations,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Top-level RL deconvolution
 # ---------------------------------------------------------------------------
 
@@ -213,6 +406,9 @@ def ci_rl_deconvolve(
     rel_threshold: float = 0.001,
     check_every: int = 5,
     device: Optional[str] = None,
+    tiling: str = "none",
+    max_tile_xy: int = MAX_TILE_XY,
+    max_tile_z: int = MAX_TILE_Z,
 ) -> dict[str, Any]:
     """SHB-accelerated Richardson-Lucy deconvolution (GPU / CPU).
 
@@ -245,6 +441,18 @@ def ci_rl_deconvolve(
         ``"convergence"`` — list of I-divergence values at check-points.
         ``"iterations_used"`` — number of iterations actually performed.
     """
+    # --- Tiling dispatch ---
+    n_tiles = _resolve_tiling(tiling, image.shape, max_xy=max_tile_xy,
+                              max_z=max_tile_z)
+    if n_tiles > 1:
+        return _ci_deconvolve_tiled(
+            image, psf, n_tiles,
+            niter=niter, tv_lambda=tv_lambda, background=background,
+            convergence=convergence, rel_threshold=rel_threshold,
+            check_every=check_every, device=device,
+            max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
+        )
+
     dev = _pick_device(device)
     dtype = _pick_dtype(dev)
     ndim = image.ndim

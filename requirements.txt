@@ -19,9 +19,11 @@ scikit-image==0.24.0
 # GUI
 PyQt6>=6.5.0
 
-# OME-TIFF and OME-Zarr reading
+# OME-TIFF, OME-Zarr, CZI, ND2 reading via bioio
 bioio==3.2.0
 bioio-ome-tiff==1.4.0
 bioio-ome-zarr==3.3.0
+bioio-czi==2.6.1
+bioio-nd2==1.7.0
 
 

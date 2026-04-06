@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import tifffile
 
 # Windows taskbar: set AppUserModelID so the taskbar shows our icon
 if sys.platform == "win32":
@@ -169,115 +168,18 @@ def _composite_to_pixmap(
 # Lightweight image loader (avoids importing deconvolve.py / torch)
 # ---------------------------------------------------------------------------
 
-def _parse_ome_xml_gui(xml_str: str) -> dict:
-    """Extract microscopy metadata from OME-XML (best-effort)."""
-    import xml.etree.ElementTree as ET
 
-    _ACQUISITION_MODE_MAP = {
-        "LaserScanningConfocalMicroscopy": "confocal",
-        "SpinningDiskConfocal": "confocal",
-        "SlitScanConfocal": "confocal",
-        "MultiPhotonMicroscopy": "confocal",
-        "WideField": "widefield",
-        "Other": "widefield",
-    }
+def _apply_metadata_defaults(images: list, meta: dict) -> dict:
+    """Track metadata source and apply defaults for missing fields."""
+    meta_keys_from_file = set(meta.keys())
+    ch_list = meta.get("channels", [])
+    if ch_list:
+        meta_keys_from_file.add("channels")
+        if all("emission_wavelength" in c for c in ch_list):
+            meta_keys_from_file.add("emission_wavelength")
+        if all("excitation_wavelength" in c for c in ch_list):
+            meta_keys_from_file.add("excitation_wavelength")
 
-    meta: dict = {}
-    try:
-        root_el = ET.fromstring(xml_str)
-        pixels = root_el.find(".//{*}Pixels")
-        if pixels is not None:
-            for attr, key in [
-                ("PhysicalSizeX", "pixel_size_x"),
-                ("PhysicalSizeY", "pixel_size_y"),
-                ("PhysicalSizeZ", "pixel_size_z"),
-            ]:
-                val = pixels.get(attr)
-                if val:
-                    meta[key] = float(val)
-            ch_elements = pixels.findall("{*}Channel")
-            ch_list = []
-            ch_names = []
-            for ch_el in ch_elements:
-                ch_d: dict = {}
-                em = ch_el.get("EmissionWavelength")
-                ex = ch_el.get("ExcitationWavelength")
-                name = ch_el.get("Name", "")
-                if em:
-                    ch_d["emission_wavelength"] = float(em)
-                if ex:
-                    ch_d["excitation_wavelength"] = float(ex)
-                ch_list.append(ch_d)
-                ch_names.append(name)
-                # AcquisitionMode → microscope_type (use first channel's)
-                acq = ch_el.get("AcquisitionMode")
-                if acq and "microscope_type" not in meta:
-                    meta["microscope_type"] = _ACQUISITION_MODE_MAP.get(
-                        acq, "widefield"
-                    )
-            if ch_list:
-                meta["channels"] = ch_list
-                meta["channel_names"] = ch_names
-
-        # ObjectiveSettings — RefractiveIndex (immersion medium RI)
-        obj_settings = root_el.find(".//{*}ObjectiveSettings")
-        if obj_settings is not None:
-            ri_val = obj_settings.get("RefractiveIndex")
-            if ri_val:
-                meta["refractive_index"] = float(ri_val)
-
-        objective = root_el.find(".//{*}Objective")
-        if objective is not None:
-            na_val = objective.get("LensNA")
-            if na_val:
-                meta["na"] = float(na_val)
-    except Exception:
-        pass
-    return meta
-
-
-def _load_image_tifffile(path_str: str) -> dict:
-    """Load image via tifffile, bypassing deconvolve.py (avoids torch).
-
-    Returns dict with ``'images'`` (list[ndarray]) and ``'metadata'``
-    (dict), matching the structure of ``deconvolve.load_image()``.
-    """
-    path = Path(path_str)
-    images: list[np.ndarray] = []
-    meta: dict = {}
-
-    with tifffile.TiffFile(str(path)) as tif:
-        data = tif.asarray().astype(np.float32)
-
-        # Determine dimension order from tifffile series
-        axes = tif.series[0].axes.upper() if tif.series else ""
-
-        # Parse OME metadata if available
-        ome = tif.ome_metadata
-        if ome:
-            meta = _parse_ome_xml_gui(ome)
-
-        # Remove T dimension (take first timepoint)
-        if "T" in axes and data.ndim > 2:
-            ti = axes.index("T")
-            data = data.take(0, axis=ti)
-            axes = axes.replace("T", "")
-
-        # Split channels
-        if "C" in axes and data.ndim > 2:
-            ci = axes.index("C")
-            for c in range(data.shape[ci]):
-                images.append(data.take(c, axis=ci))
-        elif data.ndim == 4:
-            # No axes info; assume CZYX
-            for c in range(data.shape[0]):
-                images.append(data[c])
-        elif data.ndim in (2, 3):
-            images.append(data)
-        else:
-            images.append(data.squeeze())
-
-    # Apply defaults for missing metadata
     meta.setdefault("na", 1.4)
     meta.setdefault("pixel_size_x", 0.065)
     meta.setdefault("pixel_size_z", 0.2)
@@ -286,7 +188,131 @@ def _load_image_tifffile(path_str: str) -> dict:
     if "channels" not in meta:
         meta["channels"] = [{"emission_wavelength": 520.0}] * len(images)
     meta["n_channels"] = len(images)
+    meta["_from_file"] = meta_keys_from_file
+    return meta
 
+
+def _load_image(path_str: str) -> dict:
+    """Load any supported microscopy image via BioImage (bioio).
+
+    Supports OME-TIFF, TIFF, ND2, CZI, OME-Zarr, and other bioio-
+    supported formats.  Returns dict with ``'images'`` (list[ndarray])
+    and ``'metadata'`` (dict).
+    """
+    from bioio import BioImage
+
+    _ACQ_MODE_MAP = {
+        "LASER_SCANNING_CONFOCAL_MICROSCOPY": "confocal",
+        "SPINNING_DISK_CONFOCAL": "confocal",
+        "SLIT_SCAN_CONFOCAL": "confocal",
+        "MULTI_PHOTON_MICROSCOPY": "confocal",
+        "WIDE_FIELD": "widefield",
+        "OTHER": "widefield",
+    }
+    _IMM_RI = {
+        "OIL": 1.515,
+        "WATER": 1.333,
+        "GLYCEROL": 1.47,
+        "AIR": 1.0,
+        "MULTI": 1.515,
+    }
+
+    img = BioImage(str(path_str))
+    meta: dict = {}
+
+    # Physical pixel sizes (µm)
+    pps = img.physical_pixel_sizes
+    if pps.X:
+        meta["pixel_size_x"] = pps.X
+    if pps.Z:
+        meta["pixel_size_z"] = pps.Z
+
+    # OME metadata (unified across formats via ome-types)
+    try:
+        ome = img.ome_metadata
+        if ome and hasattr(ome, "images") and ome.images:
+            im0 = ome.images[0]
+
+            # Per-channel metadata
+            ch_list = []
+            for c in (im0.pixels.channels or []):
+                ch_d: dict = {}
+                if c.emission_wavelength is not None:
+                    ch_d["emission_wavelength"] = float(c.emission_wavelength)
+                if c.excitation_wavelength is not None:
+                    ch_d["excitation_wavelength"] = float(c.excitation_wavelength)
+                ch_list.append(ch_d)
+                # Acquisition mode (use first channel's)
+                if c.acquisition_mode and "microscope_type" not in meta:
+                    name = getattr(c.acquisition_mode, "name",
+                                   str(c.acquisition_mode))
+                    meta["microscope_type"] = _ACQ_MODE_MAP.get(
+                        name, "widefield")
+            if ch_list:
+                meta["channels"] = ch_list
+
+            # Objective (NA, immersion → RI)
+            if ome.instruments:
+                for inst in ome.instruments:
+                    for obj in (inst.objectives or []):
+                        if obj.lens_na and "na" not in meta:
+                            meta["na"] = float(obj.lens_na)
+                        if obj.immersion and "refractive_index" not in meta:
+                            imm_name = getattr(
+                                obj.immersion, "name",
+                                str(obj.immersion)).upper()
+                            if imm_name in _IMM_RI:
+                                meta["refractive_index"] = _IMM_RI[imm_name]
+
+            # ObjectiveSettings — may contain explicit RI (overrides above)
+            if hasattr(im0, "objective_settings") and im0.objective_settings:
+                os_ = im0.objective_settings
+                if os_.refractive_index:
+                    meta["refractive_index"] = float(os_.refractive_index)
+    except Exception:
+        pass
+
+    # Fallback: try to parse channel names as emission wavelengths
+    # (e.g. OME-Zarr stores channel names like '520.0', '600.0')
+    if "channels" not in meta:
+        try:
+            ch_names = img.channel_names or []
+            ch_list = []
+            for nm in ch_names:
+                val = float(str(nm))
+                if 300 < val < 900:
+                    ch_list.append({"emission_wavelength": val})
+            if ch_list:
+                meta["channels"] = ch_list
+        except (ValueError, TypeError):
+            pass
+
+    # ND2 fallback: native nd2 metadata for RI when ome_metadata lacks it
+    ext = Path(path_str).suffix.lower()
+    if ext == ".nd2" and "refractive_index" not in meta:
+        try:
+            import nd2
+            with nd2.ND2File(str(path_str)) as f:
+                chs = f.metadata.channels if f.metadata else []
+                if chs and chs[0].microscope:
+                    ri = chs[0].microscope.immersionRefractiveIndex
+                    if ri is not None and ri > 0:
+                        meta["refractive_index"] = ri
+        except Exception:
+            pass
+
+    # Image data — request CZYX, first timepoint
+    raw = img.get_image_data("CZYX", T=0).astype(np.float32)
+    images: list[np.ndarray] = []
+    if raw.ndim == 4:
+        for c in range(raw.shape[0]):
+            images.append(raw[c])
+    elif raw.ndim == 3:
+        images.append(raw)
+    else:
+        images.append(raw.squeeze())
+
+    meta = _apply_metadata_defaults(images, meta)
     return {"images": images, "metadata": meta}
 
 
@@ -398,6 +424,9 @@ class _DeconvolveWorker(QThread):
                     rel_threshold=p["rel_threshold"],
                     check_every=p["check_every"],
                     device=p["device"],
+                    tiling=p["tiling"],
+                    max_tile_xy=p["max_tile_xy"],
+                    max_tile_z=p["max_tile_z"],
                 )
                 results.append(out["result"].copy())
 
@@ -535,6 +564,30 @@ class DeconvolveCIWindow(QMainWindow):
         ml.addRow("Device:", self._device_combo)
 
         ctrl_layout.addWidget(method_group)
+
+        # --- Tiling ---
+        tiling_group = QGroupBox("Tiling")
+        tl = QFormLayout()
+        tiling_group.setLayout(tl)
+
+        self._tiling_combo = QComboBox()
+        self._tiling_combo.addItems(["none", "custom"])
+        self._tiling_combo.currentTextChanged.connect(self._on_tiling_changed)
+        tl.addRow("Tiling:", self._tiling_combo)
+
+        self._sp_max_tile_xy = QSpinBox()
+        self._sp_max_tile_xy.setRange(64, 4096)
+        self._sp_max_tile_xy.setSingleStep(64)
+        self._sp_max_tile_xy.setValue(512)
+        tl.addRow("Max tile XY:", self._sp_max_tile_xy)
+
+        self._sp_max_tile_z = QSpinBox()
+        self._sp_max_tile_z.setRange(8, 512)
+        self._sp_max_tile_z.setSingleStep(8)
+        self._sp_max_tile_z.setValue(64)
+        tl.addRow("Max tile Z:", self._sp_max_tile_z)
+
+        ctrl_layout.addWidget(tiling_group)
 
         # --- Optics / PSF ---
         optics_group = QGroupBox("Optics / PSF")
@@ -755,6 +808,10 @@ class DeconvolveCIWindow(QMainWindow):
         btn_open.clicked.connect(self._on_open)
         bottom.addWidget(btn_open)
 
+        btn_open_zarr = QPushButton("Open Zarr\u2026")
+        btn_open_zarr.clicked.connect(self._on_open_zarr)
+        bottom.addWidget(btn_open_zarr)
+
         self._file_label = QLabel("No file loaded")
         self._file_label.setWordWrap(False)
         bottom.addWidget(self._file_label, stretch=1)
@@ -816,6 +873,11 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_micro_changed(self, text: str):
         self._le_excitation.setEnabled(text == "confocal")
 
+    def _on_tiling_changed(self, text: str):
+        enabled = text == "custom"
+        self._sp_max_tile_xy.setEnabled(enabled)
+        self._sp_max_tile_z.setEnabled(enabled)
+
     def _on_proj_changed(self, text: str):
         self._z_slider.setEnabled(text == "Slice")
         self._update_viewer()
@@ -829,16 +891,24 @@ class DeconvolveCIWindow(QMainWindow):
             self,
             "Open Image",
             "",
-            "Images (*.ome.tiff *.ome.tif *.tiff *.tif *.zarr);;All Files (*)",
+            "Images (*.ome.tiff *.ome.tif *.tiff *.tif *.nd2 *.czi);;All Files (*)",
         )
-        if not path:
-            return
+        if path:
+            self._do_load(path)
 
+    def _on_open_zarr(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Open OME-Zarr Folder", "",
+        )
+        if path:
+            self._do_load(path)
+
+    def _do_load(self, path: str):
         self._status.showMessage(f"Loading {Path(path).name} …")
         QApplication.processEvents()
 
         try:
-            data = _load_image_tifffile(path)
+            data = _load_image(path)
             self._input_channels = data["images"]
             self._metadata = data["metadata"]
             self._output_channels = []
@@ -846,23 +916,37 @@ class DeconvolveCIWindow(QMainWindow):
 
             # Populate UI from metadata
             meta = self._metadata
+            from_file = meta.get("_from_file", set())
+
+            def _bg(found: bool) -> str:
+                """Stylesheet snippet: green if from metadata, orange if default."""
+                if found:
+                    return "background-color: #e6ffe6; color: black;"   # pastel green
+                return "background-color: #fff0d0; color: black;"       # pastel orange
+
             if meta.get("na"):
                 self._sp_na.setValue(float(meta["na"]))
+            self._sp_na.setStyleSheet(_bg("na" in from_file))
             px_x = meta.get("pixel_size_x")
             if px_x:
                 self._sp_px_xy.setValue(float(px_x) * 1000.0)  # µm → nm
+            self._sp_px_xy.setStyleSheet(_bg("pixel_size_x" in from_file))
             px_z = meta.get("pixel_size_z")
             if px_z:
                 self._sp_px_z.setValue(float(px_z) * 1000.0)
+            self._sp_px_z.setStyleSheet(_bg("pixel_size_z" in from_file))
             ri = meta.get("refractive_index")
             if ri:
                 self._sp_ri_imm.setValue(float(ri))
                 self._sp_ri_imm_d.setValue(float(ri))
+            self._sp_ri_imm.setStyleSheet(_bg("refractive_index" in from_file))
+            self._sp_ri_imm_d.setStyleSheet(_bg("refractive_index" in from_file))
             micro = meta.get("microscope_type")
             if micro:
                 idx = self._micro_combo.findText(micro)
                 if idx >= 0:
                     self._micro_combo.setCurrentIndex(idx)
+            self._micro_combo.setStyleSheet(_bg("microscope_type" in from_file))
 
             # Per-channel wavelengths
             ch_info = meta.get("channels", [])
@@ -873,6 +957,17 @@ class DeconvolveCIWindow(QMainWindow):
                 ex_vals = [str(c.get("excitation_wavelength", 488))
                            for c in ch_info]
                 self._le_excitation.setText(", ".join(ex_vals))
+            self._le_emission.setStyleSheet(
+                _bg("emission_wavelength" in from_file))
+            self._le_excitation.setStyleSheet(
+                _bg("excitation_wavelength" in from_file))
+
+            # RI sample is never in metadata — red (needs user input)
+            self._sp_ri_sample.setStyleSheet(
+                "background-color: #ffe0e0; color: black;")  # pastel red
+            # Coverslip RI and design params — always defaults, orange
+            self._sp_ri_cover.setStyleSheet(_bg(False))
+            self._sp_ri_cover_d.setStyleSheet(_bg(False))
 
             # Channel toggle buttons
             self._rebuild_channel_toggles()
@@ -945,6 +1040,9 @@ class DeconvolveCIWindow(QMainWindow):
             "integrate_pixels": self._cb_integrate.isChecked(),
             "n_subpixels": self._sp_subpixels.value(),
             "n_pupil": self._sp_n_pupil.value(),
+            "tiling": self._tiling_combo.currentText(),
+            "max_tile_xy": self._sp_max_tile_xy.value(),
+            "max_tile_z": self._sp_max_tile_z.value(),
         }
 
     def _on_run(self):
@@ -1009,17 +1107,41 @@ class DeconvolveCIWindow(QMainWindow):
             return
 
         try:
-            channels = self._output_channels
-            if channels[0].ndim == 3:
-                stack = np.stack(channels, axis=0)  # CZYX
-            else:
-                stack = np.stack(channels, axis=0)  # CYX
+            from bioio.writers import OmeTiffWriter
 
-            tifffile.imwrite(
+            channels = self._output_channels
+            # OmeTiffWriter expects TCZYX (5-D)
+            stack = np.stack(channels, axis=0)  # CZYX
+            data = stack[np.newaxis, ...].astype(np.float32)  # TCZYX
+            if data.ndim == 4:
+                data = data[:, :, np.newaxis, :, :]  # ensure 5-D (add Z)
+
+            # Collect physical pixel sizes from current GUI state
+            meta = self._metadata or {}
+            px_x = meta.get("pixel_size_x")
+            px_z = meta.get("pixel_size_z")
+            physical_pixel_sizes = None
+            if px_x or px_z:
+                from bioio_base.types import PhysicalPixelSizes
+                physical_pixel_sizes = PhysicalPixelSizes(
+                    Z=px_z or 1.0, Y=px_x or 1.0, X=px_x or 1.0
+                )
+
+            # Channel names
+            ch_names = meta.get("channel_names")
+            if not ch_names:
+                ch_info = meta.get("channels", [])
+                ch_names = [
+                    f"Ch{i} em={c.get('emission_wavelength', '?')}"
+                    for i, c in enumerate(ch_info)
+                ]
+
+            OmeTiffWriter.save(
+                data,
                 path,
-                stack.astype(np.float32),
-                imagej=False,
-                compression="zlib",
+                dim_order="TCZYX",
+                physical_pixel_sizes=physical_pixel_sizes,
+                channel_names=ch_names[:len(channels)],
             )
             self._status.showMessage(f"Saved → {Path(path).name}", 5000)
         except Exception as exc:
