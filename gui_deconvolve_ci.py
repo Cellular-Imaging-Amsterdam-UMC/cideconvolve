@@ -366,15 +366,20 @@ class _DeconvolveWorker(QThread):
                 if p["microscope_type"] != "confocal":
                     ex_wl = None
 
-                # PSF size: match image lateral, use odd axial
+                # PSF size: auto XY from Airy radius, Z = 2*nz-1
                 if ch_data.ndim == 3:
                     nz_img, ny, nx = ch_data.shape
-                    n_xy_psf = max(ny, nx) | 1  # make odd
-                    n_z_psf = nz_img | 1
+                    n_z_psf = max(2 * nz_img - 1, 1) | 1
                 else:
                     ny, nx = ch_data.shape
-                    n_xy_psf = max(ny, nx) | 1
                     n_z_psf = 1
+
+                # Auto-calculate PSF lateral size from Airy disk
+                airy_radius_nm = 0.61 * em_wl / p["na"]
+                airy_radius_px = airy_radius_nm / p["pixel_size_xy_nm"]
+                n_xy_psf = int(max(64, 2 * int(4 * airy_radius_px) + 1))
+                if n_xy_psf % 2 == 0:
+                    n_xy_psf += 1
 
                 self.progress.emit(
                     f"  Generating PSF (ch {ci + 1}, λ={em_wl:.0f} nm) …"
