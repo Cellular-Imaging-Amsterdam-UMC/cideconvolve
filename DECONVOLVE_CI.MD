@@ -316,53 +316,41 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 
 ## References
 
-<a id="ref1"></a>
-1. Richardson, W.H. (1972). "Bayesian-based iterative method of image restoration." *JOSA* 62(1):55–59.\
+1. <a id="ref1"></a>Richardson, W.H. (1972). "Bayesian-based iterative method of image restoration." *JOSA* 62(1):55–59.\
    [doi:10.1364/JOSA.62.000055](https://doi.org/10.1364/JOSA.62.000055)
 
-<a id="ref2"></a>
-2. Lucy, L.B. (1974). "An iterative technique for the rectification of observed distributions." *AJ* 79:745.\
+2. <a id="ref2"></a>Lucy, L.B. (1974). "An iterative technique for the rectification of observed distributions." *AJ* 79:745.\
    [doi:10.1086/111605](https://doi.org/10.1086/111605)
 
-<a id="ref3"></a>
-3. Wang, C. & Miller, E.L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* 23(2):848–854.\
+3. <a id="ref3"></a>Wang, C. & Miller, E.L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* 23(2):848–854.\
    [doi:10.1109/TIP.2013.2291324](https://doi.org/10.1109/TIP.2013.2291324)
 
-<a id="ref4"></a>
-4. Bertero, M. & Boccacci, P. (2005). "A simple method for the reduction of boundary effects in the Richardson-Lucy approach to image deconvolution." *A&A* 437:369–374.\
+4. <a id="ref4"></a>Bertero, M. & Boccacci, P. (2005). "A simple method for the reduction of boundary effects in the Richardson-Lucy approach to image deconvolution." *A&A* 437:369–374.\
    [doi:10.1051/0004-6361:20042231](https://doi.org/10.1051/0004-6361:20042231)
 
-<a id="ref5"></a>
-5. Dey, N. et al. (2006). "Richardson-Lucy algorithm with total variation regularization for 3D confocal microscope deconvolution." *Microscopy Research and Technique* 69(4):260–266.\
+5. <a id="ref5"></a>Dey, N. et al. (2006). "Richardson-Lucy algorithm with total variation regularization for 3D confocal microscope deconvolution." *Microscopy Research and Technique* 69(4):260–266.\
    [doi:10.1002/jemt.20294](https://doi.org/10.1002/jemt.20294)
 
-<a id="ref6"></a>
-6. Wernersson, E. et al. (2024). "Deconwolf enables high-performance deconvolution of widefield fluorescence microscopy images." *Nature Methods* 21(7):1245–1256.\
+6. <a id="ref6"></a>Wernersson, E. et al. (2024). "Deconwolf enables high-performance deconvolution of widefield fluorescence microscopy images." *Nature Methods* 21(7):1245–1256.\
    [doi:10.1038/s41592-024-02294-7](https://doi.org/10.1038/s41592-024-02294-7) ·
    Source code: [github.com/elgw/deconwolf](https://github.com/elgw/deconwolf)
 
-<a id="ref7"></a>
-7. Richards, B. & Wolf, E. (1959). "Electromagnetic diffraction in optical systems, II." *Proc. Royal Society A* 253:358–379.\
+7. <a id="ref7"></a>Richards, B. & Wolf, E. (1959). "Electromagnetic diffraction in optical systems, II." *Proc. Royal Society A* 253:358–379.\
    [doi:10.1098/rspa.1959.0200](https://doi.org/10.1098/rspa.1959.0200)
 
-<a id="ref8"></a>
-8. Gibson, S.F. & Lanni, F. (1991). "Experimental test of an analytical model of aberration in an oil-immersion objective lens used in three-dimensional light microscopy." *JOSA A* 8(10):1601–1613.\
+8. <a id="ref8"></a>Gibson, S.F. & Lanni, F. (1991). "Experimental test of an analytical model of aberration in an oil-immersion objective lens used in three-dimensional light microscopy." *JOSA A* 8(10):1601–1613.\
    [doi:10.1364/JOSAA.8.001601](https://doi.org/10.1364/JOSAA.8.001601)
 
-<a id="ref9"></a>
-9. Aguet, F. (2009). "Super-Resolution Fluorescence Microscopy Based on Physical Models." *EPFL Thesis* no. 4555.\
+9. <a id="ref9"></a>Aguet, F. (2009). "Super-Resolution Fluorescence Microscopy Based on Physical Models." *EPFL Thesis* no. 4555.\
    [doi:10.5075/epfl-thesis-4555](https://doi.org/10.5075/epfl-thesis-4555)
 
-<a id="ref10"></a>
-10. Csiszár, I. (1991). "Why least squares and maximum entropy? An axiomatic approach to inference for linear inverse problems." *Annals of Statistics* 19(4):2032–2066.\
+10. <a id="ref10"></a>Csiszár, I. (1991). "Why least squares and maximum entropy? An axiomatic approach to inference for linear inverse problems." *Annals of Statistics* 19(4):2032–2066.\
     [doi:10.1214/aos/1176348385](https://doi.org/10.1214/aos/1176348385)
 
-<a id="ref11"></a>
-11. Laasmaa, M. et al. (2011). "Application of regularized Richardson-Lucy algorithm for deconvolution of confocal microscopy images." *Journal of Microscopy* 243(2):124–140.\
+11. <a id="ref11"></a>Laasmaa, M. et al. (2011). "Application of regularized Richardson-Lucy algorithm for deconvolution of confocal microscopy images." *Journal of Microscopy* 243(2):124–140.\
     [doi:10.1111/j.1365-2818.2011.03486.x](https://doi.org/10.1111/j.1365-2818.2011.03486.x)
 
-<a id="ref12"></a>
-12. Conchello, J.-A. (1998). "Superresolution and convergence properties of the expectation-maximization algorithm for maximum-likelihood deconvolution of incoherent images." *JOSA A* 15(10):2609–2619.\
+12. <a id="ref12"></a>Conchello, J.-A. (1998). "Superresolution and convergence properties of the expectation-maximization algorithm for maximum-likelihood deconvolution of incoherent images." *JOSA A* 15(10):2609–2619.\
     [doi:10.1364/JOSAA.15.002609](https://doi.org/10.1364/JOSAA.15.002609)
 
 ### Source Code Repositories
