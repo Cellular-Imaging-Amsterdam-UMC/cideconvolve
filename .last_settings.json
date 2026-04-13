@@ -1,9 +1,9 @@
 {
   "values": {
-    "iterations": 40,
+    "iterations": "100",
     "tiling": "custom",
     "tile_limits": "512, 64",
-    "method": "sdeconv_rl",
+    "method": "ci_rl",
     "device": "auto",
     "na": "auto",
     "refractive_index": "auto",
@@ -11,17 +11,19 @@
     "microscope_type": "auto",
     "emission_wl": "auto",
     "excitation_wl": "auto",
+    "background": "auto",
+    "damping": "none",
+    "convergence": "auto",
+    "check_every": 5,
+    "pixel_size_xy": "auto",
+    "pixel_size_z": "auto",
     "projection": "none",
     "benchmark": true,
-    "bench_iterations": "20, 40",
-    "bench_methods": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
-    "bench_crop": true,
-    "bench_one_image": true,
-    "log": false
+    "bench_crop": false
   },
   "folders": {
-    "infolder": "C:\\rahoebe\\Python\\CIDeconvolve\\infolder",
-    "outfolder": "C:\\rahoebe\\Python\\CIDeconvolve\\outfolder",
-    "gtfolder": "C:\\rahoebe\\Python\\CIDeconvolve\\gtfolder"
+    "infolder": "C:\\rahoebe\\Python\\cideconvolve\\infolder",
+    "outfolder": "C:\\rahoebe\\Python\\cideconvolve\\outfolder",
+    "gtfolder": "C:\\rahoebe\\Python\\cideconvolve\\gtfolder"
   }
 }

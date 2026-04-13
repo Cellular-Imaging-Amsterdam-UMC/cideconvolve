@@ -825,9 +825,9 @@ class _DeconvolveWorker(QThread):
                     n_z=n_z_psf,
                     ri_immersion=p["ri_immersion"],
                     ri_sample=p["ri_sample"],
-                    ri_coverslip=p["ri_coverslip"],
-                    ri_coverslip_design=p["ri_coverslip_design"],
-                    ri_immersion_design=p["ri_immersion_design"],
+                    ri_coverslip=p["ri_immersion"],
+                    ri_coverslip_design=p["ri_immersion"],
+                    ri_immersion_design=p["ri_immersion"],
                     t_g=p["t_g"],
                     t_g0=p["t_g0"],
                     t_i0=p["t_i0"],
@@ -1166,26 +1166,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_ri_sample.setValue(1.47)
         rl.addRow("RI sample:", self._sp_ri_sample)
 
-        self._sp_ri_cover = QDoubleSpinBox()
-        self._sp_ri_cover.setRange(1.0, 2.0)
-        self._sp_ri_cover.setDecimals(4)
-        self._sp_ri_cover.setSingleStep(0.001)
-        self._sp_ri_cover.setValue(1.518)
-        rl.addRow("RI coverslip:", self._sp_ri_cover)
 
-        self._sp_ri_cover_d = QDoubleSpinBox()
-        self._sp_ri_cover_d.setRange(1.0, 2.0)
-        self._sp_ri_cover_d.setDecimals(4)
-        self._sp_ri_cover_d.setSingleStep(0.001)
-        self._sp_ri_cover_d.setValue(1.518)
-        rl.addRow("RI coverslip (design):", self._sp_ri_cover_d)
-
-        self._sp_ri_imm_d = QDoubleSpinBox()
-        self._sp_ri_imm_d.setRange(1.0, 2.0)
-        self._sp_ri_imm_d.setDecimals(4)
-        self._sp_ri_imm_d.setSingleStep(0.001)
-        self._sp_ri_imm_d.setValue(1.515)
-        rl.addRow("RI immersion (design):", self._sp_ri_imm_d)
 
         ctrl_layout.addWidget(ri_group)
 
@@ -1505,9 +1486,7 @@ class DeconvolveCIWindow(QMainWindow):
             ri = meta.get("refractive_index")
             if ri:
                 self._sp_ri_imm.setValue(float(ri))
-                self._sp_ri_imm_d.setValue(float(ri))
             self._sp_ri_imm.setStyleSheet(_bg("refractive_index" in from_file))
-            self._sp_ri_imm_d.setStyleSheet(_bg("refractive_index" in from_file))
             micro = meta.get("microscope_type")
             if micro:
                 idx = self._micro_combo.findText(micro)
@@ -1537,9 +1516,7 @@ class DeconvolveCIWindow(QMainWindow):
             # RI sample is never in metadata — red (needs user input)
             self._sp_ri_sample.setStyleSheet(
                 "background-color: #ffe0e0; color: black;")  # pastel red
-            # Coverslip RI and design params — always defaults, orange
-            self._sp_ri_cover.setStyleSheet(_bg(False))
-            self._sp_ri_cover_d.setStyleSheet(_bg(False))
+
 
             # Channel toggle buttons
             self._rebuild_channel_toggles()
@@ -1620,9 +1597,6 @@ class DeconvolveCIWindow(QMainWindow):
             "pixel_size_z_nm": self._sp_px_z.value(),
             "ri_immersion": self._sp_ri_imm.value(),
             "ri_sample": self._sp_ri_sample.value(),
-            "ri_coverslip": self._sp_ri_cover.value(),
-            "ri_coverslip_design": self._sp_ri_cover_d.value(),
-            "ri_immersion_design": self._sp_ri_imm_d.value(),
             "t_g": self._sp_tg.value(),
             "t_g0": self._sp_tg0.value(),
             "t_i0": self._sp_ti0.value(),
@@ -1797,9 +1771,6 @@ class DeconvolveCIWindow(QMainWindow):
             "ri_immersion": self._sp_ri_imm.value(),
             "ri_sample": self._sp_ri_sample.value(),
             "embedding_medium": self._medium_combo.currentText(),
-            "ri_coverslip": self._sp_ri_cover.value(),
-            "ri_coverslip_design": self._sp_ri_cover_d.value(),
-            "ri_immersion_design": self._sp_ri_imm_d.value(),
             "t_g": self._sp_tg.value(),
             "t_g0": self._sp_tg0.value(),
             "t_i0": self._sp_ti0.value(),
@@ -1872,9 +1843,6 @@ class DeconvolveCIWindow(QMainWindow):
                         self._medium_combo.blockSignals(True)
                         self._medium_combo.setCurrentIndex(idx)
                         self._medium_combo.blockSignals(False)
-        _spin(self._sp_ri_cover, "ri_coverslip")
-        _spin(self._sp_ri_cover_d, "ri_coverslip_design")
-        _spin(self._sp_ri_imm_d, "ri_immersion_design")
         _spin(self._sp_tg, "t_g")
         _spin(self._sp_tg0, "t_g0")
         _spin(self._sp_ti0, "t_i0")

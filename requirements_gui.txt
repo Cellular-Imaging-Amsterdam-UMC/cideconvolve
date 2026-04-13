@@ -1,0 +1,25 @@
+# ===========================================================================
+# Dependencies for the local GUI (gui_deconvolve_ci.py + launcher.py)
+# Python 3.10 or 3.11 recommended
+# ===========================================================================
+
+# PyTorch with CUDA 12.6 support
+--index-url https://download.pytorch.org/whl/cu126
+torch==2.4.1
+
+# Core
+numpy>=1.26,<3
+
+# GUI
+PyQt6>=6.5.0
+
+# OME-TIFF, OME-Zarr, CZI, ND2 reading via bioio
+bioio==3.2.0
+bioio-ome-tiff==1.4.0
+bioio-ome-zarr==3.3.0
+bioio-czi==2.6.1
+bioio-nd2==1.7.0
+
+# Optional — GPU / system monitoring widgets in the GUI
+psutil>=5.9.0
+nvidia-ml-py>=12.0.0

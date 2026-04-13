@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -279,11 +280,19 @@ class LauncherWindow(QMainWindow):
             return combo
 
         if ptype == "Number":
-            spin = QSpinBox()
-            spin.setMinimum(inp.get("minimum", 0))
-            spin.setMaximum(inp.get("maximum", 99999))
-            if default is not None:
-                spin.setValue(int(default))
+            if inp.get("integer", False):
+                spin = QSpinBox()
+                spin.setMinimum(int(inp.get("minimum", 0)))
+                spin.setMaximum(int(inp.get("maximum", 99999)))
+                if default is not None:
+                    spin.setValue(int(default))
+            else:
+                spin = QDoubleSpinBox()
+                spin.setDecimals(8)
+                spin.setMinimum(float(inp.get("minimum", 0)))
+                spin.setMaximum(float(inp.get("maximum", 99999)))
+                if default is not None:
+                    spin.setValue(float(default))
             return spin
 
         # Fallback: plain text

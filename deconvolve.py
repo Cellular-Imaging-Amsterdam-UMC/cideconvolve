@@ -2,35 +2,26 @@
 Microscopy image deconvolution module.
 
 Reads OME-TIFF microscopy images, generates physically accurate PSFs from
-image metadata, and performs deconvolution using multiple algorithms.
+image metadata, and performs deconvolution using CI SHB-accelerated
+Richardson-Lucy (with optional Total Variation regularisation).
 
-Backends:
-    - sdeconv (primary): Pure PyTorch, 2D+3D, Richardson-Lucy / Wiener / Spitfire
-    - pycudadecon (optional): CUDA-accelerated Richardson-Lucy for 3D
-
-PSF generation via psf_generator: scalar/vectorial propagation models with
-Gibson-Lanni aberration correction for high-NA objectives.
+Backend:
+    - CI RL / RLTV (PyTorch GPU/CPU): Scaled Heavy Ball accelerated
+      Richardson-Lucy with optional TV regularisation, Bertero boundary
+      weights, and I-divergence convergence monitoring.
 
 Considerations:
     1. Incomplete metadata: If OME-TIFF files lack microscope type or NA,
        sensible defaults are used (widefield, NA=1.4). All metadata can be
        overridden via function parameters.
-    2. Memory for large volumes: Full 3D Spitfire on large volumes is
-       memory-intensive. Richardson-Lucy is the default (most memory-efficient
-       iterative method). Consider plane_by_plane=True for very large volumes.
-       Approx memory: RL ~4x image size, Wiener ~3x, Spitfire ~8x.
-    3. Edge artifacts: Padding (default pad=13) reduces boundary artifacts in
-       all sdeconv algorithms. Adjustable via the pad parameter.
+    2. Memory for large volumes: Approx memory ~8x image size.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
@@ -59,21 +50,6 @@ logger = logging.getLogger(__name__)
 
 # OME XML namespace
 _OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
-
-# ---------------------------------------------------------------------------
-# External tool paths
-# ---------------------------------------------------------------------------
-
-_DECONVLAB2_JAR = Path(__file__).parent / "bin" / "DeconvolutionLab_2.jar"
-_IJ_JAR_CANDIDATES = [
-    Path(__file__).parent / "bin" / "ij-1.51h.jar",  # Docker: /app/bin/
-    Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or "")
-    / ".m2" / "repository" / "net" / "imagej" / "ij" / "1.51h" / "ij-1.51h.jar",
-]
-_IJ_JAR = next((p for p in _IJ_JAR_CANDIDATES if p.is_file()), _IJ_JAR_CANDIDATES[-1])
-_BIN_DIR = Path(__file__).parent / "bin"
-_DW_EXE = str(_BIN_DIR / "dw.exe") if (_BIN_DIR / "dw.exe").is_file() else (shutil.which("dw") or "")
-_DW_BW_EXE = str(_BIN_DIR / "dw_bw.exe") if (_BIN_DIR / "dw_bw.exe").is_file() else (shutil.which("dw_bw") or "")
 
 # ---------------------------------------------------------------------------
 # Helper: detect GPU availability
@@ -469,6 +445,13 @@ def generate_psf(
     *,
     psf_size_xy: Optional[int] = None,
     n_pix_pupil: int = 129,
+    ri_coverslip: Optional[float] = None,
+    ri_coverslip_design: Optional[float] = None,
+    ri_immersion_design: Optional[float] = None,
+    t_g: float = 170e3,
+    t_g0: float = 170e3,
+    t_i0: float = 100e3,
+    z_p: float = 0.0,
 ) -> np.ndarray:
     """Generate a physically accurate PSF from microscopy metadata.
 
@@ -538,7 +521,13 @@ def generate_psf(
         n_z=n_defocus,
         ri_immersion=ri,
         ri_sample=sample_ri,
-        ri_immersion_design=ri,
+        ri_coverslip=ri_coverslip if ri_coverslip is not None else ri,
+        ri_coverslip_design=ri_coverslip_design if ri_coverslip_design is not None else ri,
+        ri_immersion_design=ri_immersion_design if ri_immersion_design is not None else ri,
+        t_g=t_g,
+        t_g0=t_g0,
+        t_i0=t_i0,
+        z_p=z_p,
         microscope_type=microscope_type,
         excitation_nm=excitation_nm,
         n_pupil=n_pix_pupil,
@@ -559,18 +548,6 @@ def generate_psf(
 # Available methods and their approximate memory multiplier relative to image
 # size (Consideration 2: memory for large volumes)
 METHODS = {
-    "sdeconv_rl": {"memory_factor": 4, "description": "Iterative RL (PyTorch)"},
-    "sdeconv_wiener": {"memory_factor": 3, "description": "Wiener filter with Laplacian regularization"},
-    "sdeconv_spitfire": {"memory_factor": 8, "description": "Sparse Hessian variational deconvolution"},
-    "pycudadecon_rl_cuda": {"memory_factor": 4, "description": "CUDA-accelerated RL (pycudadecon)"},
-    "deconwolf_rl": {"memory_factor": 4, "description": "deconwolf Richardson-Lucy (CLI)"},
-    "deconwolf_shb": {"memory_factor": 4, "description": "deconwolf Scaled Heavy Ball (CLI)"},
-    "deconvlab2_rl": {"memory_factor": 4, "description": "DeconvolutionLab2 Richardson-Lucy (CLI)"},
-    "deconvlab2_rltv": {"memory_factor": 4, "description": "DeconvolutionLab2 RL-Total Variation (CLI)"},
-    "redlionfish_rl": {"memory_factor": 4, "description": "RedLionfish RL (OpenCL GPU + CPU fallback)"},
-    "skimage_rl": {"memory_factor": 4, "description": "scikit-image Richardson-Lucy (CPU)"},
-    "skimage_unsupervised_wiener": {"memory_factor": 3, "description": "scikit-image Unsupervised Wiener-Hunt (CPU)"},
-    "skimage_cucim_rl": {"memory_factor": 4, "description": "cuCIM Richardson-Lucy (CUDA GPU)"},
     "ci_rl": {"memory_factor": 8, "description": "CI SHB-accelerated RL (PyTorch GPU)"},
     "ci_rl_tv": {"memory_factor": 8, "description": "CI SHB-accelerated RL + TV (PyTorch GPU)"},
 }
@@ -752,8 +729,7 @@ def _pad_to_shape(
 ) -> np.ndarray:
     """Centre-pad *arr* with zeros so it matches *target_shape*.
 
-    Used when a backend returns a slightly smaller array than the input
-    (e.g. pycudadecon trims to FFT-friendly dimensions).
+    Used when a backend returns a slightly smaller array than the input.
     """
     if arr.shape == target_shape:
         return arr
@@ -816,7 +792,7 @@ def _deconvolve_tiled(
             tile_img, psf, method=method, tiling="none", **kwargs,
         )
 
-        # Fix shape if backend returned a different size (e.g. pycudadecon)
+        # Fix shape if backend returned a different size
         if tile_result.shape != tile_img.shape:
             logger.debug(
                 "  Tile result shape %s != input %s; padding to match.",
@@ -846,26 +822,18 @@ def _deconvolve_tiled(
 def deconvolve(
     image: np.ndarray,
     psf: np.ndarray,
-    method: str = "sdeconv_rl",
+    method: str = "ci_rl",
     *,
     # Richardson-Lucy parameters
     niter: int = 30,
-    # Wiener parameters
-    beta: float = 1e-5,
-    # Spitfire parameters
-    weight: float = 0.6,
-    reg: float = 0.995,
-    # General parameters (Consideration 3: edge artifacts)
-    pad: Union[int, tuple] = 13,
-    # Plane-by-plane processing for memory-constrained scenarios
-    plane_by_plane: bool = False,
-    # pycudadecon-specific parameters
-    dzdata: Optional[float] = None,
-    dxdata: Optional[float] = None,
     background: Union[int, str] = "auto",
-    # Device override for sdeconv backend
+    damping: Union[str, float] = 0.0,
+    convergence: str = "auto",
+    rel_threshold: float = 0.005,
+    check_every: int = 5,
+    # Device override
     device: Optional[str] = None,
-    # RLTV regularization (DeconvolutionLab2)
+    # RLTV regularization
     tv_lambda: float = 1e-4,
     # XY tiling for large images
     tiling: str = "custom",
@@ -882,37 +850,16 @@ def deconvolve(
         Point spread function, same dimensionality as image.
     method : str
         Deconvolution algorithm:
-        - 'sdeconv_rl' (default): Iterative RL via sdeconv (PyTorch).
-          Most memory-efficient iterative method. Good default.
-        - 'sdeconv_wiener': Wiener filter. Fastest, single-step, but may
-          amplify noise. Good for moderate SNR.
-        - 'sdeconv_spitfire': Sparse Hessian variational. Best quality for
-          sparse structures, but ~8x memory of image size. Avoid for very
-          large 3D.
-        - 'pycudadecon_rl_cuda': CUDA-accelerated RL via pycudadecon.
-          Fastest for large 3D volumes. Requires NVIDIA GPU and pycudadecon.
+        - 'ci_rl' (default): CI SHB-accelerated Richardson-Lucy (PyTorch).
+        - 'ci_rl_tv': CI SHB-accelerated RL + Total Variation.
     niter : int
         Number of iterations for Richardson-Lucy (default: 30).
-    beta : float
-        Regularization parameter for Wiener filter (default: 1e-5).
-    weight : float
-        Hessian/sparsity balance for Spitfire (default: 0.6).
-    reg : float
-        Regularization for Spitfire (default: 0.995).
-    pad : int or tuple
-        Padding to reduce edge artifacts (default: 13).
-    plane_by_plane : bool
-        If True, process 3D stacks as independent 2D slices. Reduces memory
-        but loses axial deconvolution quality.
-    dzdata : float, optional
-        Z step size in microns (for pycudadecon). Auto-detected if None.
-    dxdata : float, optional
-        XY pixel size in microns (for pycudadecon). Auto-detected if None.
     background : int or str
-        Background subtraction for pycudadecon (default: 'auto').
+        Background subtraction (default: 'auto').
     device : str, optional
-        Force device for sdeconv backend ('cpu' or 'cuda'). Auto-detected
-        if None.
+        Force device ('cpu' or 'cuda'). Auto-detected if None.
+    tv_lambda : float
+        TV regularization strength for ci_rl_tv (default: 1e-4).
     tiling : str
         Tiling mode.  ``"custom"`` (default) computes the minimum
         number of XY tiles so each tile fits within *max_tile_xy*
@@ -937,14 +884,11 @@ def deconvolve(
     if n_tiles > 1 and image.ndim == 3:
         return _deconvolve_tiled(
             image, psf, n_tiles, method=method,
-            niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
-            plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
-            background=background, device=device, tv_lambda=tv_lambda,
+            niter=niter, background=background, device=device,
+            tv_lambda=tv_lambda,
         )
 
     # Crop PSF to image size when it is larger (e.g. n_defocus = 2*nz-1).
-    # The extra PSF extent beyond the image edges has no matching data, so
-    # centre-cropping is safe and prevents size-mismatch errors in backends.
     if psf.ndim == image.ndim:
         slices = []
         for ax in range(psf.ndim):
@@ -958,52 +902,13 @@ def deconvolve(
             psf = psf[tuple(slices)].copy()
             logger.info("PSF cropped to image size: %s", psf.shape)
 
-    if method in ("ci_rl", "ci_rl_tv"):
-        return _deconvolve_ci_rl(
-            image, psf, niter=niter,
-            tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
-            background=background, device=device,
-        )
-
-    if method == "pycudadecon_rl_cuda":
-        return _deconvolve_pycudadecon(
-            image, psf, niter=niter, dzdata=dzdata, dxdata=dxdata,
-            background=background, plane_by_plane=plane_by_plane,
-        )
-
-    if method.startswith("deconwolf_"):
-        dw_method = method.split("_", 1)[1]  # "rl" or "shb"
-        use_gpu = (device or "").startswith("cuda") or (
-            device is None and torch.cuda.is_available()
-        )
-        return _deconvolve_deconwolf(
-            image, psf, niter=niter, method=dw_method, gpu=use_gpu,
-        )
-
-    if method.startswith("deconvlab2_"):
-        dl2_algo = method.split("_", 1)[1].upper()  # "RL" or "RLTV"
-        return _deconvolve_deconvlab2(
-            image, psf, algorithm=dl2_algo, niter=niter, tv_lambda=tv_lambda,
-        )
-
-    if method == "redlionfish_rl":
-        use_gpu = (device or "").startswith("cuda") or (
-            device is None  # auto: let RedLionfish try GPU first
-        )
-        return _deconvolve_redlionfish(image, psf, niter=niter, gpu=use_gpu)
-
-    if method == "skimage_rl":
-        return _deconvolve_skimage_rl(image, psf, niter=niter)
-
-    if method == "skimage_unsupervised_wiener":
-        return _deconvolve_skimage_unsupervised_wiener(image, psf, niter=niter)
-
-    if method == "skimage_cucim_rl":
-        return _deconvolve_cucim_rl(image, psf, niter=niter)
-
-    return _deconvolve_sdeconv(
-        image, psf, method=method, niter=niter, beta=beta, weight=weight,
-        reg=reg, pad=pad, plane_by_plane=plane_by_plane, device=device,
+    return _deconvolve_ci_rl(
+        image, psf, niter=niter,
+        tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
+        background=background, damping=damping,
+        convergence=convergence, rel_threshold=rel_threshold,
+        check_every=check_every, device=device,
+        tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
     )
 
 
@@ -1018,7 +923,14 @@ def _deconvolve_ci_rl(
     niter: int = 50,
     tv_lambda: float = 0.0,
     background: Union[int, str] = "auto",
+    damping: Union[str, float] = 0.0,
+    convergence: str = "auto",
+    rel_threshold: float = 0.005,
+    check_every: int = 5,
     device: Optional[str] = None,
+    tiling: str = "custom",
+    max_tile_xy: int = MAX_TILE_XY,
+    max_tile_z: int = MAX_TILE_Z,
 ) -> np.ndarray:
     from deconvolve_ci import ci_rl_deconvolve
     result = ci_rl_deconvolve(
@@ -1026,506 +938,17 @@ def _deconvolve_ci_rl(
         niter=niter,
         tv_lambda=tv_lambda,
         background=background,
+        damping=damping,
+        convergence=convergence,
+        rel_threshold=rel_threshold,
+        check_every=check_every,
         device=device,
+        tiling=tiling,
+        max_tile_xy=max_tile_xy,
+        max_tile_z=max_tile_z,
     )
     return result["result"]
 
-
-def _deconvolve_sdeconv(
-    image: np.ndarray,
-    psf: np.ndarray,
-    method: str,
-    niter: int,
-    beta: float,
-    weight: float,
-    reg: float,
-    pad: Union[int, tuple],
-    plane_by_plane: bool,
-    device: Optional[str] = None,
-) -> np.ndarray:
-    """Deconvolve using sdeconv (PyTorch backend)."""
-    from vendor.sdeconv import SRichardsonLucy, SWiener, Spitfire
-
-    device = torch.device(device if device else _get_device())
-    psf_t = torch.from_numpy(psf).float().to(device)
-
-    # Build the deconvolution filter
-    if method == "sdeconv_rl":
-        deconv_filter = SRichardsonLucy(psf_t, niter=niter, pad=pad)
-    elif method == "sdeconv_wiener":
-        deconv_filter = SWiener(psf_t, beta=beta, pad=pad)
-    elif method == "sdeconv_spitfire":
-        delta = 1.0  # Z/XY resolution ratio (could be computed from metadata)
-        deconv_filter = Spitfire(psf_t, weight=weight, reg=reg, pad=pad, delta=delta)
-    else:
-        raise ValueError(f"Unknown sdeconv method: {method}")
-
-    if plane_by_plane and image.ndim == 3:
-        # Process each Z-slice independently (Consideration 2)
-        # Use a 2D PSF: take the central Z-slice of the 3D PSF
-        if psf.ndim == 3:
-            center_z = psf.shape[0] // 2
-            psf_2d = psf[center_z]
-            psf_2d_t = torch.from_numpy(psf_2d).float().to(device)
-            if method == "sdeconv_rl":
-                deconv_filter = SRichardsonLucy(psf_2d_t, niter=niter, pad=pad)
-            elif method == "sdeconv_wiener":
-                deconv_filter = SWiener(psf_2d_t, beta=beta, pad=pad)
-            elif method == "sdeconv_spitfire":
-                deconv_filter = Spitfire(psf_2d_t, weight=weight, reg=reg, pad=pad)
-
-        result_slices = []
-        for z in range(image.shape[0]):
-            slice_t = torch.from_numpy(image[z]).float().to(device)
-            out = deconv_filter(slice_t)
-            result_slices.append(out.detach().cpu().numpy())
-        result = np.stack(result_slices, axis=0)
-    else:
-        image_t = torch.from_numpy(image).float().to(device)
-        result = deconv_filter(image_t).detach().cpu().numpy()
-
-    # Ensure non-negative
-    result = np.clip(result, 0, None).astype(np.float32)
-    return result
-
-
-def _deconvolve_pycudadecon(
-    image: np.ndarray,
-    psf: np.ndarray,
-    niter: int,
-    dzdata: Optional[float],
-    dxdata: Optional[float],
-    background: Union[int, str],
-    plane_by_plane: bool = False,
-) -> np.ndarray:
-    """Deconvolve using pycudadecon (CUDA-accelerated RL)."""
-    try:
-        import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Unable to find function: camcor_interface")
-            from pycudadecon import decon
-    except ImportError:
-        raise ImportError(
-            "pycudadecon is not installed. Install via: "
-            "conda install -c conda-forge pycudadecon"
-        )
-
-    if plane_by_plane and image.ndim == 3:
-        # Process each Z-slice independently using a 2D PSF
-        if psf.ndim == 3:
-            psf_2d = psf[psf.shape[0] // 2]  # central Z-slice
-        else:
-            psf_2d = psf
-        psf_3d = psf_2d[np.newaxis, :, :]  # (1, Y, X)
-
-        result_slices = []
-        for z in range(image.shape[0]):
-            slice_3d = image[z][np.newaxis, :, :]  # (1, Y, X)
-            out = decon(
-                slice_3d, psf_3d,
-                dzdata=dzdata or 0.1, dxdata=dxdata or 0.1,
-                n_iters=niter, background=background,
-            )
-            sl = np.asarray(out, dtype=np.float32)[0]
-            if sl.shape != image.shape[1:]:
-                sl = _pad_to_shape(sl, image.shape[1:])
-            result_slices.append(sl)
-        return np.clip(np.stack(result_slices, axis=0), 0, None)
-
-    if image.ndim != 3:
-        raise ValueError(
-            "pycudadecon requires 3-D image (CUDA FFT requires Z > 1)."
-        )
-    if psf.ndim != 3:
-        raise ValueError("PSF must be 3D for pycudadecon.")
-
-    result = decon(
-        image,
-        psf,
-        dzdata=dzdata or 0.1,
-        dxdata=dxdata or 0.1,
-        n_iters=niter,
-        background=background,
-    )
-    result = np.clip(np.asarray(result, dtype=np.float32), 0, None)
-
-    # pycudadecon may trim to FFT-friendly dimensions — pad back to input shape
-    if result.shape != image.shape:
-        logger.debug(
-            "pycudadecon output %s != input %s; padding to match.",
-            result.shape, image.shape,
-        )
-        result = _pad_to_shape(result, image.shape)
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# External CLI backends: deconwolf & DeconvolutionLab2
-# ---------------------------------------------------------------------------
-
-def generate_psf_deconwolf(
-    metadata: dict[str, Any],
-    channel_idx: int = 0,
-    *,
-    output_path: Optional[Union[str, Path]] = None,
-) -> np.ndarray:
-    """Generate a PSF using deconwolf's *dw_bw* Born-Wolf model.
-
-    Parameters
-    ----------
-    metadata : dict
-        Microscopy metadata as returned by ``load_image()['metadata']``.
-    channel_idx : int
-        Channel index whose emission wavelength is used.
-    output_path : path, optional
-        Where to save the PSF TIFF.  A temp file is used if *None*.
-
-    Returns
-    -------
-    numpy.ndarray
-        Normalised PSF, shape ``(Z, Y, X)``, sum ≈ 1.
-    """
-    dw_bw = _DW_BW_EXE
-    if not dw_bw:
-        raise FileNotFoundError(
-            "dw_bw not found on PATH. Install deconwolf: "
-            "https://github.com/elgw/deconwolf/releases"
-        )
-
-    na = metadata["na"]
-    ri = metadata["refractive_index"]
-    pix_xy_nm = metadata["pixel_size_x"] * 1000.0
-    pix_z_nm = metadata.get("pixel_size_z", 0.3) * 1000.0
-    n_z = metadata.get("size_z", 1)
-    ch = metadata["channels"][channel_idx]
-    wavelength_nm = ch.get("emission_wavelength", 520.0)
-
-    # Lateral size: ~4× Airy radius, odd, ≥ 65
-    airy_px = 0.61 * wavelength_nm / na / pix_xy_nm
-    size_xy = int(max(65, 2 * int(4 * airy_px) + 1))
-    if size_xy % 2 == 0:
-        size_xy += 1
-    # Axial slices: match image depth (odd, ≥ 2*nz - 1)
-    n_slice = max(2 * n_z - 1, 1)
-    if n_slice % 2 == 0:
-        n_slice += 1
-
-    use_temp = output_path is None
-    if use_temp:
-        fd, output_path = tempfile.mkstemp(suffix=".tif", prefix="dw_psf_")
-        os.close(fd)
-    output_path = Path(output_path)
-
-    cmd = [
-        dw_bw,
-        "--resxy", str(int(round(pix_xy_nm))),
-        "--resz", str(int(round(pix_z_nm))),
-        "--NA", f"{na:.4f}",
-        "--ni", f"{ri:.4f}",
-        "--lambda", str(int(round(wavelength_nm))),
-        "--size", str(size_xy),
-        "--nslice", str(n_slice),
-        "--overwrite",
-        str(output_path),
-    ]
-    logger.info("dw_bw command: %s", " ".join(cmd))
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
-
-    psf = tifffile.imread(str(output_path)).astype(np.float32)
-    if use_temp:
-        output_path.unlink(missing_ok=True)
-        Path(str(output_path) + ".log.txt").unlink(missing_ok=True)
-    if psf.ndim == 2:
-        psf = psf[np.newaxis]
-    psf_sum = psf.sum()
-    if psf_sum > 0:
-        psf /= psf_sum
-    return psf
-
-
-def _deconvolve_deconwolf(
-    image: np.ndarray,
-    psf: np.ndarray,
-    niter: int = 30,
-    method: str = "rl",
-    gpu: bool = False,
-) -> np.ndarray:
-    """Deconvolve a single 3-D volume using the *dw* CLI.
-
-    *image* and *psf* are written to temp TIFFs, ``dw`` is invoked, and the
-    result is read back as a numpy array.
-    """
-    dw = _DW_EXE
-    if not dw:
-        raise FileNotFoundError(
-            "dw not found on PATH. Install deconwolf: "
-            "https://github.com/elgw/deconwolf/releases"
-        )
-
-    if image.ndim != 3 or psf.ndim != 3:
-        raise ValueError("deconwolf requires 3-D image.")
-
-    tmp = tempfile.mkdtemp(prefix="dw_")
-    try:
-        img_path = os.path.join(tmp, "image.tif")
-        psf_path = os.path.join(tmp, "psf.tif")
-        out_path = os.path.join(tmp, f"{method}_image.tif")
-
-        tifffile.imwrite(img_path, image.astype(np.float32))
-        tifffile.imwrite(psf_path, psf.astype(np.float32))
-
-        cmd = [
-            dw,
-            "--iter", str(niter),
-            "--method", method,
-            "--overwrite",
-        ]
-        if gpu:
-            cmd.append("--gpu")
-        cmd += [img_path, psf_path]
-        logger.info("dw command: %s", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
-        # Fallback: if --gpu failed due to OpenCL, retry without it
-        if proc.returncode != 0 and gpu and (
-            "cl_util.c" in proc.stderr or proc.returncode < 0
-        ):
-            logger.warning(
-                "dw --gpu failed (OpenCL/signal error, rc=%d), "
-                "retrying without --gpu",
-                proc.returncode,
-            )
-            cmd = [c for c in cmd if c != "--gpu"]
-            logger.info("dw command (cpu fallback): %s", " ".join(cmd))
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-
-        if proc.returncode != 0:
-            raise RuntimeError(f"dw failed (rc={proc.returncode}): {proc.stderr}")
-
-        if not os.path.exists(out_path):
-            # fallback: find any output that isn't our input files
-            inputs = {"image.tif", "psf.tif"}
-            candidates = [f for f in os.listdir(tmp)
-                          if f.endswith(".tif") and f not in inputs]
-            if candidates:
-                out_path = os.path.join(tmp, candidates[0])
-            else:
-                raise FileNotFoundError(
-                    f"deconwolf produced no output in {tmp}: {os.listdir(tmp)}"
-                )
-
-        result = tifffile.imread(out_path).astype(np.float32)
-        return np.clip(result, 0, None)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def _deconvolve_deconvlab2(
-    image: np.ndarray,
-    psf: np.ndarray,
-    algorithm: str = "RL",
-    niter: int = 30,
-    tv_lambda: float = 1e-4,
-) -> np.ndarray:
-    """Deconvolve a single 3-D volume using DeconvolutionLab2 CLI.
-
-    Writes temp TIFFs, invokes DL2 via ``java -cp ...``, reads the result.
-    """
-    dl2_jar = _DECONVLAB2_JAR
-    ij_jar = _IJ_JAR
-    if not dl2_jar.exists():
-        raise FileNotFoundError(f"DeconvolutionLab2 JAR not found: {dl2_jar}")
-    if not ij_jar.exists():
-        raise FileNotFoundError(f"ImageJ JAR not found: {ij_jar}")
-    java = shutil.which("java")
-    if not java:
-        raise FileNotFoundError("java not found on PATH.")
-
-    if image.ndim not in (2, 3) or psf.ndim not in (2, 3):
-        raise ValueError("DeconvolutionLab2 requires 2-D or 3-D image and PSF arrays.")
-
-    tmp = tempfile.mkdtemp(prefix="dl2_")
-    try:
-        img_path = os.path.join(tmp, "image.tif")
-        psf_path = os.path.join(tmp, "psf.tif")
-        result_name = "result"
-
-        tifffile.imwrite(img_path, image.astype(np.float32))
-        tifffile.imwrite(psf_path, psf.astype(np.float32))
-
-        # Build algorithm spec
-        if algorithm == "RLTV":
-            algo_spec = f"RLTV {niter} {tv_lambda}"
-        else:
-            algo_spec = f"{algorithm} {niter}"
-
-        sep = ";" if sys.platform == "win32" else ":"
-        cp = f"{dl2_jar}{sep}{ij_jar}"
-        cmd = [
-            java, "-cp", cp, "DeconvolutionLab2", "Run",
-            "-image", "file", img_path,
-            "-psf", "file", psf_path,
-            "-algorithm", *algo_spec.split(),
-            "-out", "stack", "noshow", result_name,
-            "-path", tmp,
-            "-monitor", "console",
-        ]
-        logger.info("DL2 command: %s", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"DeconvolutionLab2 failed (rc={proc.returncode}): {proc.stderr}"
-            )
-
-        # DL2 saves output as <result_name>.tif in -path directory
-        out_path = os.path.join(tmp, f"{result_name}.tif")
-        if not os.path.exists(out_path):
-            # Try other common suffixes
-            for ext in (".tiff", ".ome.tif"):
-                alt = os.path.join(tmp, result_name + ext)
-                if os.path.exists(alt):
-                    out_path = alt
-                    break
-            else:
-                tifs = [f for f in os.listdir(tmp) if f.endswith((".tif", ".tiff"))]
-                raise FileNotFoundError(
-                    f"DL2 output not found. Files in {tmp}: {tifs}\n"
-                    f"stdout: {proc.stdout[-500:]}\nstderr: {proc.stderr[-500:]}"
-                )
-
-        result = tifffile.imread(out_path).astype(np.float32)
-        return np.clip(result, 0, None)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def _deconvolve_redlionfish(
-    image: np.ndarray,
-    psf: np.ndarray,
-    niter: int = 30,
-    gpu: bool = True,
-) -> np.ndarray:
-    """Deconvolve a single 3-D volume using RedLionfish.
-
-    Uses OpenCL GPU acceleration with automatic CPU fallback.
-    """
-    try:
-        import RedLionfishDeconv as rl
-    except ImportError as exc:
-        raise ImportError(
-            "RedLionfish not installed.  pip install redlionfish"
-        ) from exc
-
-    if image.ndim != 3 or psf.ndim != 3:
-        raise ValueError("RedLionfish requires 3-D image.")
-
-    method = "gpu" if gpu else "cpu"
-    result = rl.doRLDeconvolutionFromNpArrays(
-        image.astype(np.float32),
-        psf.astype(np.float32),
-        niter=niter,
-        method=method,
-        resAsUint8=False,
-    )
-    return np.clip(result.astype(np.float32), 0, None)
-
-
-def _deconvolve_skimage_rl(
-    image: np.ndarray,
-    psf: np.ndarray,
-    niter: int = 30,
-) -> np.ndarray:
-    """Deconvolve using scikit-image Richardson-Lucy (CPU).
-
-    Handles 2-D and 3-D images natively.
-    Pads with reflect boundary to suppress edge artifacts from FFT zero-padding.
-    """
-    from skimage.restoration import richardson_lucy
-
-    # Pad each spatial axis by half the PSF extent (reflect) to avoid
-    # bright-edge artifacts caused by the zero-padding inside fftconvolve.
-    pad_widths = tuple((s // 2, s // 2) for s in psf.shape)
-    image_padded = np.pad(image.astype(np.float32), pad_widths, mode="reflect")
-
-    result_padded = richardson_lucy(
-        image_padded, psf.astype(np.float32),
-        num_iter=niter, clip=False, filter_epsilon=None,
-    )
-    # Crop back to original size
-    slices = tuple(slice(p[0], p[0] + s) for p, s in zip(pad_widths, image.shape))
-    result = result_padded[slices]
-    return np.clip(result.astype(np.float32), 0, None)
-
-
-def _deconvolve_skimage_unsupervised_wiener(
-    image: np.ndarray,
-    psf: np.ndarray,
-    niter: int = 30,
-) -> np.ndarray:
-    """Deconvolve using scikit-image Unsupervised Wiener-Hunt (CPU).
-
-    The algorithm is 2-D only, so 3-D stacks are processed plane-by-plane.
-    Hyperparameters (noise and prior precision) are estimated automatically
-    via Gibbs sampling.
-    """
-    from skimage.restoration import unsupervised_wiener
-
-    user_params = {"max_num_iter": niter}
-
-    def _wiener_2d(plane: np.ndarray) -> np.ndarray:
-        # Normalise to [0, 1] for skimage pipeline compatibility
-        lo, hi = plane.min(), plane.max()
-        if hi > lo:
-            plane_norm = (plane - lo) / (hi - lo)
-        else:
-            plane_norm = np.zeros_like(plane)
-        result, _ = unsupervised_wiener(
-            plane_norm.astype(np.float64),
-            psf_2d.astype(np.float64),
-            user_params=user_params,
-            clip=False,
-        )
-        # Rescale back
-        result = result.astype(np.float32) * (hi - lo) + lo
-        return np.clip(result, 0, None)
-
-    if image.ndim == 2:
-        psf_2d = psf if psf.ndim == 2 else psf[psf.shape[0] // 2]
-        return _wiener_2d(image)
-
-    # 3-D: process each Z plane with the central PSF slice
-    psf_2d = psf[psf.shape[0] // 2] if psf.ndim == 3 else psf
-    result = np.empty_like(image, dtype=np.float32)
-    for z in range(image.shape[0]):
-        result[z] = _wiener_2d(image[z])
-    return result
-
-
-def _deconvolve_cucim_rl(
-    image: np.ndarray,
-    psf: np.ndarray,
-    niter: int = 30,
-) -> np.ndarray:
-    """Deconvolve using cuCIM Richardson-Lucy (CUDA GPU).
-
-    Drop-in GPU replacement for scikit-image RL; requires cupy + cucim.
-    """
-    try:
-        import cupy as cp
-        from cucim.skimage.restoration import richardson_lucy
-    except ImportError as exc:
-        raise ImportError(
-            "cuCIM not installed.  pip install cucim-cu12 cupy-cuda12x"
-        ) from exc
-
-    image_gpu = cp.asarray(image.astype(np.float32))
-    psf_gpu = cp.asarray(psf.astype(np.float32))
-    result_gpu = richardson_lucy(
-        image_gpu, psf_gpu, num_iter=niter, clip=False, filter_epsilon=None,
-    )
-    result = cp.asnumpy(result_gpu).astype(np.float32)
-    return np.clip(result, 0, None)
 
 
 # ===========================================================================
@@ -1534,7 +957,7 @@ def _deconvolve_cucim_rl(
 
 def deconvolve_image(
     path: Union[str, Path],
-    method: str = "sdeconv_rl",
+    method: str = "ci_rl",
     channels: Optional[Sequence[int]] = None,
     *,
     # Metadata overrides (Consideration 1)
@@ -1549,14 +972,20 @@ def deconvolve_image(
     # PSF options
     psf_size_xy: Optional[int] = None,
     n_pix_pupil: int = 129,
+    ri_coverslip: Optional[float] = None,
+    ri_coverslip_design: Optional[float] = None,
+    ri_immersion_design: Optional[float] = None,
+    t_g: float = 170e3,
+    t_g0: float = 170e3,
+    t_i0: float = 100e3,
+    z_p: float = 0.0,
     # Deconvolution options
-    niter: int = 30,
-    beta: float = 1e-5,
-    weight: float = 0.6,
-    reg: float = 0.995,
-    pad: Union[int, tuple] = 13,
-    plane_by_plane: bool = False,
+    niter: Union[int, list[int]] = 30,
     background: Union[int, str] = "auto",
+    damping: Union[str, float] = 0.0,
+    convergence: str = "auto",
+    rel_threshold: float = 0.005,
+    check_every: int = 5,
     device: Optional[str] = None,
     tv_lambda: float = 1e-4,
     tiling: str = "custom",
@@ -1580,7 +1009,7 @@ def deconvolve_image(
         Metadata overrides (see load_image() for details).
     psf_size_xy, n_pix_pupil
         PSF generation options (see generate_psf() for details).
-    niter, beta, weight, reg, pad, plane_by_plane, background
+    niter, background, device, tv_lambda
         Deconvolution options (see deconvolve() for details).
 
     Returns
@@ -1609,10 +1038,6 @@ def deconvolve_image(
     if channels is None:
         channels = list(range(len(images)))
 
-    # Prepare pycudadecon pixel sizes if needed
-    dzdata = metadata.get("pixel_size_z")
-    dxdata = metadata.get("pixel_size_x")
-
     results: list[np.ndarray] = []
     psfs: list[np.ndarray] = []
 
@@ -1628,6 +1053,10 @@ def deconvolve_image(
         psf = generate_psf(
             metadata, channel_idx=ch_idx,
             psf_size_xy=psf_size_xy, n_pix_pupil=n_pix_pupil,
+            ri_coverslip=ri_coverslip,
+            ri_coverslip_design=ri_coverslip_design,
+            ri_immersion_design=ri_immersion_design,
+            t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
         )
         psfs.append(psf)
 
@@ -1639,12 +1068,19 @@ def deconvolve_image(
             # Expand 2D PSF into 3D (single-plane)
             psf = psf[np.newaxis, :, :]
 
+        # Per-channel iteration count
+        if isinstance(niter, list):
+            ch_niter = niter[ch_idx] if ch_idx < len(niter) else niter[-1]
+        else:
+            ch_niter = niter
+
         # Deconvolve
         result = deconvolve(
             img, psf, method=method,
-            niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
-            plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
-            background=background, device=device, tv_lambda=tv_lambda,
+            niter=ch_niter, background=background, damping=damping,
+            convergence=convergence, rel_threshold=rel_threshold,
+            check_every=check_every, device=device,
+            tv_lambda=tv_lambda,
             tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
         )
         results.append(result)
