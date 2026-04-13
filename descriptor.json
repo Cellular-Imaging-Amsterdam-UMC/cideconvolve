@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --tv_lambda @tv_lambda --background @background --damping @damping --convergence @convergence --rel_threshold @rel_threshold --check_every @check_every --t_g @t_g --t_g0 @t_g0 --t_i0 @t_i0 --z_p @z_p --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --projection @projection --benchmark @benchmark --bench_crop @bench_crop",
+  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --tv_lambda @tv_lambda --background @background --damping @damping --convergence @convergence --rel_threshold @rel_threshold --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --projection @projection --benchmark @benchmark --bench_crop @bench_crop",
   "inputs": [
     {
       "id": "iterations",
@@ -206,72 +206,6 @@
       "type": "Number",
       "minimum": 0.00000001,
       "maximum": 1
-    },
-    {
-      "id": "check_every",
-      "value-key": "@check_every",
-      "command-line-flag": "--check_every",
-      "name": "Check every N iterations",
-      "description": "How often to check convergence (every N iterations).",
-      "default-value": 5,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "integer": true,
-      "minimum": 1,
-      "maximum": 1000
-    },
-    {
-      "id": "t_g",
-      "value-key": "@t_g",
-      "command-line-flag": "--t_g",
-      "name": "Coverslip thickness (nm)",
-      "description": "Actual coverslip thickness in nanometers for Gibson-Lanni PSF model.",
-      "default-value": 170000,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 10000000
-    },
-    {
-      "id": "t_g0",
-      "value-key": "@t_g0",
-      "command-line-flag": "--t_g0",
-      "name": "Coverslip thickness design (nm)",
-      "description": "Design coverslip thickness in nanometers for Gibson-Lanni PSF model.",
-      "default-value": 170000,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 10000000
-    },
-    {
-      "id": "t_i0",
-      "value-key": "@t_i0",
-      "command-line-flag": "--t_i0",
-      "name": "Immersion thickness design (nm)",
-      "description": "Design immersion thickness in nanometers for Gibson-Lanni PSF model.",
-      "default-value": 100000,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 10000000
-    },
-    {
-      "id": "z_p",
-      "value-key": "@z_p",
-      "command-line-flag": "--z_p",
-      "name": "Particle depth (nm)",
-      "description": "Depth of the particle below the coverslip in nanometers for Gibson-Lanni PSF model.",
-      "default-value": 0,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 10000000
     },
     {
       "id": "pixel_size_xy",

@@ -1,20 +1,41 @@
 # CIDeconvolve
 
-**3-D / 2-D microscopy deconvolution with 11 algorithm backends.**
+**GPU-accelerated 3-D / 2-D microscopy deconvolution with SHB Richardson-Lucy.**
 
 CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible
 workflow that deconvolves widefield and confocal fluorescence microscopy
-images.  It generates a theoretically correct PSF from OME-TIFF metadata
-and applies a user-selected deconvolution method — ranging from fast CUDA
-GPU implementations to portable CPU-only fall-backs.
+images.  It generates a physically accurate PSF from OME-TIFF metadata
+(Gibson–Lanni model) and applies Scaled Heavy Ball (SHB) accelerated
+Richardson-Lucy deconvolution with optional Total Variation regularisation —
+all on the GPU via PyTorch.
 
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
-| **Version** | v0.1.0 |
+| **Version** | v1.0.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
-| **Available methods** | 11 — see [METHODS.md](METHODS.md) |
-| **Benchmark** | built-in multi-method benchmark — see [BENCHMARK.md](BENCHMARK.md) |
+| **Methods** | `ci_rl` (SHB-accelerated RL) · `ci_rl_tv` (+ TV regularisation) |
+| **Benchmark** | built-in with timing metrics CSV and MIP montages |
+
+---
+
+## Methods
+
+### `ci_rl` — Scaled Heavy Ball Accelerated Richardson-Lucy
+
+Standard Richardson-Lucy enhanced with **Scaled Heavy Ball (SHB) momentum
+acceleration** (Wang & Miller 2014).  Achieves 5–10× faster convergence
+than vanilla RL at no extra per-iteration cost.  Includes Bertero boundary
+correction weights and I-divergence convergence monitoring.
+
+### `ci_rl_tv` — SHB-RL with Total Variation Regularisation
+
+Same as `ci_rl` with an additional **Total Variation (TV) penalty** after
+each RL update (Dey et al. 2006).  Suppresses noise amplification at high
+iteration counts while preserving edges.  Controlled by the `--tv_lambda`
+parameter (typical range 0.0001–0.01).
+
+For full algorithmic details see [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD).
 
 ---
 
@@ -65,8 +86,7 @@ A ready-made SLURM script is provided for manual cluster submission
 sbatch cideconvolve.slurm \
     --infolder /data/myimages \
     --outfolder /data/results \
-    -- --method sdeconv_rl --iterations 40 --benchmark True \
-       --bench_methods all
+    -- --method ci_rl --iterations 40 --benchmark True
 ```
 
 See `cideconvolve.slurm` for full usage and resource settings.
@@ -76,16 +96,12 @@ See `cideconvolve.slurm` for full usage and resource settings.
 ## Building the Docker image locally
 
 ```bash
-docker build -t w_cideconvolve:v0.1.0 -t w_cideconvolve:latest .
+docker build -t w_cideconvolve:v1.0.0 -t w_cideconvolve:latest .
 ```
 
-The Dockerfile uses a multi-stage build:
-
-1. **Builder stage** — compiles [deconwolf](https://github.com/elgw/deconwolf)
-   from source with OpenCL GPU support on the NVIDIA CUDA 12.6 devel image.
-2. **Runtime stage** — NVIDIA CUDA 12.6 runtime + Java 17 +
-   Miniforge (conda) with `pycudadecon`, all Python dependencies, and
-   the application code.
+The Dockerfile builds on the **NVIDIA CUDA 12.6 runtime** image with
+Python 3.11 and all pip dependencies — no Java, no conda, no compilation
+step required.
 
 ### Prerequisites
 
@@ -105,7 +121,7 @@ docker run --rm --gpus all \
     -v /tmp/gt:/data/gt \
     cellularimagingcf/w_cideconvolve \
     --infolder /data/in --outfolder /data/out --gtfolder /data/gt \
-    --method sdeconv_rl --iterations 40 \
+    --method ci_rl --iterations 40 \
     --na auto --refractive_index auto --sample_ri auto \
     --microscope_type auto --emission_wl auto --excitation_wl auto
 ```
@@ -122,8 +138,13 @@ docker run --rm --gpus all \
     -v /tmp/gt:/data/gt \
     cellularimagingcf/w_cideconvolve \
     --infolder /data/in --outfolder /data/out --gtfolder /data/gt \
-    --benchmark True --bench_methods all --bench_iterations "20, 40, 60"
+    --benchmark True --bench_crop True
 ```
+
+Benchmark mode deconvolves the first input image with both `ci_rl` and
+`ci_rl_tv` at multiple iteration counts (20, 40, 60), writes a CSV with
+timing and image-quality metrics (sharpness, contrast, noise proxy), and
+generates MIP montage images.
 
 ---
 
@@ -132,9 +153,7 @@ docker run --rm --gpus all \
 ### Requirements
 
 - Python 3.10 or 3.11
-- PyTorch with CUDA support (see `requirements.txt` for install instructions)
-- Java 17+ (for DeconvolutionLab2 methods)
-- Optional: pycudadecon via conda, deconwolf binary on `$PATH`
+- PyTorch 2.4+ with CUDA support
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
@@ -146,7 +165,7 @@ pip install -r requirements.txt
 ```bash
 python wrapper.py \
     --infolder ./infolder --outfolder ./outfolder --gtfolder ./gtfolder \
-    --method sdeconv_rl --iterations 40 \
+    --method ci_rl --iterations 40 \
     --na auto --refractive_index auto --sample_ri auto
 ```
 
@@ -156,7 +175,6 @@ A PyQt6-based launcher provides a graphical interface with parameter
 controls, folder pickers, and a live command preview:
 
 ```bash
-pip install PyQt6
 python launcher.py
 ```
 
@@ -172,10 +190,10 @@ command line via `wrapper.py`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--iterations` | 40 | Number of RL iterations |
-| `--tiling` | custom | Tiling mode (`none` or `custom`) |
-| `--tile_limits` | 512, 64 | Max tile dimensions `max_xy, max_z` (used when tiling = `custom`) |
-| `--method` | sdeconv_rl | Deconvolution backend — see [METHODS.md](METHODS.md) |
+| `--iterations` | 40 | Number of RL iterations (comma-separated for per-channel) |
+| `--tiling` | custom | Tiling mode: `none` or `custom` |
+| `--tile_limits` | 512, 64 | Max tile dimensions `max_xy, max_z` (when tiling = `custom`) |
+| `--method` | ci_rl | Deconvolution method: `ci_rl` or `ci_rl_tv` |
 | `--device` | auto | Compute device: `auto`, `cpu`, `cuda` |
 | `--na` | auto | Numerical aperture override |
 | `--refractive_index` | auto | Immersion medium RI (`air`, `water`, `oil`) |
@@ -183,46 +201,52 @@ command line via `wrapper.py`:
 | `--microscope_type` | auto | `widefield` or `confocal` |
 | `--emission_wl` | auto | Emission wavelengths in nm (comma-separated) |
 | `--excitation_wl` | auto | Excitation wavelengths in nm (for confocal PSF) |
+| `--tv_lambda` | 0.001 | TV regularisation strength (only for `ci_rl_tv`) |
+| `--background` | auto | Background subtraction: `auto`, numeric value, or `0` to disable |
+| `--damping` | none | Noise suppression damping factor: `none`, `auto`, or numeric |
+| `--convergence` | auto | Early-stopping convergence: `auto` or `none` |
+| `--rel_threshold` | 0.005 | Relative change threshold for early stopping |
+| `--pixel_size_xy` | auto | Lateral pixel size in nm |
+| `--pixel_size_z` | auto | Axial pixel size (Z step) in nm |
 | `--projection` | none | Z-projection: `none`, `mip`, `sum` |
-| `--benchmark` | false | Run multi-method benchmark |
-| `--bench_iterations` | 20, 40, 60 | Iteration counts for benchmark |
-| `--bench_methods` | sdeconv_rl, pycudadecon_rl_cuda | Method set for benchmark |
-| `--bench_crop` | true | Centre-crop images before benchmarking |
-| `--bench_one_image` | true | Benchmark only the first image (sorted by name) |
+| `--benchmark` | false | Run benchmark mode |
+| `--bench_crop` | false | Centre-crop image to tile-size limits before benchmarking |
 
 ---
 
 ## Project structure
 
 ```
-wrapper.py            BIAFLOWS entrypoint — parameter parsing, benchmark runner, montage
-deconvolve.py         Core deconvolution engine with all 11 backends + PSF generation
-launcher.py           PyQt6 GUI launcher
-descriptor.json       BIAFLOWS/BIOMERO parameter descriptor
-bioflows_local.py     Local BIAFLOWS compatibility shim
-cideconvolve.slurm    SLURM job script for HPC execution
-Dockerfile            Multi-stage Docker build
-requirements.txt      Python dependencies (local install)
-requirements_docker.txt  Pinned dependencies for Docker
-vendor/               Vendored libraries (sdeconv, psf_generator)
-docs/                 Benchmark output images and CSV
+wrapper.py              BIAFLOWS entrypoint — parameter parsing, benchmark runner, metrics
+deconvolve.py           Core deconvolution engine + PSF generation
+deconvolve_ci.py        CI SHB-RL / RLTV implementation (PyTorch)
+launcher.py             PyQt6 GUI launcher
+gui_deconvolve_ci.py    GUI deconvolution panel
+descriptor.json         BIAFLOWS/BIOMERO parameter descriptor
+bioflows_local.py       Local BIAFLOWS compatibility shim
+cideconvolve.slurm      SLURM job script for HPC execution
+Dockerfile              Docker build (CUDA 12.6 runtime + Python 3.11)
+requirements.txt        Python dependencies (local install)
+requirements_docker.txt Python dependencies (Docker)
+vendor/                 Vendored libraries (psf_generator)
 ```
 
 ---
 
 ## References
 
+- **SHB Acceleration:** Wang, Y. & Miller, E. L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* **23**(12), 5284–5297.
+- **TV Regularisation:** Dey, N. et al. (2006). "Richardson-Lucy Algorithm With Total Variation Regularization for 3D Confocal Microscope Deconvolution." *Microsc. Res. Tech.* **69**(4), 260–266.
 - **BIOMERO:** Luik, T. T., Rosas-Bertolini, R., Reits, E. A. J., Hoebe, R. A. & Krawczyk, P. M. (2024). "BIOMERO: A scalable and extensible image analysis framework." *Patterns* **5**(8), 101024. [doi:10.1016/j.patter.2024.101024](https://doi.org/10.1016/j.patter.2024.101024) · [GitHub](https://github.com/NL-BioImaging/biomero) · [Documentation](https://nl-bioimaging.github.io/biomero/)
 - **BIAFLOWS:** Rubens, U. et al. (2020). "BIAFLOWS: A Collaborative Framework to Reproducibly Deploy and Benchmark Bioimage Analysis Workflows." *Patterns* **1**(3), 100040. [doi:10.1016/j.patter.2020.100040](https://doi.org/10.1016/j.patter.2020.100040)
 - **PSF Generator:** Kirshner, H. et al. — [EPFL PSF Generator](https://bigwww.epfl.ch/algorithms/psfgenerator/)
 - **Gibson–Lanni model:** Gibson, S. F. & Lanni, F. (1992). [doi:10.1364/JOSAA.9.000154](https://doi.org/10.1364/JOSAA.9.000154)
 - **OMERO:** Allan, C. et al. (2012). "OMERO: flexible, model-driven data management for experimental biology." *Nat Methods* **9**, 245–253. [doi:10.1038/nmeth.1896](https://doi.org/10.1038/nmeth.1896)
 
-For method-specific references see [METHODS.md](METHODS.md).
-For benchmark results and metrics see [BENCHMARK.md](BENCHMARK.md).
-
 ---
 
 ## License
 
-See individual library licenses in `vendor/` and `gitclones/`.
+MIT — see [LICENSE](LICENSE).
+
+

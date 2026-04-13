@@ -5,7 +5,7 @@
 
 # PyTorch with CUDA 12.6 support
 --index-url https://download.pytorch.org/whl/cu126
-torch==2.4.1
+torch>=2.4
 
 # Core dependencies
 numpy>=1.26,<3

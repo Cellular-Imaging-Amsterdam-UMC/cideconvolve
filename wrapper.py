@@ -232,13 +232,13 @@ def main(argv):
             damping = float(damp_raw)
         convergence = str(getattr(parameters, "convergence", "auto")).strip().lower()
         rel_threshold = float(getattr(parameters, "rel_threshold", 0.005))
-        check_every = int(getattr(parameters, "check_every", 5))
+        check_every = 5          # convergence check interval
 
-        # PSF Gibson-Lanni parameters
-        t_g = float(getattr(parameters, "t_g", 170000))
-        t_g0 = float(getattr(parameters, "t_g0", 170000))
-        t_i0 = float(getattr(parameters, "t_i0", 100000))
-        z_p = float(getattr(parameters, "z_p", 0))
+        # Hardcoded defaults (removed from descriptor to reduce parameter count)
+        t_g = 170000.0           # coverslip thickness (nm) — standard #1.5
+        t_g0 = 170000.0          # design coverslip thickness (nm)
+        t_i0 = 100000.0          # design immersion thickness (nm)
+        z_p = 0.0                # particle depth (nm)
 
         # Pixel size overrides
         px_xy_raw = str(getattr(parameters, "pixel_size_xy", "auto")).strip()

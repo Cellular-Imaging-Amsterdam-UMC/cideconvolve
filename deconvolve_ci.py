@@ -213,6 +213,10 @@ def _estimate_noise_sigma(image: torch.Tensor) -> float:
     med = lowest.median()
     mad = (lowest - med).abs().median()
     sigma = float(mad) * 1.4826
+    # 2D images have far fewer voxels → MAD underestimates noise;
+    # apply a conservative boost to compensate.
+    if image.ndim == 2:
+        sigma *= 1.5
     return max(sigma, 1e-12)
 
 
@@ -549,7 +553,15 @@ def ci_rl_deconvolve(
     x_cur = d_work.clone()
 
     convergence_history: list[float] = []
+    is_2d = img_t.ndim == 2
     use_tv = tv_lambda > 0.0
+    # 2D images have fewer gradient dimensions → TV is weaker; compensate.
+    if is_2d and use_tv:
+        tv_lambda = tv_lambda * 2.0
+    # 2D I-divergence converges superficially fast (fewer voxels in mean);
+    # enforce a minimum iteration count and tighten the threshold.
+    early_stop_min_iter = max(10, niter // 4) if is_2d else 0
+    eff_rel_threshold = rel_threshold * 0.1 if is_2d else rel_threshold
     iterations_used = niter
 
     for k in range(1, niter + 1):
@@ -604,11 +616,11 @@ def ci_rl_deconvolve(
             convergence_history.append(idiv)
             log.info("  iter %4d/%d  I-div=%.6g", k, niter, idiv)
 
-            if convergence == "auto" and len(convergence_history) >= 2:
+            if convergence == "auto" and len(convergence_history) >= 2 and k > early_stop_min_iter:
                 prev_idiv = convergence_history[-2]
                 if prev_idiv > 0:
                     rel_change = (prev_idiv - idiv) / prev_idiv
-                    if rel_change < rel_threshold:
+                    if rel_change < eff_rel_threshold:
                         log.info("  converged at iter %d (rel_change=%.4g)", k, rel_change)
                         iterations_used = k
                         break

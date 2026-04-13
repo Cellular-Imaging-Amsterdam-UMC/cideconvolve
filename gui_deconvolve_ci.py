@@ -946,6 +946,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_zarr_dir: str = _default_settings_dir()
         self._last_save_dir: str = _default_settings_dir()
         self._last_settings_dir: str = _default_settings_dir()
+        self._omero_gw = None  # OmeroGateway instance (lazy)
 
         self._build_ui()
         self._update_viewer()
@@ -1321,6 +1322,10 @@ class DeconvolveCIWindow(QMainWindow):
         btn_open_zarr.clicked.connect(self._on_open_zarr)
         bottom.addWidget(btn_open_zarr)
 
+        btn_open_omero = QPushButton("Open OMERO\u2026")
+        btn_open_omero.clicked.connect(self._on_open_omero)
+        bottom.addWidget(btn_open_omero)
+
         self._file_label = QLabel("No file loaded")
         self._file_label.setWordWrap(False)
         bottom.addWidget(self._file_label, stretch=1)
@@ -1456,94 +1461,163 @@ class DeconvolveCIWindow(QMainWindow):
 
         try:
             data = _load_image(path)
-            self._input_channels = data["images"]
-            self._metadata = data["metadata"]
-            self._output_channels = []
-            self._pct_cache = {}  # clear percentile cache on new data
-            self._input_path = Path(path)
-
-            # Populate UI from metadata
-            meta = self._metadata
-            from_file = meta.get("_from_file", set())
-
-            def _bg(found: bool) -> str:
-                """Stylesheet snippet: green if from metadata, orange if default."""
-                if found:
-                    return "background-color: #c8e6c9; color: black;"   # soft green
-                return "background-color: #ffe0b2; color: black;"       # soft orange
-
-            if meta.get("na"):
-                self._sp_na.setValue(float(meta["na"]))
-            self._sp_na.setStyleSheet(_bg("na" in from_file))
-            px_x = meta.get("pixel_size_x")
-            if px_x:
-                self._sp_px_xy.setValue(float(px_x) * 1000.0)  # µm → nm
-            self._sp_px_xy.setStyleSheet(_bg("pixel_size_x" in from_file))
-            px_z = meta.get("pixel_size_z")
-            if px_z:
-                self._sp_px_z.setValue(float(px_z) * 1000.0)
-            self._sp_px_z.setStyleSheet(_bg("pixel_size_z" in from_file))
-            ri = meta.get("refractive_index")
-            if ri:
-                self._sp_ri_imm.setValue(float(ri))
-            self._sp_ri_imm.setStyleSheet(_bg("refractive_index" in from_file))
-            micro = meta.get("microscope_type")
-            if micro:
-                idx = self._micro_combo.findText(micro)
-                if idx >= 0:
-                    self._micro_combo.setCurrentIndex(idx)
-                # Auto-set iterations based on microscope type
-                if micro == "confocal":
-                    self._le_niter.setText("50")
-                else:
-                    self._le_niter.setText("150")
-            self._micro_combo.setStyleSheet(_bg("microscope_type" in from_file))
-
-            # Per-channel wavelengths
-            ch_info = meta.get("channels", [])
-            if ch_info:
-                em_vals = [str(c.get("emission_wavelength", 520))
-                           for c in ch_info]
-                self._le_emission.setText(", ".join(em_vals))
-                ex_vals = [str(c.get("excitation_wavelength", 488))
-                           for c in ch_info]
-                self._le_excitation.setText(", ".join(ex_vals))
-            self._le_emission.setStyleSheet(
-                _bg("emission_wavelength" in from_file))
-            self._le_excitation.setStyleSheet(
-                _bg("excitation_wavelength" in from_file))
-
-            # RI sample is never in metadata — red (needs user input)
-            self._sp_ri_sample.setStyleSheet(
-                "background-color: #ffe0e0; color: black;")  # pastel red
-
-
-            # Channel toggle buttons
-            self._rebuild_channel_toggles()
-
-            # Z-slider
-            first = self._input_channels[0]
-            if first.ndim == 3:
-                self._z_slider.setMaximum(first.shape[0] - 1)
-                self._z_slider.setValue(first.shape[0] // 2)
-            else:
-                self._z_slider.setMaximum(0)
-                self._z_slider.setValue(0)
-
-            stem = Path(path).name
-            shape = self._input_channels[0].shape
-            n_ch = len(self._input_channels)
-            self._file_label.setText(
-                f"{stem}\n{n_ch} ch, shape={shape}"
-            )
-            self._btn_run.setEnabled(True)
-            self._btn_save.setEnabled(False)
-            self._update_viewer()
-            self._status.showMessage(f"Loaded {stem}", 5000)
-
+            self._apply_image_data(data, Path(path).name, Path(path))
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", str(exc))
             self._status.showMessage("Load failed", 5000)
+
+    def _apply_image_data(
+        self, data: dict, display_name: str, source_path: Optional[Path] = None
+    ):
+        """Apply loaded image data to the UI (shared by file and OMERO open)."""
+        self._input_channels = data["images"]
+        self._metadata = data["metadata"]
+        self._output_channels = []
+        self._pct_cache = {}  # clear percentile cache on new data
+        self._input_path = source_path
+
+        # Populate UI from metadata
+        meta = self._metadata
+        from_file = meta.get("_from_file", set())
+
+        def _bg(found: bool) -> str:
+            """Stylesheet snippet: green if from metadata, orange if default."""
+            if found:
+                return "background-color: #c8e6c9; color: black;"   # soft green
+            return "background-color: #ffe0b2; color: black;"       # soft orange
+
+        if meta.get("na"):
+            self._sp_na.setValue(float(meta["na"]))
+        self._sp_na.setStyleSheet(_bg("na" in from_file))
+        px_x = meta.get("pixel_size_x")
+        if px_x:
+            self._sp_px_xy.setValue(float(px_x) * 1000.0)  # µm → nm
+        self._sp_px_xy.setStyleSheet(_bg("pixel_size_x" in from_file))
+        px_z = meta.get("pixel_size_z")
+        if px_z:
+            self._sp_px_z.setValue(float(px_z) * 1000.0)
+        self._sp_px_z.setStyleSheet(_bg("pixel_size_z" in from_file))
+        ri = meta.get("refractive_index")
+        if ri:
+            self._sp_ri_imm.setValue(float(ri))
+        self._sp_ri_imm.setStyleSheet(_bg("refractive_index" in from_file))
+        micro = meta.get("microscope_type")
+        if micro:
+            idx = self._micro_combo.findText(micro)
+            if idx >= 0:
+                self._micro_combo.setCurrentIndex(idx)
+            # Auto-set iterations based on microscope type
+            if micro == "confocal":
+                self._le_niter.setText("50")
+            else:
+                self._le_niter.setText("150")
+        self._micro_combo.setStyleSheet(_bg("microscope_type" in from_file))
+
+        # Per-channel wavelengths
+        ch_info = meta.get("channels", [])
+        if ch_info:
+            em_vals = [str(c.get("emission_wavelength", 520))
+                       for c in ch_info]
+            self._le_emission.setText(", ".join(em_vals))
+            ex_vals = [str(c.get("excitation_wavelength", 488))
+                       for c in ch_info]
+            self._le_excitation.setText(", ".join(ex_vals))
+        self._le_emission.setStyleSheet(
+            _bg("emission_wavelength" in from_file))
+        self._le_excitation.setStyleSheet(
+            _bg("excitation_wavelength" in from_file))
+
+        # RI sample is never in metadata — red (needs user input)
+        self._sp_ri_sample.setStyleSheet(
+            "background-color: #ffe0e0; color: black;")  # pastel red
+
+
+        # Channel toggle buttons
+        self._rebuild_channel_toggles()
+
+        # Z-slider
+        first = self._input_channels[0]
+        if first.ndim == 3:
+            self._z_slider.setMaximum(first.shape[0] - 1)
+            self._z_slider.setValue(first.shape[0] // 2)
+        else:
+            self._z_slider.setMaximum(0)
+            self._z_slider.setValue(0)
+
+        shape = self._input_channels[0].shape
+        n_ch = len(self._input_channels)
+        self._file_label.setText(
+            f"{display_name}\n{n_ch} ch, shape={shape}"
+        )
+        self._btn_run.setEnabled(True)
+        self._btn_save.setEnabled(False)
+        self._update_viewer()
+        self._status.showMessage(f"Loaded {display_name}", 5000)
+
+    # -----------------------------------------------------------------------
+    # Open from OMERO
+    # -----------------------------------------------------------------------
+
+    def _on_open_omero(self):
+        try:
+            from omero_browser_qt import (
+                LoginDialog,
+                OmeroBrowserDialog,
+                OmeroGateway,
+                load_image_data,
+            )
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                "OMERO not available",
+                "omero-browser-qt is not installed.\n\n"
+                "Install with:\n  pip install omero-browser-qt",
+            )
+            return
+
+        if self._omero_gw is None:
+            try:
+                self._omero_gw = OmeroGateway()
+            except RuntimeError:
+                # PyQt6 singleton init order: QObject.__init__() must be
+                # called before any attribute access.  Work around by
+                # bootstrapping the QObject base on the raw singleton.
+                from PyQt6.QtCore import QObject as _QObj
+                inst = OmeroGateway._instance
+                _QObj.__init__(inst)
+                OmeroGateway.__init__(inst)
+                self._omero_gw = inst
+        gw = self._omero_gw
+
+        if not gw.is_connected():
+            dlg = LoginDialog(self, gateway=gw)
+            if dlg.exec() != LoginDialog.DialogCode.Accepted:
+                return
+
+        browser = OmeroBrowserDialog(self, gateway=gw)
+        if browser.exec() != OmeroBrowserDialog.DialogCode.Accepted:
+            return
+
+        images = browser.get_selected_images()
+        if not images:
+            return
+
+        image = images[0]
+        name = image.getName()
+        self._status.showMessage(f"Loading {name} from OMERO …")
+        QApplication.processEvents()
+
+        try:
+            result = load_image_data(image)
+            volumes = result["images"]
+            meta = result.get("metadata", {})
+            meta = _apply_metadata_defaults(volumes, meta)
+            self._apply_image_data(
+                {"images": volumes, "metadata": meta}, f"OMERO: {name}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "OMERO Error", str(exc))
+            self._status.showMessage("OMERO load failed", 5000)
 
     # -----------------------------------------------------------------------
     # Run deconvolution
@@ -2033,6 +2107,12 @@ class DeconvolveCIWindow(QMainWindow):
         if self._monitor is not None:
             self._monitor.request_stop()
             self._monitor = None
+        if self._omero_gw is not None:
+            try:
+                self._omero_gw.disconnect()
+            except Exception:
+                pass
+            self._omero_gw = None
         super().closeEvent(event)
 
 
