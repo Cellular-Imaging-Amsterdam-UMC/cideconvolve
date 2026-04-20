@@ -35,6 +35,10 @@ output/
 outfolder/*
 !outfolder/.gitkeep
 
+# Infolder - ignore all contents but keep folder structure
+infolder/*
+!infolder/.gitkeep
+
 # Local data folder
 localdata/
 

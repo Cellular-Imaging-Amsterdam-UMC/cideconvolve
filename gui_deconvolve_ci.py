@@ -1,7 +1,8 @@
 """gui_deconvolve_ci.py — Standalone PyQt6 GUI for CI deconvolution.
 
-Provides a graphical interface to the ``ci_rl_deconvolve`` and
-``ci_generate_psf`` functions from ``deconvolve_ci.py``.  Supports
+Provides a graphical interface to the ``ci_rl_deconvolve``,
+``ci_sparse_hessian_deconvolve``, and ``ci_generate_psf`` functions from
+``deconvolve_ci.py``. Supports
 multi-channel 3-D OME-TIFF input with per-channel PSF generation,
 side-by-side input/output viewing with a shared Z-slider, and
 MIP / SUM projection toggle.
@@ -769,7 +770,11 @@ class _DeconvolveWorker(QThread):
     def run(self):
         try:
             try:
-                from deconvolve_ci import ci_generate_psf, ci_rl_deconvolve
+                from deconvolve_ci import (
+                    ci_generate_psf,
+                    ci_rl_deconvolve,
+                    ci_sparse_hessian_deconvolve,
+                )
             except OSError as e:
                 raise RuntimeError(
                     f"Failed to load deconvolve_ci (torch DLL error).\n\n"
@@ -868,21 +873,38 @@ class _DeconvolveWorker(QThread):
                 self.progress.emit(
                     f"  Deconvolving (ch {ci + 1}, {niter} iter) …"
                 )
-                out = ci_rl_deconvolve(
-                    ch_data,
-                    psf,
+                common = dict(
                     niter=niter,
-                    tv_lambda=p["tv_lambda"],
-                    damping=p["damping"],
+                    offset=p["offset"],
+                    prefilter_sigma=p["prefilter_sigma"],
+                    start=p["start"],
                     background=p["background"],
                     convergence=p["convergence"],
                     rel_threshold=p["rel_threshold"],
                     check_every=p["check_every"],
+                    pixel_size_xy=p["pixel_size_xy_nm"],
+                    pixel_size_z=p["pixel_size_z_nm"],
                     device=p["device"],
                     tiling=p["tiling"],
                     max_tile_xy=p["max_tile_xy"],
                     max_tile_z=p["max_tile_z"],
                 )
+                if p["method"] == "ci_sparse_hessian":
+                    out = ci_sparse_hessian_deconvolve(
+                        ch_data,
+                        psf,
+                        sparse_hessian_weight=p["sparse_hessian_weight"],
+                        sparse_hessian_reg=p["sparse_hessian_reg"],
+                        **common,
+                    )
+                else:
+                    out = ci_rl_deconvolve(
+                        ch_data,
+                        psf,
+                        tv_lambda=p["tv_lambda"],
+                        damping=p["damping"],
+                        **common,
+                    )
                 results.append(out["result"].copy())
 
                 # ---- Release GPU and system memory for this channel ----
@@ -990,7 +1012,7 @@ class DeconvolveCIWindow(QMainWindow):
         method_group.setLayout(ml)
 
         self._method_combo = QComboBox()
-        self._method_combo.addItems(["ci_rl", "ci_rl_tv"])
+        self._method_combo.addItems(["ci_rl", "ci_rl_tv", "ci_sparse_hessian"])
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
 
@@ -1005,10 +1027,41 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_tv_lambda.setRange(0.0, 1.0)
         self._sp_tv_lambda.setDecimals(6)
         self._sp_tv_lambda.setSingleStep(0.0001)
-        self._sp_tv_lambda.setValue(0.001)
+        self._sp_tv_lambda.setValue(0.0001)
         self._tv_lambda_label = ml.labelForField(self._sp_tv_lambda)  # type: ignore
         ml.addRow("TV lambda:", self._sp_tv_lambda)
         self._tv_lambda_row_label = "TV lambda:"
+
+        self._damping_combo = QComboBox()
+        self._damping_combo.addItems(["none", "auto", "manual"])
+        self._damping_combo.currentTextChanged.connect(self._on_damping_changed)
+        ml.addRow("Damping:", self._damping_combo)
+        self._damping_label = ml.labelForField(self._damping_combo)  # type: ignore
+
+        self._sp_damping = QDoubleSpinBox()
+        self._sp_damping.setRange(0.0, 100.0)
+        self._sp_damping.setDecimals(2)
+        self._sp_damping.setSingleStep(0.1)
+        self._sp_damping.setValue(3.0)
+        self._sp_damping.setEnabled(False)
+        ml.addRow("Damping value:", self._sp_damping)
+        self._damping_value_label = ml.labelForField(self._sp_damping)  # type: ignore
+
+        self._sp_sparse_weight = QDoubleSpinBox()
+        self._sp_sparse_weight.setRange(0.0, 1.0)
+        self._sp_sparse_weight.setDecimals(4)
+        self._sp_sparse_weight.setSingleStep(0.01)
+        self._sp_sparse_weight.setValue(0.6)
+        ml.addRow("Sparse weight:", self._sp_sparse_weight)
+        self._sparse_weight_label = ml.labelForField(self._sp_sparse_weight)  # type: ignore
+
+        self._sp_sparse_reg = QDoubleSpinBox()
+        self._sp_sparse_reg.setRange(0.0, 1.0)
+        self._sp_sparse_reg.setDecimals(4)
+        self._sp_sparse_reg.setSingleStep(0.001)
+        self._sp_sparse_reg.setValue(0.98)
+        ml.addRow("Sparse reg:", self._sp_sparse_reg)
+        self._sparse_reg_label = ml.labelForField(self._sp_sparse_reg)  # type: ignore
 
         self._bg_combo = QComboBox()
         self._bg_combo.addItems(["auto", "manual"])
@@ -1022,18 +1075,29 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_bg_value.setEnabled(False)
         ml.addRow("BG value:", self._sp_bg_value)
 
-        self._damping_combo = QComboBox()
-        self._damping_combo.addItems(["none", "auto", "manual"])
-        self._damping_combo.currentTextChanged.connect(self._on_damping_changed)
-        ml.addRow("Damping:", self._damping_combo)
+        self._offset_combo = QComboBox()
+        self._offset_combo.addItems(["auto", "none", "manual"])
+        self._offset_combo.currentTextChanged.connect(self._on_offset_changed)
+        ml.addRow("Offset:", self._offset_combo)
 
-        self._sp_damping = QDoubleSpinBox()
-        self._sp_damping.setRange(0.1, 10.0)
-        self._sp_damping.setDecimals(1)
-        self._sp_damping.setSingleStep(0.1)
-        self._sp_damping.setValue(1.0)
-        self._sp_damping.setEnabled(False)
-        ml.addRow("Damp value:", self._sp_damping)
+        self._sp_offset = QDoubleSpinBox()
+        self._sp_offset.setRange(0.0, 1000.0)
+        self._sp_offset.setDecimals(1)
+        self._sp_offset.setSingleStep(1.0)
+        self._sp_offset.setValue(5.0)
+        self._sp_offset.setEnabled(False)
+        ml.addRow("Offset value:", self._sp_offset)
+
+        self._sp_prefilter = QDoubleSpinBox()
+        self._sp_prefilter.setRange(0.0, 5.0)
+        self._sp_prefilter.setDecimals(2)
+        self._sp_prefilter.setSingleStep(0.1)
+        self._sp_prefilter.setValue(0.0)
+        ml.addRow("Prefilter sigma:", self._sp_prefilter)
+
+        self._start_combo = QComboBox()
+        self._start_combo.addItems(["flat", "observed", "lowpass"])
+        ml.addRow("Start:", self._start_combo)
 
         self._conv_combo = QComboBox()
         self._conv_combo.addItems(["auto", "fixed"])
@@ -1390,19 +1454,55 @@ class DeconvolveCIWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _on_method_changed(self, text: str):
+        is_rl_family = text in ("ci_rl", "ci_rl_tv")
         is_tv = text == "ci_rl_tv"
+        is_sparse = text == "ci_sparse_hessian"
         self._sp_tv_lambda.setEnabled(is_tv)
         if not is_tv:
             self._sp_tv_lambda.setValue(0.0)
         else:
             if self._sp_tv_lambda.value() == 0.0:
-                self._sp_tv_lambda.setValue(0.001)
+                self._sp_tv_lambda.setValue(0.0001)
+        for label, widget in (
+            (self._tv_lambda_label, self._sp_tv_lambda),
+            (self._damping_label, self._damping_combo),
+            (self._damping_value_label, self._sp_damping),
+            (self._sparse_weight_label, self._sp_sparse_weight),
+            (self._sparse_reg_label, self._sp_sparse_reg),
+        ):
+            if label is not None:
+                label.setVisible(False)
+            widget.setVisible(False)
+
+        if self._tv_lambda_label is not None:
+            self._tv_lambda_label.setVisible(is_tv)
+        self._sp_tv_lambda.setVisible(is_tv)
+
+        if self._damping_label is not None:
+            self._damping_label.setVisible(is_rl_family)
+        self._damping_combo.setVisible(is_rl_family)
+        if self._damping_value_label is not None:
+            self._damping_value_label.setVisible(is_rl_family)
+        self._sp_damping.setVisible(is_rl_family)
+
+        if self._sparse_weight_label is not None:
+            self._sparse_weight_label.setVisible(is_sparse)
+        self._sp_sparse_weight.setVisible(is_sparse)
+        if self._sparse_reg_label is not None:
+            self._sparse_reg_label.setVisible(is_sparse)
+        self._sp_sparse_reg.setVisible(is_sparse)
+
+        self._on_damping_changed(self._damping_combo.currentText())
 
     def _on_bg_changed(self, text: str):
         self._sp_bg_value.setEnabled(text == "manual")
 
+    def _on_offset_changed(self, text: str):
+        self._sp_offset.setEnabled(text == "manual")
+
     def _on_damping_changed(self, text: str):
-        self._sp_damping.setEnabled(text == "manual")
+        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv")
+        self._sp_damping.setEnabled(rl_family and text == "manual")
 
     def _on_conv_changed(self, text: str):
         auto = text == "auto"
@@ -1632,12 +1732,12 @@ class DeconvolveCIWindow(QMainWindow):
         if bg_text == "manual":
             background = self._sp_bg_value.value()
 
-        damp_text = self._damping_combo.currentText()
-        damping: str | float = 0.0
-        if damp_text == "auto":
-            damping = "auto"
-        elif damp_text == "manual":
-            damping = self._sp_damping.value()
+        offset_text = self._offset_combo.currentText()
+        offset: str | float = "auto"
+        if offset_text == "none":
+            offset = 0.0
+        elif offset_text == "manual":
+            offset = self._sp_offset.value()
 
         em_list = [float(s.strip()) for s in self._le_emission.text().split(",")
                    if s.strip()]
@@ -1655,10 +1755,23 @@ class DeconvolveCIWindow(QMainWindow):
         if not niter_list:
             niter_list = [50]
 
+        damping_text = self._damping_combo.currentText()
+        damping: str | float = "auto"
+        if damping_text == "none":
+            damping = 0.0
+        elif damping_text == "manual":
+            damping = self._sp_damping.value()
+
         return {
+            "method": self._method_combo.currentText(),
             "niter_list": niter_list,
             "tv_lambda": self._sp_tv_lambda.value(),
             "damping": damping,
+            "offset": offset,
+            "prefilter_sigma": self._sp_prefilter.value(),
+            "start": self._start_combo.currentText(),
+            "sparse_hessian_weight": self._sp_sparse_weight.value(),
+            "sparse_hessian_reg": self._sp_sparse_reg.value(),
             "background": background,
             "convergence": self._conv_combo.currentText(),
             "rel_threshold": self._sp_rel_thresh.value(),
@@ -1826,10 +1939,16 @@ class DeconvolveCIWindow(QMainWindow):
             "method": self._method_combo.currentText(),
             "iterations": self._le_niter.text(),
             "tv_lambda": self._sp_tv_lambda.value(),
-            "background": self._bg_combo.currentText(),
-            "background_value": self._sp_bg_value.value(),
             "damping": self._damping_combo.currentText(),
             "damping_value": self._sp_damping.value(),
+            "background": self._bg_combo.currentText(),
+            "background_value": self._sp_bg_value.value(),
+            "offset": self._offset_combo.currentText(),
+            "offset_value": self._sp_offset.value(),
+            "prefilter_sigma": self._sp_prefilter.value(),
+            "start": self._start_combo.currentText(),
+            "sparse_hessian_weight": self._sp_sparse_weight.value(),
+            "sparse_hessian_reg": self._sp_sparse_reg.value(),
             "convergence": self._conv_combo.currentText(),
             "rel_threshold": self._sp_rel_thresh.value(),
             "check_every": self._sp_check_every.value(),
@@ -1879,10 +1998,16 @@ class DeconvolveCIWindow(QMainWindow):
         _combo(self._method_combo, "method")
         _line(self._le_niter, "iterations")
         _spin(self._sp_tv_lambda, "tv_lambda")
-        _combo(self._bg_combo, "background")
-        _spin(self._sp_bg_value, "background_value")
         _combo(self._damping_combo, "damping")
         _spin(self._sp_damping, "damping_value")
+        _combo(self._bg_combo, "background")
+        _spin(self._sp_bg_value, "background_value")
+        _combo(self._offset_combo, "offset")
+        _spin(self._sp_offset, "offset_value")
+        _spin(self._sp_prefilter, "prefilter_sigma")
+        _combo(self._start_combo, "start")
+        _spin(self._sp_sparse_weight, "sparse_hessian_weight")
+        _spin(self._sp_sparse_reg, "sparse_hessian_reg")
         _combo(self._conv_combo, "convergence")
         _spin(self._sp_rel_thresh, "rel_threshold")
         _spin(self._sp_check_every, "check_every")

@@ -1,11 +1,11 @@
 {
   "name": "W_CIDeconvolve",
-  "description": "3D/2D deconvolution for widefield and confocal microscopy images using CI SHB-accelerated Richardson-Lucy with optional Total Variation regularisation. Supports GPU acceleration via CUDA (PyTorch).",
+  "description": "3D/2D deconvolution for widefield and confocal microscopy images using CI SHB-accelerated Richardson-Lucy, SHB-RL with Total Variation, or sparse-Hessian variational deconvolution. Supports GPU acceleration via CUDA (PyTorch).",
   "container-image": {
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --tv_lambda @tv_lambda --background @background --damping @damping --convergence @convergence --rel_threshold @rel_threshold --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --projection @projection --benchmark @benchmark --bench_crop @bench_crop",
+  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --tv_lambda @tv_lambda --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --damping @damping --offset @offset --prefilter_sigma @prefilter_sigma --start @start --convergence @convergence --rel_threshold @rel_threshold --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --projection @projection --benchmark @benchmark --bench_crop @bench_crop",
   "inputs": [
     {
       "id": "iterations",
@@ -46,14 +46,15 @@
       "value-key": "@method",
       "command-line-flag": "--method",
       "name": "Deconvolution method",
-      "description": "Which deconvolution algorithm to use. ci_rl: SHB-accelerated Richardson-Lucy. ci_rl_tv: same with Total Variation regularisation.",
+      "description": "Which deconvolution algorithm to use. ci_rl: SHB-accelerated Richardson-Lucy. ci_rl_tv: same with Total Variation regularisation. ci_sparse_hessian: sparse-Hessian / SPITFIRE-style variational deconvolution.",
       "default-value": "ci_rl",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
         "ci_rl",
-        "ci_rl_tv"
+        "ci_rl_tv",
+        "ci_sparse_hessian"
       ]
     },
     {
@@ -152,8 +153,34 @@
       "value-key": "@tv_lambda",
       "command-line-flag": "--tv_lambda",
       "name": "TV lambda",
-      "description": "Total Variation regularization strength for ci_rl_tv method. Ignored when method is ci_rl. Range 0–1, typical values 0.0001–0.01.",
-      "default-value": 0.001,
+      "description": "Total Variation regularization strength for ci_rl_tv. Ignored by ci_rl and ci_sparse_hessian. Range 0–1, typical values 0.00005–0.001.",
+      "default-value": 0.0001,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    {
+      "id": "sparse_hessian_weight",
+      "value-key": "@sparse_hessian_weight",
+      "command-line-flag": "--sparse_hessian_weight",
+      "name": "Sparse Hessian weight",
+      "description": "Hessian-vs-sparsity balance for ci_sparse_hessian. Ignored by RL-family methods. Typical values are 0.4–0.8.",
+      "default-value": 0.6,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    {
+      "id": "sparse_hessian_reg",
+      "value-key": "@sparse_hessian_reg",
+      "command-line-flag": "--sparse_hessian_reg",
+      "name": "Sparse Hessian reg",
+      "description": "Data-vs-regularizer balance for ci_sparse_hessian. Ignored by RL-family methods. Higher values stay closer to the observed data.",
+      "default-value": 0.98,
       "set-by-server": false,
       "optional": true,
       "type": "Number",
@@ -172,11 +199,47 @@
       "type": "String"
     },
     {
+      "id": "offset",
+      "value-key": "@offset",
+      "command-line-flag": "--offset",
+      "name": "Offset",
+      "description": "Positive offset added during processing and removed afterwards. 'auto' uses the deconwolf-style default of 5. 'none' or '0' disables it.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "prefilter_sigma",
+      "value-key": "@prefilter_sigma",
+      "command-line-flag": "--prefilter_sigma",
+      "name": "Prefilter sigma",
+      "description": "Sigma in pixels for Anscombe-domain Gaussian prefiltering. '0' disables the prefilter.",
+      "default-value": 0.0,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0,
+      "maximum": 10
+    },
+    {
+      "id": "start",
+      "value-key": "@start",
+      "command-line-flag": "--start",
+      "name": "Initial estimate",
+      "description": "Initial estimate for iterative solvers. 'flat' uses a uniform mean image, 'observed' uses the raw observation, and 'lowpass' uses a strongly smoothed observation.",
+      "default-value": "flat",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": ["flat", "observed", "lowpass"]
+    },
+    {
       "id": "damping",
       "value-key": "@damping",
       "command-line-flag": "--damping",
       "name": "Damping",
-      "description": "Damping factor for noise suppression. 'none' or '0' disables damping. 'auto' selects automatically. A numeric value sets a fixed damping factor (typical range 0.1–10).",
+      "description": "Noise-gated damping for ci_rl and ci_rl_tv. 'none' or '0' disables damping. 'auto' selects the recommended automatic value. Ignored by ci_sparse_hessian.",
       "default-value": "none",
       "set-by-server": false,
       "optional": true,
@@ -246,7 +309,7 @@
       "value-key": "@benchmark",
       "command-line-flag": "--benchmark",
       "name": "Benchmark mode",
-      "description": "Run benchmark: deconvolves the first input image with both ci_rl and ci_rl_tv at multiple iteration counts (20, 40, 60), writes a CSV with timing metrics, and generates MIP montage images.",
+      "description": "Run benchmark: deconvolves the first input image with ci_rl, ci_rl_tv, and ci_sparse_hessian using the requested iteration counts, writes a CSV with timing metrics, and generates MIP montage images.",
       "default-value": false,
       "set-by-server": false,
       "optional": true,

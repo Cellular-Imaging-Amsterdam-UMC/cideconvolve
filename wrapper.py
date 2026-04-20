@@ -1,5 +1,5 @@
 ﻿"""
-wrapper.py â€” BIAFLOWS-compatible entrypoint for CIDeconvolve.
+wrapper.py - BIAFLOWS-compatible entrypoint for CIDeconvolve.
 
 Parses BIAFLOWS job parameters (--infolder, --outfolder, --gtfolder, etc.)
 via bioflows_local, then processes each input image through the CI
@@ -43,7 +43,9 @@ from bioflows_local import (
 from deconvolve import (
     MAX_TILE_XY,
     MAX_TILE_Z,
+    deconvolve,
     deconvolve_image,
+    generate_psf,
     load_image,
     save_mip_png,
     save_result,
@@ -52,7 +54,12 @@ from deconvolve import (
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# RI lookup tables â€” value-choices in descriptor.json use "name (RI)" format
+# Output zarr format: 2 for OMERO compatibility, 3 for latest zarr spec
+# ---------------------------------------------------------------------------
+OUTPUT_ZARR_FORMAT = 2
+
+# ---------------------------------------------------------------------------
+# RI lookup tables - value-choices in descriptor.json use "name (RI)" format
 # ---------------------------------------------------------------------------
 _IMMERSION_RI = {
     "air":   1.0003,
@@ -91,7 +98,7 @@ def _parse_ri_choice(raw: str, lookup: dict[str, float]) -> float | None:
     s = str(raw).strip().lower()
     if s == "auto":
         return None
-    # Try "name (1.234)" format â€” extract the name part
+    # Try "name (1.234)" format - extract the name part
     name = s.split("(")[0].strip()
     if name in lookup:
         return lookup[name]
@@ -183,6 +190,521 @@ def _quality_metrics(
     }
 
 
+# ---------------------------------------------------------------------------
+# OME-Zarr HCS plate helpers
+# ---------------------------------------------------------------------------
+
+def _is_hcs_plate(zarr_path: Path) -> bool:
+    """Return True if *zarr_path* is an OME-Zarr HCS plate (has 'plate' in root attrs)."""
+    import zarr
+    try:
+        store = zarr.open(str(zarr_path), mode="r")
+        return "plate" in store.attrs
+    except Exception:
+        return False
+
+
+def _get_zarr_plate_info(zarr_path: Path) -> dict:
+    """Parse an HCS plate zarr and return plate metadata + list of (row, col, field) tuples."""
+    import zarr
+    store = zarr.open(str(zarr_path), mode="r")
+    plate_attrs = dict(store.attrs)
+    plate_meta = plate_attrs["plate"]
+
+    wells_and_fields = []
+    for well_entry in plate_meta["wells"]:
+        well_path = well_entry["path"]  # e.g. "A/1"
+        parts = well_path.split("/")
+        row, col = parts[0], parts[1]
+        well_group = store[well_path]
+        well_attrs = dict(well_group.attrs)
+        if "well" in well_attrs and "images" in well_attrs["well"]:
+            for img_entry in well_attrs["well"]["images"]:
+                field = img_entry["path"]  # e.g. "0"
+                wells_and_fields.append((row, col, field))
+        else:
+            # Fallback: enumerate numeric subdirectories
+            for key in sorted(well_group.keys()):
+                if key.isdigit():
+                    wells_and_fields.append((row, col, key))
+
+    return {
+        "plate_attrs": plate_attrs,
+        "plate_meta": plate_meta,
+        "wells_and_fields": wells_and_fields,
+    }
+
+
+def _load_zarr_field(
+    zarr_path: Path,
+    row: str,
+    col: str,
+    field: str,
+    *,
+    na=None,
+    refractive_index=None,
+    sample_refractive_index=1.45,
+    microscope_type=None,
+    pixel_size_xy=None,
+    pixel_size_z=None,
+    emission_wavelengths=None,
+    excitation_wavelengths=None,
+) -> dict:
+    """Load a single field from an HCS plate zarr.
+
+    Returns a dict compatible with load_image() output:
+        {'images': [np.ndarray per channel], 'metadata': dict}
+    """
+    import zarr
+
+    store = zarr.open(str(zarr_path), mode="r")
+    field_group = store[f"{row}/{col}/{field}"]
+    field_attrs = dict(field_group.attrs)
+
+    # Read level 0 (highest resolution)
+    data = np.asarray(field_group["0"][:])
+
+    # Squeeze leading dimensions until we have at most 5D (T, C, Z, Y, X)
+    while data.ndim > 5 and data.shape[0] == 1:
+        data = data[0]
+
+    # Expected shapes: (T, C, Z, Y, X) or (C, Z, Y, X) or (C, Y, X)
+    if data.ndim == 5:
+        data = data[0]  # Take T=0 -> (C, Z, Y, X)
+    if data.ndim == 4:
+        n_c, n_z, n_y, n_x = data.shape
+    elif data.ndim == 3:
+        n_c, n_y, n_x = data.shape
+        n_z = 1
+    else:
+        raise ValueError(f"Unexpected field data shape: {data.shape}")
+
+    # Split into per-channel arrays
+    images = []
+    for c in range(n_c):
+        if data.ndim == 4:
+            ch_data = data[c]  # (Z, Y, X)
+            if ch_data.shape[0] == 1:
+                ch_data = ch_data[0]  # Squeeze Z=1 -> (Y, X)
+        else:
+            ch_data = data[c]  # (Y, X)
+        images.append(np.asarray(ch_data, dtype=np.float32))
+
+    # Extract metadata from field attrs
+    meta = {}
+    meta["n_channels"] = n_c
+    meta["size_x"] = n_x
+    meta["size_y"] = n_y
+    meta["size_z"] = n_z
+
+    # Pixel sizes from multiscales coordinate transforms
+    multiscales = field_attrs.get("multiscales", [])
+    if multiscales:
+        ms = multiscales[0]
+        datasets = ms.get("datasets", [])
+        if datasets:
+            transforms = datasets[0].get("coordinateTransformations", [])
+            for t in transforms:
+                if t.get("type") == "scale":
+                    scale = t["scale"]
+                    # Scale array: for 5D TCZYX -> indices [0]=T, [1]=C, [2]=Z, [3]=Y, [4]=X
+                    if len(scale) == 5:
+                        meta["pixel_size_z"] = scale[2]
+                        meta["pixel_size_y"] = scale[3]
+                        meta["pixel_size_x"] = scale[4]
+                    elif len(scale) == 4:
+                        meta["pixel_size_z"] = scale[1]
+                        meta["pixel_size_y"] = scale[2]
+                        meta["pixel_size_x"] = scale[3]
+                    elif len(scale) == 3:
+                        meta["pixel_size_y"] = scale[1]
+                        meta["pixel_size_x"] = scale[2]
+                    break
+
+    # Channel info from omero metadata
+    omero = field_attrs.get("omero", {})
+    omero_channels = omero.get("channels", [])
+    ch_info = []
+    channel_names = []
+    for i, och in enumerate(omero_channels):
+        info = {
+            "emission_wavelength": None,
+            "excitation_wavelength": None,
+            "acquisition_mode": None,
+            "pinhole_size": None,
+        }
+        channel_names.append(och.get("label", f"Ch{i}"))
+        ch_info.append(info)
+    meta["channels"] = ch_info
+    meta["channel_names"] = channel_names
+
+    # Defaults for missing critical metadata
+    meta.setdefault("microscope_type", "widefield")
+    meta.setdefault("na", 1.4)
+    meta.setdefault("refractive_index", 1.515)
+    meta.setdefault("pixel_size_x", 0.1)
+    meta.setdefault("pixel_size_y", 0.1)
+    meta.setdefault("pixel_size_z", 0.3)
+
+    _defaulted = set()
+    _defaults = {
+        "na": 1.4,
+        "refractive_index": 1.515,
+        "microscope_type": "widefield",
+        "pixel_size_x": 0.1,
+        "pixel_size_y": 0.1,
+        "pixel_size_z": 0.3,
+    }
+    for k, v in _defaults.items():
+        if meta.get(k) is None:
+            meta[k] = v
+            _defaulted.add(k)
+    meta["_defaulted_keys"] = _defaulted
+
+    # Apply user overrides
+    if na is not None:
+        meta["na"] = na
+    if refractive_index is not None:
+        meta["refractive_index"] = refractive_index
+    if microscope_type is not None:
+        meta["microscope_type"] = microscope_type
+    if pixel_size_xy is not None:
+        meta["pixel_size_x"] = pixel_size_xy
+        meta["pixel_size_y"] = pixel_size_xy
+    if pixel_size_z is not None:
+        meta["pixel_size_z"] = pixel_size_z
+    if emission_wavelengths is not None:
+        for i, wl in enumerate(emission_wavelengths):
+            if i < len(meta["channels"]):
+                meta["channels"][i]["emission_wavelength"] = wl
+    if excitation_wavelengths is not None:
+        for i, wl in enumerate(excitation_wavelengths):
+            if i < len(meta["channels"]):
+                meta["channels"][i]["excitation_wavelength"] = wl
+
+    # Ensure emission wavelengths have a default
+    _em_defaulted = False
+    for ch in meta["channels"]:
+        if ch.get("emission_wavelength") is None:
+            ch["emission_wavelength"] = 520.0
+            _em_defaulted = True
+    if _em_defaulted:
+        _defaulted.add("emission_wavelength")
+
+    meta["sample_refractive_index"] = sample_refractive_index
+
+    return {"images": images, "metadata": meta}
+
+
+def _init_output_plate_zarr(
+    out_zarr_path: Path,
+    source_plate_attrs: dict,
+    wells_and_fields: list,
+) -> None:
+    """Create the output HCS plate zarr skeleton (root + well groups)."""
+    import zarr
+
+    store = zarr.open(str(out_zarr_path), mode="w", zarr_format=OUTPUT_ZARR_FORMAT)
+
+    # Copy and update plate metadata for OME-Zarr 0.5
+    plate_meta = dict(source_plate_attrs.get("plate", {}))
+    stem = out_zarr_path.stem
+    if stem.endswith(".ome"):
+        stem = stem[:-4]
+    plate_meta["name"] = stem
+    plate_meta["version"] = "0.5"
+    store.attrs["plate"] = plate_meta
+
+    # Copy creator if present
+    if "_creator" in source_plate_attrs:
+        store.attrs["_creator"] = source_plate_attrs["_creator"]
+
+    # Create well groups
+    wells_seen = set()
+    for row, col, field in wells_and_fields:
+        well_path = f"{row}/{col}"
+        if well_path not in wells_seen:
+            wells_seen.add(well_path)
+            well_group = store.require_group(well_path)
+
+            # Collect all fields for this well
+            well_fields = [
+                f for r, c, f in wells_and_fields
+                if r == row and c == col
+            ]
+            well_group.attrs["well"] = {
+                "images": [{"path": f} for f in sorted(well_fields)],
+                "version": "0.5",
+            }
+
+
+def _downsample_2x_xy(data: np.ndarray) -> np.ndarray:
+    """Downsample by 2x in XY using block mean. Handles odd dimensions."""
+    if data.ndim == 5:
+        # (T, C, Z, Y, X)
+        t, c, z, y, x = data.shape
+        y2 = (y // 2) * 2
+        x2 = (x // 2) * 2
+        cropped = data[:, :, :, :y2, :x2]
+        return cropped.reshape(t, c, z, y2 // 2, 2, x2 // 2, 2).mean(axis=(4, 6))
+    elif data.ndim == 4:
+        # (C, Z, Y, X)
+        c, z, y, x = data.shape
+        y2 = (y // 2) * 2
+        x2 = (x // 2) * 2
+        cropped = data[:, :, :y2, :x2]
+        return cropped.reshape(c, z, y2 // 2, 2, x2 // 2, 2).mean(axis=(3, 5))
+    elif data.ndim == 3:
+        # (C, Y, X)
+        c, y, x = data.shape
+        y2 = (y // 2) * 2
+        x2 = (x // 2) * 2
+        cropped = data[:, :y2, :x2]
+        return cropped.reshape(c, y2 // 2, 2, x2 // 2, 2).mean(axis=(2, 4))
+    else:
+        raise ValueError(f"Cannot downsample array with {data.ndim} dimensions")
+
+
+def _write_zarr_field(
+    result_channels: list,
+    metadata: dict,
+    out_zarr_path: Path,
+    row: str,
+    col: str,
+    field: str,
+    orig_field_attrs: dict,
+) -> None:
+    """Write deconvolved channels as a field in the output plate zarr."""
+    import zarr
+
+    store = zarr.open(str(out_zarr_path), mode="a", zarr_format=OUTPUT_ZARR_FORMAT)
+    field_group = store.require_group(f"{row}/{col}/{field}")
+
+    # Stack channels: determine if 3D or 2D
+    is_3d = result_channels[0].ndim == 3
+    if is_3d:
+        stack = np.stack(result_channels, axis=0)  # (C, Z, Y, X)
+        stack = stack[np.newaxis, ...]  # (1, C, Z, Y, X) = TCZYX
+    else:
+        stack = np.stack(result_channels, axis=0)  # (C, Y, X)
+        stack = stack[np.newaxis, :, np.newaxis, :, :]  # (1, C, 1, Y, X) = TCZYX
+
+    stack = stack.astype(np.float32)
+    _, n_c, n_z, n_y, n_x = stack.shape
+
+    # Compressor and array kwargs differ between zarr v2 and v3
+    if OUTPUT_ZARR_FORMAT == 2:
+        from numcodecs import Blosc
+        _compressor_kw = {
+            "compressor": Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
+            "chunk_key_encoding": {"name": "v2", "configuration": {"separator": "/"}},
+        }
+    else:
+        from zarr.codecs import BloscCodec
+        _compressor_kw = {"compressors": [BloscCodec(cname="zstd", clevel=5)]}
+
+    # Determine number of pyramid levels from source multiscales
+    src_ms = orig_field_attrs.get("multiscales", [{}])[0]
+    src_datasets = src_ms.get("datasets", [{"path": "0"}])
+    n_levels = len(src_datasets)
+
+    # Pixel sizes
+    px_x = metadata.get("pixel_size_x", 0.1)
+    px_y = metadata.get("pixel_size_y", 0.1)
+    px_z = metadata.get("pixel_size_z", 0.3)
+
+    # Write all pyramid levels
+    datasets = []
+    current = stack
+    for lvl in range(n_levels):
+        if lvl > 0:
+            current = _downsample_2x_xy(current).astype(np.float32)
+        cy = min(512, current.shape[-2])
+        cx = min(512, current.shape[-1])
+        field_group.create_array(
+            str(lvl),
+            data=current,
+            chunks=(1, 1, n_z, cy, cx),
+            overwrite=True,
+            **_compressor_kw,
+        )
+        scale_factor = 2 ** lvl
+        datasets.append({
+            "path": str(lvl),
+            "coordinateTransformations": [
+                {"type": "scale", "scale": [1, 1, px_z, px_y * scale_factor, px_x * scale_factor]},
+            ],
+        })
+
+    # Build OME-Zarr 0.5 multiscales metadata
+    axes = [
+        {"name": "t", "type": "time"},
+        {"name": "c", "type": "channel"},
+        {"name": "z", "type": "space", "unit": "micrometer"},
+        {"name": "y", "type": "space", "unit": "micrometer"},
+        {"name": "x", "type": "space", "unit": "micrometer"},
+    ]
+
+    multiscales = [{
+        "version": "0.5",
+        "axes": axes,
+        "datasets": datasets,
+        "name": f"{row}/{col}/{field}",
+    }]
+
+    field_group.attrs["multiscales"] = multiscales
+
+    # Copy omero metadata from source
+    omero = orig_field_attrs.get("omero")
+    if omero is not None:
+        field_group.attrs["omero"] = omero
+
+
+def _run_plate_zarr(
+    zarr_path: Path,
+    out_path: str,
+    *,
+    niter_list: list,
+    method: str,
+    device,
+    tiling: str,
+    max_tile_xy: int,
+    max_tile_z: int,
+    na,
+    refractive_index,
+    sample_ri: float,
+    microscope_type,
+    emission_wavelengths,
+    excitation_wavelengths,
+    pixel_size_xy,
+    pixel_size_z,
+    tv_lambda: float,
+    damping,
+    sparse_hessian_weight: float,
+    sparse_hessian_reg: float,
+    background,
+    offset,
+    prefilter_sigma: float,
+    start: str,
+    convergence: str,
+    rel_threshold: float,
+    check_every: int,
+    ri_coverslip,
+    ri_coverslip_design,
+    ri_immersion_design,
+    t_g: float,
+    t_g0: float,
+    t_i0: float,
+    z_p: float,
+    projection: str = "none",
+) -> None:
+    """Process an HCS plate zarr: deconvolve every field and write output plate zarr."""
+    import zarr
+
+    plate_info = _get_zarr_plate_info(zarr_path)
+    plate_attrs = plate_info["plate_attrs"]
+    wells_and_fields = plate_info["wells_and_fields"]
+
+    plate_stem = zarr_path.stem
+    if plate_stem.endswith(".ome"):
+        plate_stem = plate_stem[:-4]
+    out_zarr_name = f"{plate_stem}_decon.ome.zarr"
+    out_zarr_path = Path(out_path) / out_zarr_name
+
+    print(f"\n  HCS Plate detected: {zarr_path.name}")
+    print(f"  Wells/fields: {len(wells_and_fields)}")
+    print(f"  Output: {out_zarr_name}")
+
+    _init_output_plate_zarr(out_zarr_path, plate_attrs, wells_and_fields)
+
+    # Read source zarr for field attrs
+    source_store = zarr.open(str(zarr_path), mode="r")
+
+    total = len(wells_and_fields)
+    t_plate_start = time.time()
+
+    for idx, (row, col, field) in enumerate(wells_and_fields):
+        field_id = f"{row}/{col}/{field}"
+        print(f"\n  [{idx + 1}/{total}] Processing field {field_id}")
+
+        t0 = time.time()
+
+        # Load field data
+        data = _load_zarr_field(
+            zarr_path, row, col, field,
+            na=na,
+            refractive_index=refractive_index,
+            sample_refractive_index=sample_ri,
+            microscope_type=microscope_type,
+            pixel_size_xy=pixel_size_xy,
+            pixel_size_z=pixel_size_z,
+            emission_wavelengths=emission_wavelengths,
+            excitation_wavelengths=excitation_wavelengths,
+        )
+        images = data["images"]
+        meta = data["metadata"]
+
+        print(f"    Channels: {len(images)}, shape: {images[0].shape}")
+
+        # Deconvolve each channel
+        result_channels = []
+        psfs = []
+        for ch_idx in range(len(images)):
+            psf = generate_psf(
+                meta, channel_idx=ch_idx,
+                ri_coverslip=ri_coverslip,
+                ri_coverslip_design=ri_coverslip_design,
+                ri_immersion_design=ri_immersion_design,
+                t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
+            )
+            psfs.append(psf)
+
+            img = images[ch_idx]
+            # Match PSF dimensionality
+            if img.ndim == 2 and psf.ndim == 3:
+                psf = psf[psf.shape[0] // 2]
+            elif img.ndim == 3 and psf.ndim == 2:
+                psf = psf[np.newaxis, :, :]
+
+            # Per-channel iteration count
+            if isinstance(niter_list, list) and len(niter_list) > 1:
+                ch_niter = niter_list[ch_idx] if ch_idx < len(niter_list) else niter_list[-1]
+            else:
+                ch_niter = niter_list[0] if isinstance(niter_list, list) else niter_list
+
+            result = deconvolve(
+                img, psf, method=method,
+                niter=ch_niter, background=background, damping=damping, offset=offset,
+                prefilter_sigma=prefilter_sigma, start=start,
+                convergence=convergence, rel_threshold=rel_threshold,
+                check_every=check_every, device=device,
+                tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
+                sparse_hessian_weight=sparse_hessian_weight,
+                sparse_hessian_reg=sparse_hessian_reg,
+                pixel_size_xy=meta.get("pixel_size_x"),
+                pixel_size_z=meta.get("pixel_size_z"),
+                tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
+            )
+            result_channels.append(result)
+
+        # Get original field attrs for metadata copying
+        field_group = source_store[f"{row}/{col}/{field}"]
+        orig_field_attrs = dict(field_group.attrs)
+
+        # Write to output zarr
+        _write_zarr_field(
+            result_channels, meta, out_zarr_path,
+            row, col, field, orig_field_attrs,
+        )
+
+        elapsed = time.time() - t0
+        print(f"    Done in {elapsed:.1f}s")
+
+    total_time = time.time() - t_plate_start
+    print(f"\n  Plate processing complete: {total} fields in {total_time:.1f}s")
+    print(f"  Output: {out_zarr_path}")
+
+
 def main(argv):
     with BiaflowsJob.from_cli(argv) as bj:
         parameters = getattr(bj, "parameters", SimpleNamespace())
@@ -220,16 +742,29 @@ def main(argv):
         ) or None
 
         # Deconvolution parameters
-        tv_lambda = float(getattr(parameters, "tv_lambda", 0.001))
-        bg_raw = str(getattr(parameters, "background", "auto")).strip()
-        background = bg_raw if bg_raw.lower() == "auto" else float(bg_raw)
-        damp_raw = str(getattr(parameters, "damping", "none")).strip().lower()
-        if damp_raw in ("none", "0", "0.0"):
+        tv_lambda = float(getattr(parameters, "tv_lambda", 0.0001))
+        damping_raw = str(getattr(parameters, "damping", "none")).strip().lower()
+        if damping_raw in ("none", "0", "0.0"):
             damping = 0.0
-        elif damp_raw == "auto":
+        elif damping_raw == "auto":
             damping = "auto"
         else:
-            damping = float(damp_raw)
+            damping = float(damping_raw)
+        bg_raw = str(getattr(parameters, "background", "auto")).strip()
+        background = bg_raw if bg_raw.lower() == "auto" else float(bg_raw)
+        offset_raw = str(getattr(parameters, "offset", "auto")).strip().lower()
+        if offset_raw in ("none", "0", "0.0"):
+            offset = 0.0
+        elif offset_raw == "auto":
+            offset = "auto"
+        else:
+            offset = float(offset_raw)
+        prefilter_sigma = float(getattr(parameters, "prefilter_sigma", 0.0))
+        start = str(getattr(parameters, "start", "flat")).strip().lower()
+        if start not in ("flat", "observed", "lowpass"):
+            start = "flat"
+        sparse_hessian_weight = float(getattr(parameters, "sparse_hessian_weight", 0.6))
+        sparse_hessian_reg = float(getattr(parameters, "sparse_hessian_reg", 0.98))
         convergence = str(getattr(parameters, "convergence", "auto")).strip().lower()
         rel_threshold = float(getattr(parameters, "rel_threshold", 0.005))
         check_every = 5          # convergence check interval
@@ -274,9 +809,16 @@ def main(argv):
         print(f"  Projection   : {projection}")
         if method == "ci_rl_tv":
             print(f"  TV lambda    : {tv_lambda}")
-        print(f"  Background   : {background}")
-        if damping != 0.0:
+        if method in ("ci_rl", "ci_rl_tv"):
             print(f"  Damping      : {damping}")
+        if method == "ci_sparse_hessian":
+            print(f"  Sparse weight: {sparse_hessian_weight}")
+            print(f"  Sparse reg   : {sparse_hessian_reg}")
+        print(f"  Background   : {background}")
+        print(f"  Offset       : {offset}")
+        if prefilter_sigma > 0.0:
+            print(f"  Prefilter    : sigma={prefilter_sigma}")
+        print(f"  Start        : {start}")
         print(f"  Convergence  : {convergence} (threshold={rel_threshold}, every={check_every})")
         if na_override is not None:
             print(f"  NA           : {na_override}")
@@ -308,6 +850,7 @@ def main(argv):
 
         # ---- Benchmark mode ----
         if benchmark:
+            # Always use only the first image/plate field for benchmark
             _run_benchmark(
                 in_imgs[0], in_path, out_path,
                 niter_list=niter_list,
@@ -325,8 +868,13 @@ def main(argv):
                 pixel_size_xy=px_xy_override,
                 pixel_size_z=px_z_override,
                 tv_lambda=tv_lambda,
-                background=background,
                 damping=damping,
+                sparse_hessian_weight=sparse_hessian_weight,
+                sparse_hessian_reg=sparse_hessian_reg,
+                background=background,
+                offset=offset,
+                prefilter_sigma=prefilter_sigma,
+                start=start,
                 convergence=convergence,
                 rel_threshold=rel_threshold,
                 check_every=check_every,
@@ -342,7 +890,64 @@ def main(argv):
                 shutil.rmtree(tmp_path, ignore_errors=True)
             return
 
+        # ---- Separate plate zarrs from regular images ----
+        plate_imgs = []
+        regular_imgs = []
         for img_resource in in_imgs:
+            img_path = Path(in_path) / img_resource.filename
+            if img_path.is_dir() and img_path.suffix.lower() == ".zarr" and _is_hcs_plate(img_path):
+                plate_imgs.append(img_resource)
+            else:
+                regular_imgs.append(img_resource)
+
+        # ---- Process HCS plate zarrs ----
+        for img_resource in plate_imgs:
+            zarr_path = Path(in_path) / img_resource.filename
+            print(f"\n{'=' * 60}")
+            print(f"Processing HCS Plate: {img_resource.filename}")
+            print(f"{'=' * 60}")
+
+            try:
+                _run_plate_zarr(
+                    zarr_path, out_path,
+                    niter_list=niter_list,
+                    method=method,
+                    device=device,
+                    tiling=tiling,
+                    max_tile_xy=max_tile_xy,
+                    max_tile_z=max_tile_z,
+                    na=na_override,
+                    refractive_index=ri_override,
+                    sample_ri=sample_ri,
+                    microscope_type=micro_override,
+                    emission_wavelengths=em_override,
+                    excitation_wavelengths=ex_override,
+                    pixel_size_xy=px_xy_override,
+                    pixel_size_z=px_z_override,
+                    tv_lambda=tv_lambda,
+                    damping=damping,
+                    sparse_hessian_weight=sparse_hessian_weight,
+                    sparse_hessian_reg=sparse_hessian_reg,
+                    background=background,
+                    offset=offset,
+                    prefilter_sigma=prefilter_sigma,
+                    start=start,
+                    convergence=convergence,
+                    rel_threshold=rel_threshold,
+                    check_every=check_every,
+                    ri_coverslip=ri_override,
+                    ri_coverslip_design=ri_override,
+                    ri_immersion_design=ri_override,
+                    t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
+                    projection=projection,
+                )
+            except Exception as exc:
+                print(f"  ERROR processing plate {img_resource.filename}: {exc}")
+                import traceback
+                traceback.print_exc()
+
+        # ---- Process regular (non-plate) images ----
+        for img_resource in regular_imgs:
             img_path = Path(in_path) / img_resource.filename
             print(f"\n{'=' * 60}")
             print(f"Processing: {img_resource.filename}")
@@ -382,8 +987,13 @@ def main(argv):
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
                     tv_lambda=tv_lambda,
-                    background=background,
                     damping=damping,
+                    sparse_hessian_weight=sparse_hessian_weight,
+                    sparse_hessian_reg=sparse_hessian_reg,
+                    background=background,
+                    offset=offset,
+                    prefilter_sigma=prefilter_sigma,
+                    start=start,
                     convergence=convergence,
                     rel_threshold=rel_threshold,
                     check_every=check_every,
@@ -465,12 +1075,12 @@ def main(argv):
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
-_BENCH_METHODS = ["ci_rl", "ci_rl_tv"]
+_BENCH_METHODS = ["ci_rl", "ci_rl_tv", "ci_sparse_hessian"]
 
 
 def _method_device(method: str) -> str:
     """Return the compute device label for a benchmark method."""
-    if method.startswith("ci_rl"):
+    if method.startswith("ci_"):
         import torch
         return "CUDA" if torch.cuda.is_available() else "CPU"
     return "?"
@@ -689,6 +1299,31 @@ def _write_metrics_csv(csv_path: Path, all_metrics: dict[str, dict]):
     print(f"\n  Metrics CSV saved -> {csv_path}")
 
 
+def _scaled_font(max_dim):
+    """Return a Pillow font scaled to the image size and a matching label height."""
+    from PIL import ImageFont
+
+    # Scale font: ~3.5% of the largest image dimension (min 18px)
+    font_size = max(18, int(max_dim * 0.035))
+    label_height = int(font_size * 2.5) + 10  # room for 2 lines of text
+
+    font = None
+    for name in (
+        "arial.ttf",
+        "DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            font = ImageFont.truetype(name, font_size)
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    return font, label_height
+
+
 def _make_metadata_panel(meta, width, height, font):
     """Create a metadata text panel for the montage."""
     from PIL import Image, ImageDraw
@@ -700,22 +1335,24 @@ def _make_metadata_panel(meta, width, height, font):
         f"NA: {meta.get('na', '?')}",
         f"RI immersion: {meta.get('refractive_index', '?')}",
         f"RI sample: {meta.get('sample_refractive_index', '?')}",
-        f"Pixel XY: {meta.get('pixel_size_x', '?')} \u00b5m",
-        f"Pixel Z:  {meta.get('pixel_size_z', '?')} \u00b5m",
-        f"Size: {meta.get('size_x', '?')}\u00d7{meta.get('size_y', '?')}"
-        f"\u00d7{meta.get('size_z', '?')}",
+        f"Pixel XY: {meta.get('pixel_size_x', '?')} um",
+        f"Pixel Z:  {meta.get('pixel_size_z', '?')} um",
+        f"Size: {meta.get('size_x', '?')}x{meta.get('size_y', '?')}"
+        f"x{meta.get('size_z', '?')}",
         f"Microscope: {meta.get('microscope_type', '?')}",
     ]
     for i, ch in enumerate(meta.get("channels", [])):
         em = ch.get("emission_wavelength") or "?"
         lines.append(f"Ch{i}: Em {em} nm")
 
-    draw.text((8, 8), "\n".join(lines), fill=(255, 255, 255), font=font)
+    margin = max(8, int(height * 0.02))
+    draw.text((margin, margin), "\n".join(lines), fill=(255, 255, 255), font=font)
     return panel
 
 
 def _make_benchmark_montage(
     out_path,
+    tmp_path,
     stem,
     available_methods,
     bench_iterations,
@@ -727,25 +1364,16 @@ def _make_benchmark_montage(
     Layout: Row 0 = Source + metadata panel spanning remaining columns.
     Each subsequent row = one iteration config, one column per method.
     """
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     out_dir = Path(out_path)
-
-    font = None
-    for name in ("arial.ttf", "DejaVuSans.ttf"):
-        try:
-            font = ImageFont.truetype(name, 18)
-            break
-        except OSError:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
+    tmp_dir = Path(tmp_path)
 
     # Column order
     col_order = [(m, None) for m in available_methods]
 
     # Row 0: source MIP
-    rows = [[(out_dir / "mip_source.ome.png", "Source")]]
+    rows = [[(tmp_dir / "mip_source.ome.png", "Source")]]
 
     # One row per iteration config
     for nit_tag, nit_label in bench_iterations:
@@ -758,7 +1386,7 @@ def _make_benchmark_montage(
                 label = f"{method}\n{nit_label} iter  {met['time_s']:.1f}s"
             else:
                 label = f"{method}\n{nit_label} iter"
-            row.append((out_dir / fname, label))
+            row.append((tmp_dir / fname, label))
         rows.append(row)
 
     # Load existing images, skip missing
@@ -775,15 +1403,17 @@ def _make_benchmark_montage(
             loaded_rows.append(row_images)
 
     if total == 0:
-        print("  No MIP PNG files found \u2014 skipping montage.")
+        print("  No MIP PNG files found -- skipping montage.")
         return None
 
-    label_height = 78
     padding = 4
 
     all_imgs = [img for row in loaded_rows for img, _ in row]
     max_w = max(img.size[0] for img in all_imgs)
     max_h = max(img.size[1] for img in all_imgs)
+
+    # Scale font to image size
+    font, label_height = _scaled_font(max(max_w, max_h))
 
     n_cols = max(len(row) for row in loaded_rows)
     n_rows = len(loaded_rows)
@@ -828,6 +1458,7 @@ def _make_benchmark_montage(
 
 def _make_per_channel_montages(
     out_path,
+    tmp_path,
     stem,
     available_methods,
     bench_iterations,
@@ -835,29 +1466,20 @@ def _make_per_channel_montages(
     metadata,
 ):
     """Create one greyscale montage per channel from benchmark MIP TIFFs."""
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     import tifffile
 
     out_dir = Path(out_path)
+    tmp_dir = Path(tmp_path)
     n_ch = metadata.get("n_channels", 1)
     if n_ch < 1:
         n_ch = 1
-
-    font = None
-    for name in ("arial.ttf", "DejaVuSans.ttf"):
-        try:
-            font = ImageFont.truetype(name, 18)
-            break
-        except OSError:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
 
     col_order = [(m, None) for m in available_methods]
 
     # Row 0 = source, rows 1-N = per iteration config
     mip_rows = [
-        [("Source", out_dir / "mip_source.ome.tiff")],
+        [("Source", tmp_dir / "mip_source.ome.tiff")],
     ]
     for nit_tag, nit_label in bench_iterations:
         row = []
@@ -869,7 +1491,7 @@ def _make_per_channel_montages(
                 label = f"{method}\n{nit_label} iter  {met['time_s']:.1f}s"
             else:
                 label = f"{method}\n{nit_label} iter"
-            row.append((label, out_dir / fname))
+            row.append((label, tmp_dir / fname))
         mip_rows.append(row)
 
     # Load TIFF arrays per row
@@ -890,8 +1512,12 @@ def _make_per_channel_montages(
 
     print(f"\n  Creating per-channel montages ({n_ch} channels)...")
 
-    label_height = 78
     padding = 4
+
+    # Pre-compute scaled font from the first loaded image dimensions
+    first_arr = loaded_rows[0][0][1]  # (label, arr)
+    arr_max_dim = max(first_arr.shape[-2], first_arr.shape[-1])
+    font, label_height = _scaled_font(arr_max_dim)
 
     for ch_idx in range(n_ch):
         panel_rows = []
@@ -986,8 +1612,13 @@ def _run_benchmark(
     pixel_size_xy,
     pixel_size_z,
     tv_lambda,
-    background,
     damping,
+    sparse_hessian_weight,
+    sparse_hessian_reg,
+    background,
+    offset,
+    prefilter_sigma,
+    start,
     convergence,
     rel_threshold,
     check_every,
@@ -1007,6 +1638,8 @@ def _run_benchmark(
     stem = _stem(img_resource.filename)
     out_dir = Path(out_path)
     out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = out_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # Derive iteration tag and label from descriptor iterations
     if len(set(niter_list)) == 1:
@@ -1024,10 +1657,40 @@ def _run_benchmark(
     print(f"  Crop      : {bench_crop}")
     print(f"{'=' * 70}")
 
-    # Load image once
-    data = load_image(img_path)
-    meta = data["metadata"]
-    images = data["images"]
+    # Load image once — for HCS plates, use only the first well/field
+    _plate_path = img_path
+    if _plate_path.is_dir() and _plate_path.suffix.lower() == ".zarr" and _is_hcs_plate(_plate_path):
+        plate_info = _get_zarr_plate_info(_plate_path)
+        wf = plate_info["wells_and_fields"]
+        if not wf:
+            print("  No fields found in plate. Exiting benchmark.")
+            return
+        row, col, field = wf[0]
+        print(f"  Plate detected — using first field: {row}/{col}/{field}")
+        data = _load_zarr_field(
+            _plate_path, row, col, field,
+            na=na,
+            refractive_index=refractive_index,
+            sample_refractive_index=sample_ri,
+            microscope_type=microscope_type,
+            pixel_size_xy=pixel_size_xy,
+            pixel_size_z=pixel_size_z,
+            emission_wavelengths=emission_wavelengths,
+            excitation_wavelengths=excitation_wavelengths,
+        )
+        meta = data["metadata"]
+        images = data["images"]
+        # Save as temp OME-TIFF so benchmark methods can reload via img_path
+        import tifffile
+        tmp_tiff = tmp_dir / f"{stem}_plate_field0.ome.tiff"
+        stack = np.stack(images, axis=0)
+        tifffile.imwrite(str(tmp_tiff), stack, ome=True, photometric="minisblack")
+        img_path = tmp_tiff
+        stem = _stem(tmp_tiff.name)
+    else:
+        data = load_image(img_path)
+        meta = data["metadata"]
+        images = data["images"]
 
     # If bench_crop, centre-crop each channel to tile limits
     if bench_crop:
@@ -1055,7 +1718,7 @@ def _run_benchmark(
             meta["size_z"], meta["size_y"], meta["size_x"] = images[0].shape
         else:
             meta["size_y"], meta["size_x"] = images[0].shape
-        crop_path = out_dir / f"{stem}_bench_crop.ome.tiff"
+        crop_path = tmp_dir / f"{stem}_bench_crop.ome.tiff"
         stack = np.stack(images, axis=0)
         tifffile.imwrite(str(crop_path), stack)
         img_path = crop_path
@@ -1081,6 +1744,9 @@ def _run_benchmark(
         pixel_size_z=pixel_size_z,
         background=background,
         damping=damping,
+        offset=offset,
+        prefilter_sigma=prefilter_sigma,
+        start=start,
         convergence=convergence,
         rel_threshold=rel_threshold,
         check_every=check_every,
@@ -1101,10 +1767,13 @@ def _run_benchmark(
                 method=m,
                 niter=niter_list,
                 tv_lambda=tv_lambda if m == "ci_rl_tv" else 0.0,
+                damping=damping if m in ("ci_rl", "ci_rl_tv") else 0.0,
+                sparse_hessian_weight=sparse_hessian_weight,
+                sparse_hessian_reg=sparse_hessian_reg,
                 **common_kw,
             )
             out_name = f"{stem}_{m}_{nit_tag}i.ome.tiff"
-            out_file = out_dir / out_name
+            out_file = tmp_dir / out_name
             save_result(result, str(out_file), mip_only=True)
             metrics = monitor.stop()
             metrics["device"] = _method_device(m)
@@ -1161,20 +1830,17 @@ def _run_benchmark(
 
     # --- Montages ---
     _make_benchmark_montage(
-        str(out_dir), stem, available_methods,
+        str(out_dir), str(tmp_dir), stem, available_methods,
         bench_iterations, all_metrics, meta,
     )
     _make_per_channel_montages(
-        str(out_dir), stem, available_methods,
+        str(out_dir), str(tmp_dir), stem, available_methods,
         bench_iterations, all_metrics, meta,
     )
 
-    # Clean up: keep only CSV and montage PNGs
-    keep_prefixes = ("benchmark_metrics_", "decon_benchmark_")
-    for f in out_dir.iterdir():
-        if f.is_file() and not f.name.startswith(keep_prefixes):
-            f.unlink()
-            print(f"  Cleaned: {f.name}")
+    # Clean up tmp folder
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(f"  Cleaned up benchmark tmp folder: {tmp_dir}")
 
 
 def _print_metrics_summary(all_metrics):

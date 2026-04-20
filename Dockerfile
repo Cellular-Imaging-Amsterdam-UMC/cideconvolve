@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-venv python3.11-distutils \
         ca-certificates \
+        fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
 

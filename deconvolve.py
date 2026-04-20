@@ -339,13 +339,19 @@ def load_image(
                     channel_data = img.get_image_data("YX", T=0, C=c)
                 images.append(np.asarray(channel_data, dtype=np.float32))
 
-    except ImportError:
-        if _is_zarr:
+    except Exception as exc:
+        # Catch ImportError (bioio not installed) and UnsupportedFileFormatError
+        # (no plugin for the specific format, e.g. TIFF without bioio-tifffile).
+        # Re-raise anything that isn't one of these two known fallback cases.
+        _is_unsupported = type(exc).__name__ == "UnsupportedFileFormatError"
+        if not isinstance(exc, ImportError) and not _is_unsupported:
+            raise
+        if _is_zarr and isinstance(exc, ImportError):
             raise ImportError(
                 "bioio-ome-zarr is required to read OME-Zarr files. "
                 "Install with: pip install bioio-ome-zarr"
             )
-        logger.warning("bioio not available, falling back to tifffile")
+        logger.warning("bioio cannot read this format, falling back to tifffile")
         if companion_path is not None and path.suffix == ".ome":
             tiff_files = sorted(path.parent.glob("*.ome.tiff")) + sorted(
                 path.parent.glob("*.ome.tif")
@@ -550,6 +556,10 @@ def generate_psf(
 METHODS = {
     "ci_rl": {"memory_factor": 8, "description": "CI SHB-accelerated RL (PyTorch GPU)"},
     "ci_rl_tv": {"memory_factor": 8, "description": "CI SHB-accelerated RL + TV (PyTorch GPU)"},
+    "ci_sparse_hessian": {
+        "memory_factor": 10,
+        "description": "CI sparse-Hessian variational deconvolution (PyTorch GPU)",
+    },
 }
 
 
@@ -828,6 +838,9 @@ def deconvolve(
     niter: int = 30,
     background: Union[int, str] = "auto",
     damping: Union[str, float] = 0.0,
+    offset: Union[str, float] = "auto",
+    prefilter_sigma: float = 0.0,
+    start: str = "flat",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
     check_every: int = 5,
@@ -835,6 +848,12 @@ def deconvolve(
     device: Optional[str] = None,
     # RLTV regularization
     tv_lambda: float = 1e-4,
+    # Sparse-Hessian regularization
+    sparse_hessian_weight: float = 0.6,
+    sparse_hessian_reg: float = 0.98,
+    # Physical voxel size
+    pixel_size_xy: Optional[float] = None,
+    pixel_size_z: Optional[float] = None,
     # XY tiling for large images
     tiling: str = "custom",
     max_tile_xy: int = MAX_TILE_XY,
@@ -852,14 +871,21 @@ def deconvolve(
         Deconvolution algorithm:
         - 'ci_rl' (default): CI SHB-accelerated Richardson-Lucy (PyTorch).
         - 'ci_rl_tv': CI SHB-accelerated RL + Total Variation.
+        - 'ci_sparse_hessian': CI sparse-Hessian variational deconvolution.
     niter : int
-        Number of iterations for Richardson-Lucy (default: 30).
+        Number of iterations / optimisation steps (default: 30).
     background : int or str
         Background subtraction (default: 'auto').
+    damping : str or float
+        Noise-gated damping for RL-family methods (default: 0 / disabled).
     device : str, optional
         Force device ('cpu' or 'cuda'). Auto-detected if None.
     tv_lambda : float
         TV regularization strength for ci_rl_tv (default: 1e-4).
+    sparse_hessian_weight : float
+        Hessian-vs-sparsity balance for ci_sparse_hessian (default: 0.6).
+    sparse_hessian_reg : float
+        Data-vs-regulariser balance for ci_sparse_hessian (default: 0.98).
     tiling : str
         Tiling mode.  ``"custom"`` (default) computes the minimum
         number of XY tiles so each tile fits within *max_tile_xy*
@@ -884,8 +910,14 @@ def deconvolve(
     if n_tiles > 1 and image.ndim == 3:
         return _deconvolve_tiled(
             image, psf, n_tiles, method=method,
-            niter=niter, background=background, device=device,
-            tv_lambda=tv_lambda,
+            niter=niter, background=background, damping=damping,
+            device=device, tv_lambda=tv_lambda,
+            sparse_hessian_weight=sparse_hessian_weight,
+            sparse_hessian_reg=sparse_hessian_reg,
+            pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
+            offset=offset, prefilter_sigma=prefilter_sigma, start=start,
+            convergence=convergence, rel_threshold=rel_threshold,
+            check_every=check_every,
         )
 
     # Crop PSF to image size when it is larger (e.g. n_defocus = 2*nz-1).
@@ -902,51 +934,86 @@ def deconvolve(
             psf = psf[tuple(slices)].copy()
             logger.info("PSF cropped to image size: %s", psf.shape)
 
-    return _deconvolve_ci_rl(
+    return _deconvolve_ci_method(
         image, psf, niter=niter,
+        method=method,
         tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
-        background=background, damping=damping,
+        damping=damping if method in ("ci_rl", "ci_rl_tv") else 0.0,
+        sparse_hessian_weight=sparse_hessian_weight,
+        sparse_hessian_reg=sparse_hessian_reg,
+        background=background, offset=offset,
+        prefilter_sigma=prefilter_sigma, start=start,
         convergence=convergence, rel_threshold=rel_threshold,
+        pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
         check_every=check_every, device=device,
         tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
     )
 
 
 # ---------------------------------------------------------------------------
-# CI RL backend (deconvolve_ci module)
+# CI backend (deconvolve_ci module)
 # ---------------------------------------------------------------------------
 
-def _deconvolve_ci_rl(
+def _deconvolve_ci_method(
     image: np.ndarray,
     psf: np.ndarray,
     *,
+    method: str = "ci_rl",
     niter: int = 50,
     tv_lambda: float = 0.0,
-    background: Union[int, str] = "auto",
     damping: Union[str, float] = 0.0,
+    sparse_hessian_weight: float = 0.6,
+    sparse_hessian_reg: float = 0.98,
+    background: Union[int, str] = "auto",
+    offset: Union[str, float] = "auto",
+    prefilter_sigma: float = 0.0,
+    start: str = "flat",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
     check_every: int = 5,
+    pixel_size_xy: Optional[float] = None,
+    pixel_size_z: Optional[float] = None,
     device: Optional[str] = None,
     tiling: str = "custom",
     max_tile_xy: int = MAX_TILE_XY,
     max_tile_z: int = MAX_TILE_Z,
 ) -> np.ndarray:
-    from deconvolve_ci import ci_rl_deconvolve
-    result = ci_rl_deconvolve(
-        image, psf,
+    from deconvolve_ci import (
+        ci_rl_deconvolve,
+        ci_sparse_hessian_deconvolve,
+    )
+
+    common = dict(
+        image=image,
+        psf=psf,
         niter=niter,
-        tv_lambda=tv_lambda,
         background=background,
-        damping=damping,
+        offset=offset,
+        prefilter_sigma=prefilter_sigma,
+        start=start,
         convergence=convergence,
         rel_threshold=rel_threshold,
         check_every=check_every,
+        pixel_size_xy=pixel_size_xy,
+        pixel_size_z=pixel_size_z,
         device=device,
         tiling=tiling,
         max_tile_xy=max_tile_xy,
         max_tile_z=max_tile_z,
     )
+
+    if method == "ci_sparse_hessian":
+        result = ci_sparse_hessian_deconvolve(
+            sparse_hessian_weight=sparse_hessian_weight,
+            sparse_hessian_reg=sparse_hessian_reg,
+            **common,
+        )
+    else:
+        result = ci_rl_deconvolve(
+            tv_lambda=tv_lambda,
+            damping=damping,
+            **common,
+        )
     return result["result"]
 
 
@@ -983,11 +1050,16 @@ def deconvolve_image(
     niter: Union[int, list[int]] = 30,
     background: Union[int, str] = "auto",
     damping: Union[str, float] = 0.0,
+    offset: Union[str, float] = "auto",
+    prefilter_sigma: float = 0.0,
+    start: str = "flat",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
     check_every: int = 5,
     device: Optional[str] = None,
     tv_lambda: float = 1e-4,
+    sparse_hessian_weight: float = 0.6,
+    sparse_hessian_reg: float = 0.98,
     tiling: str = "custom",
     max_tile_xy: int = MAX_TILE_XY,
     max_tile_z: int = MAX_TILE_Z,
@@ -1077,10 +1149,15 @@ def deconvolve_image(
         # Deconvolve
         result = deconvolve(
             img, psf, method=method,
-            niter=ch_niter, background=background, damping=damping,
+            niter=ch_niter, background=background, damping=damping, offset=offset,
+            prefilter_sigma=prefilter_sigma, start=start,
             convergence=convergence, rel_threshold=rel_threshold,
             check_every=check_every, device=device,
             tv_lambda=tv_lambda,
+            sparse_hessian_weight=sparse_hessian_weight,
+            sparse_hessian_reg=sparse_hessian_reg,
+            pixel_size_xy=metadata.get("pixel_size_x"),
+            pixel_size_z=metadata.get("pixel_size_z"),
             tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
         )
         results.append(result)

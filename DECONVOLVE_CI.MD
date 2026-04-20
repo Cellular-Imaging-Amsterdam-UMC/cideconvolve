@@ -6,7 +6,7 @@
 module for CIDeconvolve. It combines the best mathematical ideas from multiple state-of-the-art
 implementations into a single, cohesive, fast engine.
 
-**Methods**: `ci_rl` (accelerated RL) and `ci_rl_tv` (accelerated RL with Total Variation)
+**Methods**: `ci_rl` (accelerated RL), `ci_rl_tv` (accelerated RL with Total Variation), and `ci_sparse_hessian` (sparse-Hessian variational deconvolution)
 
 ---
 
@@ -59,6 +59,41 @@ high iteration counts) while preserving edges.
 5. TV factor: tv_i = 1 / (λ · div_i + 1)
 
 Applied multiplicatively: x_{k+1} = x_{k+1} · tv(x_k)
+
+**Spacing awareness**: for anisotropic 3D data the Z derivative terms are scaled by
+`pixel_size_xy / pixel_size_z`, so TV no longer treats coarse axial sampling as if it
+were equal to the lateral spacing.
+
+### `ci_sparse_hessian` — Sparse-Hessian Variational Deconvolution
+
+`ci_sparse_hessian` uses the same preprocessing, FFT-based forward model, positivity
+constraint, and tiling support as the RL-family methods, but combines an RL-style
+data-fidelity update with a sparse-Hessian regularisation step each iteration.
+
+**Objective**:
+
+```
+L(x) = reg · NLL_poisson(H x, d) / s_data + (1 − reg) · R_sparse_hessian(x) / s_prior
+```
+
+Where:
+- `H` is the convolution operator defined by the PSF / OTF
+- `d` is the observed image
+- `reg` is `sparse_hessian_reg`
+- `R_sparse_hessian` combines second-order Hessian terms and a sparsity term
+- `s_data` and `s_prior` are the initial loss magnitudes, used to keep the
+  data and prior terms on comparable scales
+
+In practice, the implementation performs an alternating update:
+- a deconvolution step driven by the PSF forward model
+- a sparse-Hessian gradient step on the current image estimate
+
+**Expert parameters**:
+- `sparse_hessian_weight` — Hessian-vs-sparsity balance (default `0.6`)
+- `sparse_hessian_reg` — data-vs-regulariser balance (default `0.98`)
+
+**Anisotropy handling**: the 3D prior uses the same spacing ratio `pixel_size_xy / pixel_size_z`
+as anisotropic TV, scaling second derivatives and mixed XZ / YZ terms to respect physical voxel size.
 
 ---
 
@@ -113,7 +148,8 @@ for Poisson statistics). When I-divergence plateaus, further iterations are ampl
 TV penalizes the total gradient magnitude, promoting piecewise-constant reconstructions
 that suppress noise while preserving sharp edges.
 
-**Parameter**: `tv_lambda` (default 0, i.e. off). Typical values: 0.001–0.01.
+**Parameter**: `tv_lambda` (default 0, i.e. off). Conservative starting values are
+typically `0.00005–0.001`.
 
 ### 5. Automatic Background Estimation
 **What it does**: Estimates the image background level from the mode of the lowest 10%
@@ -123,12 +159,26 @@ of voxel intensities. This is used as:
 
 Can be overridden with `background=<float>` or disabled with `background=0`.
 
-### 6. Real-Valued FFT (Memory Optimization)
+### 6. Offset, Prefilter, and Initial Estimate
+**Source**: deconwolf preprocessing defaults.
+
+**Offset**: `offset="auto"` adds a positive constant of 5 during processing and removes it
+afterwards. This stabilises low-valued pixels and mitigates ratio blow-up in RL.
+
+**Prefilter**: `prefilter_sigma > 0` applies Gaussian smoothing in the Anscombe-transformed
+domain before deconvolution, reducing the impact of non-Poissonian detector noise.
+
+**Initial estimate**:
+- `start="flat"` — uniform mean image
+- `start="observed"` — padded observed image
+- `start="lowpass"` — strongly smoothed observed image (deconwolf-style conservative start)
+
+### 7. Real-Valued FFT (Memory Optimization)
 **What it does**: Uses `torch.fft.rfftn` / `irfftn` throughout, which exploits the
 Hermitian symmetry of real-valued data to store only half the complex spectrum. This
 halves the memory cost of all frequency-domain buffers compared to sdeconv's `torch.fft.fftn`.
 
-### 7. Noise-Gated Damping
+### 8. Noise-Gated Damping
 **Source**: [Laasmaa et al. 2011](#ref11); [Conchello 1998](#ref12).
 
 **What it does**: Attenuates the RL update in background (noisy) regions while leaving
@@ -156,7 +206,7 @@ computed on the lowest quartile of voxels.
 - `damping="auto"` — automatic strength of 3.0
 - `damping=<float>` — manual strength (typical range: 1.0–10.0)
 
-### 8. XY Tiling (Large Image Support)
+### 9. XY Tiling (Large Image Support)
 **What it does**: Splits large images into overlapping XY tiles that are deconvolved
 independently and stitched back together. This allows processing images that are too
 large to fit in GPU memory as a single volume.
@@ -252,7 +302,7 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 | Acceleration | SHB momentum | Proven convergence guarantees ([Wang 2014](#ref3)), no extra FFTs per iteration, 5-10× speedup |
 | Boundary handling | Bertero weights | Mathematically rigorous, superior to reflection/zero padding |
 | Convergence metric | I-divergence | Natural for Poisson noise model underlying RL |
-| Regularization | TV (optional) | Well-understood, preserves edges, single parameter |
+| Regularization | TV and sparse-Hessian | TV for RL-family denoising; sparse-Hessian for quality-focused variational restoration |
 | PSF model | Vectorial + Scalar | Auto-select based on NA; vectorial essential for high-NA (immersion) objectives |
 | PSF Aberration | Gibson-Lanni | Accounts for real-world RI mismatches; critical for accurate PSF at depth |
 | Pixel integration | Sub-pixel grid | Measurable accuracy gain, optional for speed |
@@ -275,10 +325,15 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 | `niter` | int | 50 | Maximum number of iterations |
 | `tv_lambda` | float | 0.0 | TV regularization strength (0 = disabled) |
 | `damping` | str/float | 0.0 | Noise-gated damping: `0` (disabled), `"auto"` (strength 3.0), or float > 0 |
+| `offset` | str/float | "auto" | Positive processing offset: `"auto"` (=5), float, or 0 |
+| `prefilter_sigma` | float | 0.0 | Anscombe-domain Gaussian prefilter sigma in pixels |
+| `start` | str | "flat" | Initial estimate: `"flat"`, `"observed"`, or `"lowpass"` |
 | `background` | str/float | "auto" | Background level: "auto", float, or 0 |
 | `convergence` | str | "auto" | "fixed" (exact niter) or "auto" (I-divergence stop) |
 | `rel_threshold` | float | 0.005 | Relative I-divergence change threshold for auto-stop |
 | `check_every` | int | 5 | Check convergence every N iterations |
+| `pixel_size_xy` | float/None | None | Lateral voxel size used for anisotropic regularization scaling |
+| `pixel_size_z` | float/None | None | Axial voxel size used for anisotropic regularization scaling |
 | `device` | str/None | None | PyTorch device ("cuda", "cpu", or None=auto) |
 | `tiling` | str | "custom" | Tiling mode: "none" or "custom" (auto tile to fit GPU) |
 | `max_tile_xy` | int | 512 | Maximum tile size in XY (pixels) when tiling="custom" |
@@ -288,6 +343,17 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 - `"result"` — deconvolved image as numpy ndarray (same shape as input)
 - `"convergence"` — list of I-divergence values at check points
 - `"iterations_used"` — actual number of iterations performed
+
+### `ci_sparse_hessian_deconvolve(image, psf, **kwargs) → dict`
+
+**Additional parameters**:
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `sparse_hessian_weight` | float | 0.6 | Hessian-vs-sparsity balance |
+| `sparse_hessian_reg` | float | 0.98 | Data-vs-regulariser balance |
+
+All preprocessing, convergence, spacing, device, and tiling parameters listed above also apply.
+The return dictionary has the same structure as `ci_rl_deconvolve`.
 
 ### `ci_generate_psf(na, wavelength_nm, ...) → ndarray`
 

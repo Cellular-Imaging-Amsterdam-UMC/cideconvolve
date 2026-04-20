@@ -1,20 +1,21 @@
 # CIDeconvolve
 
-**GPU-accelerated 3-D / 2-D microscopy deconvolution with SHB Richardson-Lucy.**
+**GPU-accelerated 3-D / 2-D microscopy deconvolution with SHB Richardson-Lucy and sparse-Hessian regularisation.**
 
 CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible
 workflow that deconvolves widefield and confocal fluorescence microscopy
 images.  It generates a physically accurate PSF from OME-TIFF metadata
-(Gibson–Lanni model) and applies Scaled Heavy Ball (SHB) accelerated
-Richardson-Lucy deconvolution with optional Total Variation regularisation —
-all on the GPU via PyTorch.
+(Gibson–Lanni model) and applies one of three native GPU-capable
+deconvolution methods: SHB-accelerated Richardson-Lucy, SHB-RL with
+Total Variation regularisation, or a sparse-Hessian / SPITFIRE-style
+variational solver — all on the GPU via PyTorch.
 
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
 | **Version** | v1.0.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
-| **Methods** | `ci_rl` (SHB-accelerated RL) · `ci_rl_tv` (+ TV regularisation) |
+| **Methods** | `ci_rl` · `ci_rl_tv` · `ci_sparse_hessian` |
 | **Benchmark** | built-in with timing metrics CSV and MIP montages |
 
 ---
@@ -33,7 +34,24 @@ correction weights and I-divergence convergence monitoring.
 Same as `ci_rl` with an additional **Total Variation (TV) penalty** after
 each RL update (Dey et al. 2006).  Suppresses noise amplification at high
 iteration counts while preserving edges.  Controlled by the `--tv_lambda`
-parameter (typical range 0.0001–0.01).
+parameter (typical range 0.00005–0.001).
+
+### `ci_sparse_hessian` — Sparse-Hessian Variational Deconvolution
+
+A quality-focused **sparse-Hessian / SPITFIRE-style** variational method.
+It combines the same FFT-based forward model and preprocessing stack used by
+the RL-family methods with a sparse-Hessian prior that favours thin,
+high-contrast structures while suppressing noise.  Controlled by
+`--sparse_hessian_weight` and `--sparse_hessian_reg`.
+
+### Stabilisation Options
+
+The RL-family methods also support:
+
+- **Noise-gated damping** via `--damping`
+- **Positive offseting** via `--offset`
+- **Anscombe-domain Gaussian prefiltering** via `--prefilter_sigma`
+- **Initial estimate selection** via `--start flat|observed|lowpass`
 
 For full algorithmic details see [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD).
 
@@ -141,8 +159,8 @@ docker run --rm --gpus all \
     --benchmark True --bench_crop True
 ```
 
-Benchmark mode deconvolves the first input image with both `ci_rl` and
-`ci_rl_tv` at multiple iteration counts (20, 40, 60), writes a CSV with
+Benchmark mode deconvolves the first input image with `ci_rl`,
+`ci_rl_tv`, and `ci_sparse_hessian` at the requested iteration counts, writes a CSV with
 timing and image-quality metrics (sharpness, contrast, noise proxy), and
 generates MIP montage images.
 
@@ -193,7 +211,10 @@ command line via `wrapper.py`:
 | `--iterations` | 40 | Number of RL iterations (comma-separated for per-channel) |
 | `--tiling` | custom | Tiling mode: `none` or `custom` |
 | `--tile_limits` | 512, 64 | Max tile dimensions `max_xy, max_z` (when tiling = `custom`) |
-| `--method` | ci_rl | Deconvolution method: `ci_rl` or `ci_rl_tv` |
+| `--method` | ci_rl | Deconvolution method: `ci_rl`, `ci_rl_tv`, or `ci_sparse_hessian` |
+| `--tv_lambda` | 0.0001 | TV regularisation strength (only for `ci_rl_tv`) |
+| `--sparse_hessian_weight` | 0.6 | Hessian-vs-sparsity balance (only for `ci_sparse_hessian`) |
+| `--sparse_hessian_reg` | 0.98 | Data-vs-regulariser balance (only for `ci_sparse_hessian`) |
 | `--device` | auto | Compute device: `auto`, `cpu`, `cuda` |
 | `--na` | auto | Numerical aperture override |
 | `--refractive_index` | auto | Immersion medium RI (`air`, `water`, `oil`) |
@@ -201,9 +222,11 @@ command line via `wrapper.py`:
 | `--microscope_type` | auto | `widefield` or `confocal` |
 | `--emission_wl` | auto | Emission wavelengths in nm (comma-separated) |
 | `--excitation_wl` | auto | Excitation wavelengths in nm (for confocal PSF) |
-| `--tv_lambda` | 0.001 | TV regularisation strength (only for `ci_rl_tv`) |
 | `--background` | auto | Background subtraction: `auto`, numeric value, or `0` to disable |
-| `--damping` | none | Noise suppression damping factor: `none`, `auto`, or numeric |
+| `--damping` | none | Noise-gated damping for `ci_rl` / `ci_rl_tv`: `none`, `auto`, or numeric |
+| `--offset` | auto | Positive processing offset: `auto`, `none`, or numeric |
+| `--prefilter_sigma` | 0.0 | Anscombe-domain Gaussian prefilter sigma in pixels |
+| `--start` | flat | Initial estimate: `flat`, `observed`, or `lowpass` |
 | `--convergence` | auto | Early-stopping convergence: `auto` or `none` |
 | `--rel_threshold` | 0.005 | Relative change threshold for early stopping |
 | `--pixel_size_xy` | auto | Lateral pixel size in nm |
@@ -219,7 +242,7 @@ command line via `wrapper.py`:
 ```
 wrapper.py              BIAFLOWS entrypoint — parameter parsing, benchmark runner, metrics
 deconvolve.py           Core deconvolution engine + PSF generation
-deconvolve_ci.py        CI SHB-RL / RLTV implementation (PyTorch)
+deconvolve_ci.py        CI SHB-RL / RLTV / sparse-Hessian implementation (PyTorch)
 launcher.py             PyQt6 GUI launcher
 gui_deconvolve_ci.py    GUI deconvolution panel
 descriptor.json         BIAFLOWS/BIOMERO parameter descriptor

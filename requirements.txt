@@ -26,4 +26,7 @@ bioio-ome-zarr==3.3.0
 bioio-czi==2.6.1
 bioio-nd2==1.7.0
 
+# Zarr (needed for HCS plate reading/writing)
+zarr>=2.16
+
 
