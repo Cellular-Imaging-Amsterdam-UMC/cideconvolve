@@ -58,6 +58,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -68,6 +69,7 @@ log = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent
 ICON_PATH = SCRIPT_DIR / "icon.svg"
 LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
+OMERO_SESSION_REUSE_S = 10 * 60
 
 def _default_settings_dir() -> str:
     """Return Documents folder (Windows) or HOME (Linux) as default dir."""
@@ -746,6 +748,65 @@ class ResourceMonitorBar(QWidget):
         self._dot.setVisible(active)
 
 
+class CollapsibleSection(QWidget):
+    """Simple inline section that can show or hide its child content."""
+
+    def __init__(self, title: str, expanded: bool = False, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._toggle = QToolButton()
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self._toggle.toggled.connect(self._on_toggled)
+        layout.addWidget(self._toggle)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(6)
+        layout.addWidget(self._content)
+
+        self._on_toggled(expanded)
+
+    def content_layout(self) -> QVBoxLayout:
+        """Return the layout that should receive the collapsible content."""
+        return self._content_layout
+
+    def _on_toggled(self, expanded: bool):
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._content.setVisible(expanded)
+
+
+class NoWheelComboBox(QComboBox):
+    """Combo box that ignores mouse-wheel changes."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class NoWheelSpinBox(QSpinBox):
+    """Spin box that ignores mouse-wheel changes."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """Double spin box that ignores mouse-wheel changes."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
 # ---------------------------------------------------------------------------
 # Worker thread for deconvolution
 # ---------------------------------------------------------------------------
@@ -969,6 +1030,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_save_dir: str = _default_settings_dir()
         self._last_settings_dir: str = _default_settings_dir()
         self._omero_gw = None  # OmeroGateway instance (lazy)
+        self._omero_session_deadline: float = 0.0
 
         self._build_ui()
         self._update_viewer()
@@ -1011,7 +1073,7 @@ class DeconvolveCIWindow(QMainWindow):
         ml = QFormLayout()
         method_group.setLayout(ml)
 
-        self._method_combo = QComboBox()
+        self._method_combo = NoWheelComboBox()
         self._method_combo.addItems(["ci_rl", "ci_rl_tv", "ci_sparse_hessian"])
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
@@ -1023,136 +1085,145 @@ class DeconvolveCIWindow(QMainWindow):
         )
         ml.addRow("Iterations:", self._le_niter)
 
-        self._sp_tv_lambda = QDoubleSpinBox()
-        self._sp_tv_lambda.setRange(0.0, 1.0)
-        self._sp_tv_lambda.setDecimals(6)
-        self._sp_tv_lambda.setSingleStep(0.0001)
-        self._sp_tv_lambda.setValue(0.0001)
-        self._tv_lambda_label = ml.labelForField(self._sp_tv_lambda)  # type: ignore
-        ml.addRow("TV lambda:", self._sp_tv_lambda)
-        self._tv_lambda_row_label = "TV lambda:"
-
-        self._damping_combo = QComboBox()
-        self._damping_combo.addItems(["none", "auto", "manual"])
-        self._damping_combo.currentTextChanged.connect(self._on_damping_changed)
-        ml.addRow("Damping:", self._damping_combo)
-        self._damping_label = ml.labelForField(self._damping_combo)  # type: ignore
-
-        self._sp_damping = QDoubleSpinBox()
-        self._sp_damping.setRange(0.0, 100.0)
-        self._sp_damping.setDecimals(2)
-        self._sp_damping.setSingleStep(0.1)
-        self._sp_damping.setValue(3.0)
-        self._sp_damping.setEnabled(False)
-        ml.addRow("Damping value:", self._sp_damping)
-        self._damping_value_label = ml.labelForField(self._sp_damping)  # type: ignore
-
-        self._sp_sparse_weight = QDoubleSpinBox()
-        self._sp_sparse_weight.setRange(0.0, 1.0)
-        self._sp_sparse_weight.setDecimals(4)
-        self._sp_sparse_weight.setSingleStep(0.01)
-        self._sp_sparse_weight.setValue(0.6)
-        ml.addRow("Sparse weight:", self._sp_sparse_weight)
-        self._sparse_weight_label = ml.labelForField(self._sp_sparse_weight)  # type: ignore
-
-        self._sp_sparse_reg = QDoubleSpinBox()
-        self._sp_sparse_reg.setRange(0.0, 1.0)
-        self._sp_sparse_reg.setDecimals(4)
-        self._sp_sparse_reg.setSingleStep(0.001)
-        self._sp_sparse_reg.setValue(0.98)
-        ml.addRow("Sparse reg:", self._sp_sparse_reg)
-        self._sparse_reg_label = ml.labelForField(self._sp_sparse_reg)  # type: ignore
-
-        self._bg_combo = QComboBox()
-        self._bg_combo.addItems(["auto", "manual"])
-        self._bg_combo.currentTextChanged.connect(self._on_bg_changed)
-        ml.addRow("Background:", self._bg_combo)
-
-        self._sp_bg_value = QDoubleSpinBox()
-        self._sp_bg_value.setRange(0.0, 1e9)
-        self._sp_bg_value.setDecimals(2)
-        self._sp_bg_value.setValue(0.0)
-        self._sp_bg_value.setEnabled(False)
-        ml.addRow("BG value:", self._sp_bg_value)
-
-        self._offset_combo = QComboBox()
-        self._offset_combo.addItems(["auto", "none", "manual"])
-        self._offset_combo.currentTextChanged.connect(self._on_offset_changed)
-        ml.addRow("Offset:", self._offset_combo)
-
-        self._sp_offset = QDoubleSpinBox()
-        self._sp_offset.setRange(0.0, 1000.0)
-        self._sp_offset.setDecimals(1)
-        self._sp_offset.setSingleStep(1.0)
-        self._sp_offset.setValue(5.0)
-        self._sp_offset.setEnabled(False)
-        ml.addRow("Offset value:", self._sp_offset)
-
-        self._sp_prefilter = QDoubleSpinBox()
-        self._sp_prefilter.setRange(0.0, 5.0)
-        self._sp_prefilter.setDecimals(2)
-        self._sp_prefilter.setSingleStep(0.1)
-        self._sp_prefilter.setValue(0.0)
-        ml.addRow("Prefilter sigma:", self._sp_prefilter)
-
-        self._start_combo = QComboBox()
-        self._start_combo.addItems(["flat", "observed", "lowpass"])
-        ml.addRow("Start:", self._start_combo)
-
-        self._conv_combo = QComboBox()
+        self._conv_combo = NoWheelComboBox()
         self._conv_combo.addItems(["auto", "fixed"])
-        self._conv_combo.currentTextChanged.connect(self._on_conv_changed)
         ml.addRow("Convergence:", self._conv_combo)
 
-        self._sp_rel_thresh = QDoubleSpinBox()
+        self._sp_rel_thresh = NoWheelDoubleSpinBox()
         self._sp_rel_thresh.setRange(1e-8, 1.0)
         self._sp_rel_thresh.setDecimals(6)
         self._sp_rel_thresh.setSingleStep(0.0001)
-        self._sp_rel_thresh.setValue(0.005)
+        self._sp_rel_thresh.setValue(0.001)
         ml.addRow("Rel. threshold:", self._sp_rel_thresh)
 
-        self._sp_check_every = QSpinBox()
-        self._sp_check_every.setRange(1, 1000)
-        self._sp_check_every.setValue(5)
-        self._sp_check_every.setEnabled(False)
-        ml.addRow("Check every:", self._sp_check_every)
-
-        self._device_combo = QComboBox()
-        self._device_combo.addItems(["auto", "cuda", "cpu"])
-        ml.addRow("Device:", self._device_combo)
-
         ctrl_layout.addWidget(method_group)
+
+        advanced_section = CollapsibleSection("Advanced Parameters", expanded=False)
+        advanced_layout = advanced_section.content_layout()
 
         # --- Tiling ---
         tiling_group = QGroupBox("Tiling")
         tl = QFormLayout()
         tiling_group.setLayout(tl)
 
-        self._tiling_combo = QComboBox()
+        self._tiling_combo = NoWheelComboBox()
         self._tiling_combo.addItems(["custom", "none"])
         self._tiling_combo.currentTextChanged.connect(self._on_tiling_changed)
         tl.addRow("Tiling:", self._tiling_combo)
 
-        self._sp_max_tile_xy = QSpinBox()
+        self._sp_max_tile_xy = NoWheelSpinBox()
         self._sp_max_tile_xy.setRange(64, 4096)
         self._sp_max_tile_xy.setSingleStep(64)
         self._sp_max_tile_xy.setValue(512)
         tl.addRow("Max tile XY:", self._sp_max_tile_xy)
 
-        self._sp_max_tile_z = QSpinBox()
+        self._sp_max_tile_z = NoWheelSpinBox()
         self._sp_max_tile_z.setRange(8, 512)
         self._sp_max_tile_z.setSingleStep(8)
         self._sp_max_tile_z.setValue(64)
         tl.addRow("Max tile Z:", self._sp_max_tile_z)
 
-        ctrl_layout.addWidget(tiling_group)
+        advanced_layout.addWidget(tiling_group)
+
+        # --- Method tuning ---
+        method_adv_group = QGroupBox("Method Tuning")
+        aml = QFormLayout()
+        method_adv_group.setLayout(aml)
+
+        self._sp_tv_lambda = NoWheelDoubleSpinBox()
+        self._sp_tv_lambda.setRange(0.0, 1.0)
+        self._sp_tv_lambda.setDecimals(6)
+        self._sp_tv_lambda.setSingleStep(0.0001)
+        self._sp_tv_lambda.setValue(0.0001)
+        aml.addRow("TV lambda:", self._sp_tv_lambda)
+        self._tv_lambda_label = aml.labelForField(self._sp_tv_lambda)  # type: ignore
+
+        self._damping_combo = NoWheelComboBox()
+        self._damping_combo.addItems(["none", "auto", "manual"])
+        self._damping_combo.currentTextChanged.connect(self._on_damping_changed)
+        aml.addRow("Damping:", self._damping_combo)
+        self._damping_label = aml.labelForField(self._damping_combo)  # type: ignore
+
+        self._sp_damping = NoWheelDoubleSpinBox()
+        self._sp_damping.setRange(0.0, 100.0)
+        self._sp_damping.setDecimals(2)
+        self._sp_damping.setSingleStep(0.1)
+        self._sp_damping.setValue(3.0)
+        self._sp_damping.setEnabled(False)
+        aml.addRow("Damping value:", self._sp_damping)
+        self._damping_value_label = aml.labelForField(self._sp_damping)  # type: ignore
+
+        self._sp_sparse_weight = NoWheelDoubleSpinBox()
+        self._sp_sparse_weight.setRange(0.0, 1.0)
+        self._sp_sparse_weight.setDecimals(4)
+        self._sp_sparse_weight.setSingleStep(0.01)
+        self._sp_sparse_weight.setValue(0.6)
+        aml.addRow("Sparse weight:", self._sp_sparse_weight)
+        self._sparse_weight_label = aml.labelForField(self._sp_sparse_weight)  # type: ignore
+
+        self._sp_sparse_reg = NoWheelDoubleSpinBox()
+        self._sp_sparse_reg.setRange(0.0, 1.0)
+        self._sp_sparse_reg.setDecimals(4)
+        self._sp_sparse_reg.setSingleStep(0.001)
+        self._sp_sparse_reg.setValue(0.98)
+        aml.addRow("Sparse reg:", self._sp_sparse_reg)
+        self._sparse_reg_label = aml.labelForField(self._sp_sparse_reg)  # type: ignore
+
+        self._bg_combo = NoWheelComboBox()
+        self._bg_combo.addItems(["auto", "manual"])
+        self._bg_combo.currentTextChanged.connect(self._on_bg_changed)
+        aml.addRow("Background:", self._bg_combo)
+
+        self._sp_bg_value = NoWheelDoubleSpinBox()
+        self._sp_bg_value.setRange(0.0, 1e9)
+        self._sp_bg_value.setDecimals(2)
+        self._sp_bg_value.setValue(0.0)
+        self._sp_bg_value.setEnabled(False)
+        aml.addRow("BG value:", self._sp_bg_value)
+
+        self._offset_combo = NoWheelComboBox()
+        self._offset_combo.addItems(["auto", "none", "manual"])
+        self._offset_combo.currentTextChanged.connect(self._on_offset_changed)
+        aml.addRow("Offset:", self._offset_combo)
+
+        self._sp_offset = NoWheelDoubleSpinBox()
+        self._sp_offset.setRange(0.0, 1000.0)
+        self._sp_offset.setDecimals(1)
+        self._sp_offset.setSingleStep(1.0)
+        self._sp_offset.setValue(5.0)
+        self._sp_offset.setEnabled(False)
+        aml.addRow("Offset value:", self._sp_offset)
+
+        self._sp_prefilter = NoWheelDoubleSpinBox()
+        self._sp_prefilter.setRange(0.0, 5.0)
+        self._sp_prefilter.setDecimals(2)
+        self._sp_prefilter.setSingleStep(0.1)
+        self._sp_prefilter.setValue(0.0)
+        aml.addRow("Prefilter sigma:", self._sp_prefilter)
+
+        self._start_combo = NoWheelComboBox()
+        self._start_combo.addItems(["flat", "observed", "lowpass"])
+        aml.addRow("Start:", self._start_combo)
+
+        self._sp_check_every = NoWheelSpinBox()
+        self._sp_check_every.setRange(1, 1000)
+        self._sp_check_every.setValue(5)
+        self._sp_check_every.setEnabled(False)
+        aml.addRow("Check every:", self._sp_check_every)
+        self._conv_combo.currentTextChanged.connect(self._on_conv_changed)
+
+        self._device_combo = NoWheelComboBox()
+        self._device_combo.addItems(["auto", "cuda", "cpu"])
+        aml.addRow("Device:", self._device_combo)
+
+        advanced_layout.addWidget(method_adv_group)
 
         # --- Optics / PSF ---
         optics_group = QGroupBox("Optics / PSF")
         ol = QFormLayout()
         optics_group.setLayout(ol)
 
-        self._sp_na = QDoubleSpinBox()
+        self._sp_na = NoWheelDoubleSpinBox()
         self._sp_na.setRange(0.1, 2.0)
         self._sp_na.setDecimals(3)
         self._sp_na.setSingleStep(0.05)
@@ -1165,21 +1236,21 @@ class DeconvolveCIWindow(QMainWindow):
         )
         ol.addRow("Emission (nm):", self._le_emission)
 
-        self._sp_px_xy = QDoubleSpinBox()
+        self._sp_px_xy = NoWheelDoubleSpinBox()
         self._sp_px_xy.setRange(1.0, 10000.0)
         self._sp_px_xy.setDecimals(3)
         self._sp_px_xy.setSingleStep(1.0)
         self._sp_px_xy.setValue(65.0)
         ol.addRow("Pixel XY (nm):", self._sp_px_xy)
 
-        self._sp_px_z = QDoubleSpinBox()
+        self._sp_px_z = NoWheelDoubleSpinBox()
         self._sp_px_z.setRange(1.0, 50000.0)
         self._sp_px_z.setDecimals(3)
         self._sp_px_z.setSingleStep(10.0)
         self._sp_px_z.setValue(200.0)
         ol.addRow("Pixel Z (nm):", self._sp_px_z)
 
-        self._micro_combo = QComboBox()
+        self._micro_combo = NoWheelComboBox()
         self._micro_combo.addItems(["widefield", "confocal"])
         self._micro_combo.currentTextChanged.connect(self._on_micro_changed)
         ol.addRow("Microscope:", self._micro_combo)
@@ -1199,7 +1270,7 @@ class DeconvolveCIWindow(QMainWindow):
         rl = QFormLayout()
         ri_group.setLayout(rl)
 
-        self._sp_ri_imm = QDoubleSpinBox()
+        self._sp_ri_imm = NoWheelDoubleSpinBox()
         self._sp_ri_imm.setRange(1.0, 2.0)
         self._sp_ri_imm.setDecimals(4)
         self._sp_ri_imm.setSingleStep(0.001)
@@ -1218,13 +1289,13 @@ class DeconvolveCIWindow(QMainWindow):
             "prolong glass (1.52)": 1.52,
         }
         self._medium_ri_map = _MEDIUM_RI
-        self._medium_combo = QComboBox()
+        self._medium_combo = NoWheelComboBox()
         self._medium_combo.addItems(list(_MEDIUM_RI.keys()))
         self._medium_combo.setCurrentText("prolong gold (1.47)")
         self._medium_combo.currentTextChanged.connect(self._on_medium_changed)
         rl.addRow("Emb. medium:", self._medium_combo)
 
-        self._sp_ri_sample = QDoubleSpinBox()
+        self._sp_ri_sample = NoWheelDoubleSpinBox()
         self._sp_ri_sample.setRange(1.0, 2.0)
         self._sp_ri_sample.setDecimals(4)
         self._sp_ri_sample.setSingleStep(0.001)
@@ -1240,7 +1311,7 @@ class DeconvolveCIWindow(QMainWindow):
         cl = QFormLayout()
         cov_group.setLayout(cl)
 
-        self._sp_tg = QDoubleSpinBox()
+        self._sp_tg = NoWheelDoubleSpinBox()
         self._sp_tg.setRange(0, 1e7)
         self._sp_tg.setDecimals(0)
         self._sp_tg.setSingleStep(1000)
@@ -1248,7 +1319,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_tg.setSuffix(" nm")
         cl.addRow("Coverslip thickness:", self._sp_tg)
 
-        self._sp_tg0 = QDoubleSpinBox()
+        self._sp_tg0 = NoWheelDoubleSpinBox()
         self._sp_tg0.setRange(0, 1e7)
         self._sp_tg0.setDecimals(0)
         self._sp_tg0.setSingleStep(1000)
@@ -1256,7 +1327,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_tg0.setSuffix(" nm")
         cl.addRow("Coverslip thickness (design):", self._sp_tg0)
 
-        self._sp_ti0 = QDoubleSpinBox()
+        self._sp_ti0 = NoWheelDoubleSpinBox()
         self._sp_ti0.setRange(0, 1e7)
         self._sp_ti0.setDecimals(0)
         self._sp_ti0.setSingleStep(1000)
@@ -1264,7 +1335,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_ti0.setSuffix(" nm")
         cl.addRow("Immersion thickness (design):", self._sp_ti0)
 
-        self._sp_zp = QDoubleSpinBox()
+        self._sp_zp = NoWheelDoubleSpinBox()
         self._sp_zp.setRange(0, 1e7)
         self._sp_zp.setDecimals(0)
         self._sp_zp.setSingleStep(100)
@@ -1272,7 +1343,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_zp.setSuffix(" nm")
         cl.addRow("Particle depth (z_p):", self._sp_zp)
 
-        ctrl_layout.addWidget(cov_group)
+        advanced_layout.addWidget(cov_group)
 
         # --- PSF advanced ---
         psf_group = QGroupBox("PSF Advanced")
@@ -1283,18 +1354,20 @@ class DeconvolveCIWindow(QMainWindow):
         self._cb_integrate.setChecked(True)
         pl.addRow("Pixel integration:", self._cb_integrate)
 
-        self._sp_subpixels = QSpinBox()
+        self._sp_subpixels = NoWheelSpinBox()
         self._sp_subpixels.setRange(1, 9)
         self._sp_subpixels.setValue(3)
         pl.addRow("Sub-pixels:", self._sp_subpixels)
 
-        self._sp_n_pupil = QSpinBox()
+        self._sp_n_pupil = NoWheelSpinBox()
         self._sp_n_pupil.setRange(33, 513)
         self._sp_n_pupil.setSingleStep(2)
         self._sp_n_pupil.setValue(129)
         pl.addRow("Pupil samples:", self._sp_n_pupil)
 
-        ctrl_layout.addWidget(psf_group)
+        advanced_layout.addWidget(psf_group)
+        advanced_layout.addStretch()
+        ctrl_layout.addWidget(advanced_section)
 
         ctrl_layout.addStretch()
 
@@ -1346,14 +1419,14 @@ class DeconvolveCIWindow(QMainWindow):
         self._z_label.setMinimumWidth(50)
         nav.addWidget(self._z_label)
 
-        self._proj_combo = QComboBox()
+        self._proj_combo = NoWheelComboBox()
         self._proj_combo.addItems(["Slice", "MIP", "SUM"])
         self._proj_combo.currentTextChanged.connect(self._on_proj_changed)
         nav.addWidget(QLabel("View:"))
         nav.addWidget(self._proj_combo)
 
         nav.addWidget(QLabel("Lo%:"))
-        self._sp_pct_lo = QDoubleSpinBox()
+        self._sp_pct_lo = NoWheelDoubleSpinBox()
         self._sp_pct_lo.setRange(0.0, 50.0)
         self._sp_pct_lo.setDecimals(2)
         self._sp_pct_lo.setSingleStep(0.01)
@@ -1363,7 +1436,7 @@ class DeconvolveCIWindow(QMainWindow):
         nav.addWidget(self._sp_pct_lo)
 
         nav.addWidget(QLabel("Hi%:"))
-        self._sp_pct_hi = QDoubleSpinBox()
+        self._sp_pct_hi = NoWheelDoubleSpinBox()
         self._sp_pct_hi.setRange(50.0, 100.0)
         self._sp_pct_hi.setDecimals(3)
         self._sp_pct_hi.setSingleStep(0.001)
@@ -1689,14 +1762,24 @@ class DeconvolveCIWindow(QMainWindow):
                 self._omero_gw = inst
         gw = self._omero_gw
 
-        if not gw.is_connected():
+        if gw.is_connected() and not self._omero_session_is_reusable():
+            gw.disconnect()
+            self._omero_session_deadline = 0.0
+
+        if not self._omero_session_is_reusable():
             dlg = LoginDialog(self, gateway=gw)
+            self._configure_omero_login_dialog(dlg)
             if dlg.exec() != LoginDialog.DialogCode.Accepted:
                 return
+            self._refresh_omero_session_deadline()
+        else:
+            self._refresh_omero_session_deadline()
 
         browser = OmeroBrowserDialog(self, gateway=gw)
         if browser.exec() != OmeroBrowserDialog.DialogCode.Accepted:
             return
+
+        self._refresh_omero_session_deadline()
 
         images = browser.get_selected_images()
         if not images:
@@ -2106,6 +2189,24 @@ class DeconvolveCIWindow(QMainWindow):
             return
         self._apply_settings(data)
         self._status.showMessage(f"Settings loaded from {Path(path).name}", 3000)
+
+    def _configure_omero_login_dialog(self, dlg):
+        """Hide any remember-me checkbox and force 10-minute reuse."""
+        for cb in dlg.findChildren(QCheckBox):
+            text = cb.text().strip().lower()
+            if "remember" in text:
+                cb.setChecked(True)
+                cb.hide()
+
+    def _refresh_omero_session_deadline(self):
+        """Extend OMERO session reuse window from the current moment."""
+        self._omero_session_deadline = time.monotonic() + OMERO_SESSION_REUSE_S
+
+    def _omero_session_is_reusable(self) -> bool:
+        """Return True when the current OMERO connection is still reusable."""
+        if self._omero_gw is None or not self._omero_gw.is_connected():
+            return False
+        return time.monotonic() < self._omero_session_deadline
 
     # -----------------------------------------------------------------------
     # Viewer

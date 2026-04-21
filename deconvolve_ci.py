@@ -361,9 +361,19 @@ def _sparse_hessian_penalty(
     eps = 1e-8
     weighting = float(np.clip(weighting, 0.0, 1.0))
 
+    # Treat singleton axes as lower-dimensional data so 2-D inputs stored
+    # as (1, Y, X) still receive XY regularisation instead of a zero penalty.
+    if x.ndim == 3 and 1 in x.shape:
+        squeezed = x.squeeze()
+        if squeezed.ndim in (2, 3):
+            eff_z_scale = z_scale if squeezed.ndim == 3 else 1.0
+            return _sparse_hessian_penalty(
+                squeezed, weighting, z_scale=eff_z_scale
+            )
+
     if x.ndim == 2:
         if min(x.shape) < 3:
-            return torch.zeros((), dtype=x.dtype, device=x.device)
+            return x.sum() * 0.0
         core = x[1:-1, 1:-1]
         dxx = -x[2:, 1:-1] + 2.0 * core - x[:-2, 1:-1]
         dyy = -x[1:-1, 2:] + 2.0 * core - x[1:-1, :-2]
@@ -378,7 +388,7 @@ def _sparse_hessian_penalty(
 
     if x.ndim == 3:
         if min(x.shape) < 3:
-            return torch.zeros((), dtype=x.dtype, device=x.device)
+            return x.sum() * 0.0
         core = x[1:-1, 1:-1, 1:-1]
         dxx = -x[1:-1, 1:-1, 2:] + 2.0 * core - x[1:-1, 1:-1, :-2]
         dyy = -x[1:-1, 2:, 1:-1] + 2.0 * core - x[1:-1, :-2, 1:-1]
