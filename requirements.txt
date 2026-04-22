@@ -26,6 +26,10 @@ bioio-ome-zarr==3.3.0
 bioio-czi==2.6.1
 bioio-nd2==1.7.0
 
+# OMERO browser + shared XYZT/3D viewer components
+# Requires ZeroC ICE wheel installed separately — see README.md
+omero-browser-qt[viewer]==0.2.2
+
 # Zarr (needed for HCS plate reading/writing)
 zarr>=2.16
 

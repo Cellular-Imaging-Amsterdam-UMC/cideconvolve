@@ -16,12 +16,14 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -62,6 +64,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from ci_dual_viewer import DualViewerWidget
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -295,20 +299,89 @@ def _apply_metadata_defaults(images: list, meta: dict) -> dict:
     meta.setdefault("microscope_type", "widefield")
     if "channels" not in meta:
         meta["channels"] = [{"emission_wavelength": 520.0}] * len(images)
+    if "channel_names" not in meta:
+        meta["channel_names"] = [f"Ch {i}" for i in range(len(images))]
     meta["n_channels"] = len(images)
     meta["_from_file"] = meta_keys_from_file
     return meta
 
 
-def _load_image(path_str: str) -> dict:
-    """Load any supported microscopy image via BioImage (bioio).
+def _normalize_channel_to_tzyx(channel: np.ndarray) -> np.ndarray:
+    """Normalize supported image arrays to TZYX."""
+    arr = np.asarray(channel, dtype=np.float32)
+    if arr.ndim == 2:
+        return arr[np.newaxis, np.newaxis, :, :]
+    if arr.ndim == 3:
+        return arr[np.newaxis, :, :, :]
+    if arr.ndim == 4:
+        return arr
+    raise ValueError(f"Unsupported channel shape {arr.shape}; expected 2D, 3D, or 4D.")
 
-    Supports OME-TIFF, TIFF, ND2, CZI, OME-Zarr, and other bioio-
-    supported formats.  Returns dict with ``'images'`` (list[ndarray])
-    and ``'metadata'`` (dict).
-    """
-    from bioio import BioImage
 
+def _normalize_image_bundle(images: list[np.ndarray], meta: dict) -> dict:
+    """Normalize per-channel image volumes to TZYX and enrich metadata."""
+    channels = [_normalize_channel_to_tzyx(img) for img in images]
+    if not channels:
+        raise ValueError("No image channels were loaded.")
+    size_t, size_z, size_y, size_x = channels[0].shape
+    for idx, channel in enumerate(channels[1:], start=1):
+        if channel.shape != channels[0].shape:
+            raise ValueError(
+                f"Channel {idx} shape {channel.shape} does not match channel 0 shape {channels[0].shape}."
+            )
+    meta = _apply_metadata_defaults(channels, meta)
+    meta["size_t"] = size_t
+    meta["size_z"] = size_z
+    meta["size_y"] = size_y
+    meta["size_x"] = size_x
+    meta["size_c"] = len(channels)
+    meta["default_t"] = 0
+    meta["default_z"] = size_z // 2 if size_z > 1 else 0
+    if "channel_names" not in meta or len(meta["channel_names"]) < len(channels):
+        existing = list(meta.get("channel_names", []))
+        meta["channel_names"] = existing + [
+            f"Ch {i}" for i in range(len(existing), len(channels))
+        ]
+    for idx, channel_meta in enumerate(meta.get("channels", [])):
+        if "name" not in channel_meta and idx < len(meta["channel_names"]):
+            channel_meta["name"] = meta["channel_names"][idx]
+    return {"images": channels, "metadata": meta}
+
+
+def _channel_stack_to_solver_input(channel_zyx: np.ndarray) -> np.ndarray:
+    """Convert a normalized ZYX stack into 2D or 3D solver input."""
+    volume = np.asarray(channel_zyx, dtype=np.float32)
+    if volume.ndim != 3:
+        raise ValueError(f"Expected ZYX input, got {volume.shape}.")
+    if volume.shape[0] == 1:
+        return volume[0]
+    return volume
+
+
+def _solver_output_to_zyx(result: np.ndarray) -> np.ndarray:
+    """Normalize solver output back to ZYX for preview/export storage."""
+    arr = np.asarray(result, dtype=np.float32)
+    if arr.ndim == 2:
+        return arr[np.newaxis, :, :]
+    if arr.ndim == 3:
+        return arr
+    raise ValueError(f"Unexpected solver result shape {arr.shape}.")
+
+
+def _current_channel_names(meta: dict, n_channels: int) -> list[str]:
+    names = list(meta.get("channel_names") or [])
+    if names:
+        return names[:n_channels]
+    channels = meta.get("channels", [])
+    if channels:
+        return [
+            str(ch.get("name") or f"Ch{i} em={ch.get('emission_wavelength', '?')}")
+            for i, ch in enumerate(channels[:n_channels])
+        ]
+    return [f"Ch{i}" for i in range(n_channels)]
+
+
+def _extract_bioio_metadata(img, path_str: str) -> dict:
     _ACQ_MODE_MAP = {
         "LASER_SCANNING_CONFOCAL_MICROSCOPY": "confocal",
         "SPINNING_DISK_CONFOCAL": "confocal",
@@ -324,8 +397,6 @@ def _load_image(path_str: str) -> dict:
         "AIR": 1.0,
         "MULTI": 1.515,
     }
-
-    img = BioImage(str(path_str))
     meta: dict = {}
 
     # Physical pixel sizes (µm)
@@ -380,6 +451,13 @@ def _load_image(path_str: str) -> dict:
     except Exception:
         pass
 
+    try:
+        channel_names = list(img.channel_names or [])
+        if channel_names:
+            meta["channel_names"] = [str(name) for name in channel_names]
+    except Exception:
+        pass
+
     # Fallback: try to parse channel names as emission wavelengths
     # (e.g. OME-Zarr stores channel names like '520.0', '600.0')
     if "channels" not in meta:
@@ -409,19 +487,173 @@ def _load_image(path_str: str) -> dict:
         except Exception:
             pass
 
-    # Image data — request CZYX, first timepoint
-    raw = img.get_image_data("CZYX", T=0).astype(np.float32)
-    images: list[np.ndarray] = []
-    if raw.ndim == 4:
-        for c in range(raw.shape[0]):
-            images.append(raw[c])
-    elif raw.ndim == 3:
-        images.append(raw)
-    else:
-        images.append(raw.squeeze())
+    return meta
 
-    meta = _apply_metadata_defaults(images, meta)
-    return {"images": images, "metadata": meta}
+
+def _bioio_dim_size(img, dim_name: str, default: int = 1) -> int:
+    try:
+        value = getattr(img.dims, dim_name)
+        if value is not None:
+            return max(int(value), 1)
+    except Exception:
+        pass
+    try:
+        order = str(getattr(img.dims, "order", ""))
+        shape = tuple(int(v) for v in getattr(img, "shape", ()))
+        if dim_name in order and len(order) == len(shape):
+            return max(int(shape[order.index(dim_name)]), 1)
+    except Exception:
+        pass
+    return max(int(default), 1)
+
+
+def _normalize_stack_to_zyx(arr: np.ndarray) -> np.ndarray:
+    stack = np.asarray(arr, dtype=np.float32)
+    if stack.ndim == 2:
+        return stack[np.newaxis, :, :]
+    if stack.ndim == 3:
+        return stack
+    raise ValueError(f"Unsupported stack shape {stack.shape}; expected YX or ZYX.")
+
+
+def _parse_float_list(text: str) -> list[float]:
+    values: list[float] = []
+    for raw in text.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if token.lower() in {"none", "nan", "null"}:
+            continue
+        try:
+            values.append(float(token))
+        except ValueError:
+            continue
+    return values
+
+
+def _format_channel_values(
+    channels: list[dict],
+    key: str,
+    default: float,
+) -> str:
+    values: list[str] = []
+    for channel in channels:
+        value = channel.get(key)
+        try:
+            values.append(str(float(value if value is not None else default)))
+        except (TypeError, ValueError):
+            values.append(str(float(default)))
+    return ", ".join(values)
+
+
+class _BaseTimepointSource:
+    def __init__(self, metadata: dict):
+        self.metadata = metadata
+
+    def load_timepoint(
+        self,
+        t_index: int,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> list[np.ndarray]:
+        raise NotImplementedError
+
+
+class _BioImageTimepointSource(_BaseTimepointSource):
+    def __init__(self, path_str: str):
+        from bioio import BioImage
+
+        self._path_str = str(path_str)
+        self._img = BioImage(self._path_str)
+        meta = _extract_bioio_metadata(self._img, self._path_str)
+        size_c = _bioio_dim_size(self._img, "C", default=1)
+        meta = _apply_metadata_defaults([None] * size_c, meta)
+        meta["size_t"] = _bioio_dim_size(self._img, "T", default=1)
+        meta["size_z"] = _bioio_dim_size(self._img, "Z", default=1)
+        meta["size_y"] = _bioio_dim_size(self._img, "Y", default=1)
+        meta["size_x"] = _bioio_dim_size(self._img, "X", default=1)
+        meta["size_c"] = size_c
+        meta["default_t"] = 0
+        meta["default_z"] = meta["size_z"] // 2 if meta["size_z"] > 1 else 0
+        super().__init__(meta)
+
+    def load_timepoint(
+        self,
+        t_index: int,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> list[np.ndarray]:
+        size_c = max(int(self.metadata.get("size_c", 1)), 1)
+        size_t = max(int(self.metadata.get("size_t", 1)), 1)
+        target_t = max(0, min(int(t_index), size_t - 1))
+        channels: list[np.ndarray] = []
+        total = size_c
+        for c_index in range(size_c):
+            if progress_cb is not None:
+                progress_cb(c_index, total, f"Loading stack… channel {c_index + 1}/{total}")
+            selector: dict[str, Any] = {}
+            if size_t > 1:
+                selector["T"] = target_t
+            if size_c > 1:
+                selector["C"] = c_index
+            if hasattr(self._img, "get_image_dask_data"):
+                arr = self._img.get_image_dask_data("ZYX", **selector).compute()
+            else:
+                arr = self._img.get_image_data("ZYX", **selector)
+            channels.append(_normalize_stack_to_zyx(arr))
+            if progress_cb is not None:
+                progress_cb(c_index + 1, total, f"Loading stack… channel {c_index + 1}/{total}")
+        return channels
+
+
+class _OmeroTimepointSource(_BaseTimepointSource):
+    def __init__(self, image):
+        from omero_browser_qt import RegularImagePlaneProvider, get_image_metadata
+
+        self._image = image
+        self._provider = RegularImagePlaneProvider(image)
+        meta = get_image_metadata(image)
+        size_c = max(int(meta.get("size_c", 1)), 1)
+        meta = _apply_metadata_defaults([None] * size_c, meta)
+        meta["size_c"] = size_c
+        meta["default_t"] = 0
+        meta["default_z"] = max(int(meta.get("size_z", 1)) // 2, 0)
+        super().__init__(meta)
+
+    def load_timepoint(
+        self,
+        t_index: int,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> list[np.ndarray]:
+        size_c = max(int(self.metadata.get("size_c", 1)), 1)
+        size_t = max(int(self.metadata.get("size_t", 1)), 1)
+        size_z = max(int(self.metadata.get("size_z", 1)), 1)
+        target_t = max(0, min(int(t_index), size_t - 1))
+        channels: list[np.ndarray] = []
+        total = max(size_c * size_z, 1)
+        for c_index in range(size_c):
+            base = c_index * size_z
+
+            def _progress(done: int, channel_total: int, *, _c=c_index, _base=base) -> None:
+                if progress_cb is None:
+                    return
+                progress_cb(
+                    _base + done,
+                    total,
+                    f"Loading stack… channel {_c + 1}/{size_c}, plane {done}/{channel_total}",
+                )
+
+            stack = self._provider.get_stack(c_index, target_t, progress=_progress)
+            channels.append(_normalize_stack_to_zyx(stack))
+            if progress_cb is not None:
+                progress_cb(base + size_z, total, f"Loading stack… channel {c_index + 1}/{size_c}")
+        return channels
+
+
+def _build_file_source(path_str: str) -> _BaseTimepointSource:
+    return _BioImageTimepointSource(path_str)
+
+
+def _build_omero_source(image) -> _BaseTimepointSource:
+    return _OmeroTimepointSource(image)
 
 
 # ---------------------------------------------------------------------------
@@ -811,9 +1043,184 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
 # Worker thread for deconvolution
 # ---------------------------------------------------------------------------
 
+def _deconvolve_channel_stacks(
+    channels_zyx: list[np.ndarray],
+    metadata: dict,
+    params: dict,
+    t_index: int,
+    *,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> list[np.ndarray]:
+    """Deconvolve one already-loaded timepoint and return per-channel ZYX output."""
+    del metadata  # Metadata is carried indirectly via params and normalized shapes.
+
+    def _progress(message: str) -> None:
+        if progress_cb is not None:
+            progress_cb(message)
+
+    def _stopped() -> bool:
+        return bool(should_stop and should_stop())
+
+    try:
+        from deconvolve_ci import (
+            ci_generate_psf,
+            ci_rl_deconvolve,
+            ci_sparse_hessian_deconvolve,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to load deconvolve_ci (torch DLL error).\n\n"
+            f"Your PyTorch installation appears broken. Try:\n"
+            f"  conda install pytorch torchvision torchaudio "
+            f"pytorch-cuda=12.1 -c pytorch -c nvidia\n\n"
+            f"Original error: {exc}"
+        ) from exc
+
+    results: list[np.ndarray] = []
+    n_channels = len(channels_zyx)
+    for ci, channel_zyx in enumerate(channels_zyx):
+        if _stopped():
+            raise RuntimeError("Stopped by user")
+
+        ch_data = _channel_stack_to_solver_input(channel_zyx)
+        em_list = params["emission_wavelengths"]
+        em_wl = em_list[ci] if ci < len(em_list) else em_list[-1] if em_list else 520.0
+        ex_list = params["excitation_wavelengths"]
+        ex_wl = ex_list[ci] if ci < len(ex_list) else ex_list[-1] if ex_list else None
+        if params["microscope_type"] != "confocal":
+            ex_wl = None
+
+        if ch_data.ndim == 3:
+            nz_img, _, _ = ch_data.shape
+            n_z_psf = max(2 * nz_img - 1, 1) | 1
+        else:
+            n_z_psf = 1
+
+        airy_radius_nm = 0.61 * em_wl / params["na"]
+        airy_radius_px = airy_radius_nm / params["pixel_size_xy_nm"]
+        n_xy_psf = int(max(64, 2 * int(4 * airy_radius_px) + 1))
+        if n_xy_psf % 2 == 0:
+            n_xy_psf += 1
+
+        _progress(
+            f"T {t_index + 1} — generating PSF for channel {ci + 1}/{n_channels} (λ={em_wl:.0f} nm)…"
+        )
+        psf = ci_generate_psf(
+            na=params["na"],
+            wavelength_nm=em_wl,
+            pixel_size_xy_nm=params["pixel_size_xy_nm"],
+            pixel_size_z_nm=params["pixel_size_z_nm"],
+            n_xy=n_xy_psf,
+            n_z=n_z_psf,
+            ri_immersion=params["ri_immersion"],
+            ri_sample=params["ri_sample"],
+            ri_coverslip=params["ri_immersion"],
+            ri_coverslip_design=params["ri_immersion"],
+            ri_immersion_design=params["ri_immersion"],
+            t_g=params["t_g"],
+            t_g0=params["t_g0"],
+            t_i0=params["t_i0"],
+            z_p=params["z_p"],
+            microscope_type=params["microscope_type"],
+            excitation_nm=ex_wl,
+            integrate_pixels=params["integrate_pixels"],
+            n_subpixels=params["n_subpixels"],
+            n_pupil=params["n_pupil"],
+            device=params["device"],
+        )
+
+        if psf.ndim == 3 and ch_data.ndim == 3 and psf.shape[0] > ch_data.shape[0]:
+            start = (psf.shape[0] - ch_data.shape[0]) // 2
+            psf = psf[start:start + ch_data.shape[0]]
+
+        gc.collect()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        niter_list = params["niter_list"]
+        niter = niter_list[ci] if ci < len(niter_list) else niter_list[-1]
+        if _stopped():
+            raise RuntimeError("Stopped by user")
+
+        _progress(f"T {t_index + 1} — deconvolving channel {ci + 1}/{n_channels} ({niter} iter)…")
+        common = dict(
+            niter=niter,
+            offset=params["offset"],
+            prefilter_sigma=params["prefilter_sigma"],
+            start=params["start"],
+            background=params["background"],
+            convergence=params["convergence"],
+            rel_threshold=params["rel_threshold"],
+            check_every=params["check_every"],
+            pixel_size_xy=params["pixel_size_xy_nm"],
+            pixel_size_z=params["pixel_size_z_nm"],
+            device=params["device"],
+            tiling=params["tiling"],
+            max_tile_xy=params["max_tile_xy"],
+            max_tile_z=params["max_tile_z"],
+        )
+        if params["method"] == "ci_sparse_hessian":
+            out = ci_sparse_hessian_deconvolve(
+                ch_data,
+                psf,
+                sparse_hessian_weight=params["sparse_hessian_weight"],
+                sparse_hessian_reg=params["sparse_hessian_reg"],
+                **common,
+            )
+        else:
+            out = ci_rl_deconvolve(
+                ch_data,
+                psf,
+                tv_lambda=params["tv_lambda"],
+                damping=params["damping"],
+                **common,
+            )
+        results.append(_solver_output_to_zyx(out["result"].copy()))
+
+        del psf
+        del out
+        gc.collect()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    return results
+
+
+def _write_ome_tiff(data: np.ndarray, path: str, metadata: dict) -> None:
+    from bioio.writers import OmeTiffWriter
+
+    physical_pixel_sizes = None
+    px_x = metadata.get("pixel_size_x")
+    px_z = metadata.get("pixel_size_z")
+    if px_x or px_z:
+        from bioio_base.types import PhysicalPixelSizes
+        physical_pixel_sizes = PhysicalPixelSizes(
+            Z=px_z or 1.0, Y=px_x or 1.0, X=px_x or 1.0
+        )
+
+    channel_names = _current_channel_names(metadata, data.shape[1])
+    OmeTiffWriter.save(
+        data.astype(np.float32),
+        path,
+        dim_order="TCZYX",
+        physical_pixel_sizes=physical_pixel_sizes,
+        channel_names=channel_names,
+    )
+
+
 class _DeconvolveWorker(QThread):
-    """Run deconvolution in a background thread."""
-    finished = pyqtSignal(object)  # emits list[np.ndarray] or Exception
+    """Preview deconvolution for a single timepoint."""
+
+    finished = pyqtSignal(object)
     progress = pyqtSignal(str)
 
     def __init__(
@@ -821,171 +1228,104 @@ class _DeconvolveWorker(QThread):
         channels: list[np.ndarray],
         metadata: dict,
         params: dict,
+        t_index: int,
         parent=None,
     ):
         super().__init__(parent)
         self.channels = channels
         self.metadata = metadata
         self.params = params
+        self.t_index = int(t_index)
 
     def run(self):
         try:
-            try:
-                from deconvolve_ci import (
-                    ci_generate_psf,
-                    ci_rl_deconvolve,
-                    ci_sparse_hessian_deconvolve,
-                )
-            except OSError as e:
-                raise RuntimeError(
-                    f"Failed to load deconvolve_ci (torch DLL error).\n\n"
-                    f"Your PyTorch installation appears broken. Try:\n"
-                    f"  conda install pytorch torchvision torchaudio "
-                    f"pytorch-cuda=12.1 -c pytorch -c nvidia\n\n"
-                    f"Original error: {e}"
-                ) from e
-
-            results: list[np.ndarray] = []
-            n_ch = len(self.channels)
-            meta = self.metadata
-            p = self.params
-
-            for ci, ch_data in enumerate(self.channels):
-                if self.isInterruptionRequested():
-                    self.finished.emit(RuntimeError("Stopped by user"))
-                    return
-                self.progress.emit(f"Processing channel {ci + 1}/{n_ch} …")
-
-                # Per-channel wavelengths from GUI
-                em_list = p["emission_wavelengths"]
-                em_wl = em_list[ci] if ci < len(em_list) else em_list[-1] if em_list else 520.0
-                ex_list = p["excitation_wavelengths"]
-                ex_wl = ex_list[ci] if ci < len(ex_list) else ex_list[-1] if ex_list else None
-                if p["microscope_type"] != "confocal":
-                    ex_wl = None
-
-                # PSF size: auto XY from Airy radius, Z = 2*nz-1
-                if ch_data.ndim == 3:
-                    nz_img, ny, nx = ch_data.shape
-                    n_z_psf = max(2 * nz_img - 1, 1) | 1
-                else:
-                    ny, nx = ch_data.shape
-                    n_z_psf = 1
-
-                # Auto-calculate PSF lateral size from Airy disk
-                airy_radius_nm = 0.61 * em_wl / p["na"]
-                airy_radius_px = airy_radius_nm / p["pixel_size_xy_nm"]
-                n_xy_psf = int(max(64, 2 * int(4 * airy_radius_px) + 1))
-                if n_xy_psf % 2 == 0:
-                    n_xy_psf += 1
-
-                self.progress.emit(
-                    f"  Generating PSF (ch {ci + 1}, λ={em_wl:.0f} nm) …"
-                )
-                psf = ci_generate_psf(
-                    na=p["na"],
-                    wavelength_nm=em_wl,
-                    pixel_size_xy_nm=p["pixel_size_xy_nm"],
-                    pixel_size_z_nm=p["pixel_size_z_nm"],
-                    n_xy=n_xy_psf,
-                    n_z=n_z_psf,
-                    ri_immersion=p["ri_immersion"],
-                    ri_sample=p["ri_sample"],
-                    ri_coverslip=p["ri_immersion"],
-                    ri_coverslip_design=p["ri_immersion"],
-                    ri_immersion_design=p["ri_immersion"],
-                    t_g=p["t_g"],
-                    t_g0=p["t_g0"],
-                    t_i0=p["t_i0"],
-                    z_p=p["z_p"],
-                    microscope_type=p["microscope_type"],
-                    excitation_nm=ex_wl,
-                    integrate_pixels=p["integrate_pixels"],
-                    n_subpixels=p["n_subpixels"],
-                    n_pupil=p["n_pupil"],
-                    device=p["device"],
-                )
-
-                # Crop PSF axial dimension to match image
-                if psf.ndim == 3 and ch_data.ndim == 3:
-                    pz = psf.shape[0]
-                    iz = ch_data.shape[0]
-                    if pz > iz:
-                        start = (pz - iz) // 2
-                        psf = psf[start : start + iz]
-
-                # Release any GPU memory used by PSF generation before decon
-                gc.collect()
-                try:
-                    import torch as _torch
-                    if _torch.cuda.is_available():
-                        _torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-                # Per-channel iteration count
-                niter_list = p["niter_list"]
-                niter = niter_list[ci] if ci < len(niter_list) else niter_list[-1]
-
-                if self.isInterruptionRequested():
-                    self.finished.emit(RuntimeError("Stopped by user"))
-                    return
-
-                self.progress.emit(
-                    f"  Deconvolving (ch {ci + 1}, {niter} iter) …"
-                )
-                common = dict(
-                    niter=niter,
-                    offset=p["offset"],
-                    prefilter_sigma=p["prefilter_sigma"],
-                    start=p["start"],
-                    background=p["background"],
-                    convergence=p["convergence"],
-                    rel_threshold=p["rel_threshold"],
-                    check_every=p["check_every"],
-                    pixel_size_xy=p["pixel_size_xy_nm"],
-                    pixel_size_z=p["pixel_size_z_nm"],
-                    device=p["device"],
-                    tiling=p["tiling"],
-                    max_tile_xy=p["max_tile_xy"],
-                    max_tile_z=p["max_tile_z"],
-                )
-                if p["method"] == "ci_sparse_hessian":
-                    out = ci_sparse_hessian_deconvolve(
-                        ch_data,
-                        psf,
-                        sparse_hessian_weight=p["sparse_hessian_weight"],
-                        sparse_hessian_reg=p["sparse_hessian_reg"],
-                        **common,
-                    )
-                else:
-                    out = ci_rl_deconvolve(
-                        ch_data,
-                        psf,
-                        tv_lambda=p["tv_lambda"],
-                        damping=p["damping"],
-                        **common,
-                    )
-                results.append(out["result"].copy())
-
-                # ---- Release GPU and system memory for this channel ----
-                del psf
-                del out
-                gc.collect()
-                try:
-                    import torch as _torch
-                    if _torch.cuda.is_available():
-                        _torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                self.progress.emit(
-                    f"  Ch {ci + 1}/{n_ch} done — GPU/CPU memory released"
-                )
-
-            self.finished.emit(results)
+            results = _deconvolve_channel_stacks(
+                self.channels,
+                self.metadata,
+                self.params,
+                self.t_index,
+                progress_cb=self.progress.emit,
+                should_stop=self.isInterruptionRequested,
+            )
+            self.finished.emit({"timepoint": self.t_index, "channels": results})
         except Exception as exc:
             traceback.print_exc()
             self.finished.emit(exc)
+
+
+class _SaveTSeriesWorker(QThread):
+    """Export a full deconvolved T-series to OME-TIFF."""
+
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(str)
+
+    def __init__(
+        self,
+        source: _BaseTimepointSource,
+        metadata: dict,
+        params: dict,
+        output_path: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.source = source
+        self.metadata = metadata
+        self.params = params
+        self.output_path = output_path
+
+    def run(self):
+        stage_path = None
+        try:
+            size_t = max(int(self.metadata.get("size_t", 1)), 1)
+            size_c = max(int(self.metadata.get("size_c", 1)), 1)
+            size_z = max(int(self.metadata.get("size_z", 1)), 1)
+            size_y = max(int(self.metadata.get("size_y", 1)), 1)
+            size_x = max(int(self.metadata.get("size_x", 1)), 1)
+
+            fd, stage_path = tempfile.mkstemp(prefix="cideconvolve_", suffix=".dat")
+            os.close(fd)
+            staged = np.memmap(
+                stage_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=(size_t, size_c, size_z, size_y, size_x),
+            )
+
+            for t_index in range(size_t):
+                if self.isInterruptionRequested():
+                    raise RuntimeError("Stopped by user")
+                self.progress.emit(f"Saving T-series — loading timepoint {t_index + 1}/{size_t}…")
+                channels = self.source.load_timepoint(
+                    t_index,
+                    progress_cb=lambda done, total, text: self.progress.emit(
+                        f"{text} ({done}/{total})"
+                    ),
+                )
+                self.progress.emit(f"Saving T-series — processing timepoint {t_index + 1}/{size_t}…")
+                results = _deconvolve_channel_stacks(
+                    channels,
+                    self.metadata,
+                    self.params,
+                    t_index,
+                    progress_cb=self.progress.emit,
+                    should_stop=self.isInterruptionRequested,
+                )
+                for c_index, result in enumerate(results):
+                    staged[t_index, c_index, :, :, :] = result
+                staged.flush()
+
+            self.progress.emit("Writing OME-TIFF…")
+            _write_ome_tiff(staged, self.output_path, self.metadata)
+            self.finished.emit({"path": self.output_path})
+        except Exception as exc:
+            traceback.print_exc()
+            self.finished.emit(exc)
+        finally:
+            if stage_path and os.path.exists(stage_path):
+                try:
+                    os.remove(stage_path)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1019,10 +1359,13 @@ class DeconvolveCIWindow(QMainWindow):
 
         # State
         self._input_channels: list[np.ndarray] = []
-        self._output_channels: list[np.ndarray] = []
+        self._input_source: Optional[_BaseTimepointSource] = None
+        self._input_source_factory: Optional[Callable[[], _BaseTimepointSource]] = None
+        self._loaded_timepoint: Optional[int] = None
+        self._preview_outputs_by_t: dict[int, list[np.ndarray]] = {}
         self._metadata: dict = {}
-        self._pct_cache: dict = {}  # (side, ch, pct_lo, pct_hi, mode) → (lo, hi)
         self._worker: Optional[_DeconvolveWorker] = None
+        self._save_worker: Optional[_SaveTSeriesWorker] = None
         self._monitor: Optional[_ResourceMonitor] = None
         self._input_path: Optional[Path] = None
         self._last_open_dir: str = _default_settings_dir()
@@ -1033,7 +1376,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._omero_session_deadline: float = 0.0
 
         self._build_ui()
-        self._update_viewer()
 
         # Start the resource monitor immediately and keep it running
         self._monitor = _ResourceMonitor(parent=self)
@@ -1375,77 +1717,10 @@ class DeconvolveCIWindow(QMainWindow):
         viewer = QWidget()
         vl = QVBoxLayout(viewer)
         vl.setContentsMargins(0, 0, 0, 0)
+        self._viewer = DualViewerWidget()
+        self._viewer.timepointChanged.connect(self._on_viewer_time_changed)
+        vl.addWidget(self._viewer, stretch=1)
         splitter.addWidget(viewer)
-
-        # Channel toggle buttons (per-channel, coloured)
-        self._ch_bar = QHBoxLayout()
-        self._ch_bar.addWidget(QLabel("Channels:"))
-        self._ch_toggles: list[QPushButton] = []
-        self._ch_bar.addStretch()
-        vl.addLayout(self._ch_bar)
-
-        # Image panels
-        panels = QHBoxLayout()
-        vl.addLayout(panels, stretch=1)
-
-        # Input panel
-        inp_vl = QVBoxLayout()
-        inp_vl.addWidget(QLabel("Input"))
-        self._view_input = ZoomableImageView()
-        inp_vl.addWidget(self._view_input, stretch=1)
-        panels.addLayout(inp_vl)
-
-        # Output panel
-        out_vl = QVBoxLayout()
-        out_vl.addWidget(QLabel("Output"))
-        self._view_output = ZoomableImageView()
-        out_vl.addWidget(self._view_output, stretch=1)
-        panels.addLayout(out_vl)
-
-        # Link zoom/pan between both panels
-        self._view_input.link_to(self._view_output)
-
-        # Z-slider + projection toggle
-        nav = QHBoxLayout()
-
-        self._z_slider = QSlider(Qt.Orientation.Horizontal)
-        self._z_slider.setMinimum(0)
-        self._z_slider.setMaximum(0)
-        self._z_slider.valueChanged.connect(self._update_viewer)
-        nav.addWidget(QLabel("Z:"))
-        nav.addWidget(self._z_slider, stretch=1)
-
-        self._z_label = QLabel("0/0")
-        self._z_label.setMinimumWidth(50)
-        nav.addWidget(self._z_label)
-
-        self._proj_combo = NoWheelComboBox()
-        self._proj_combo.addItems(["Slice", "MIP", "SUM"])
-        self._proj_combo.currentTextChanged.connect(self._on_proj_changed)
-        nav.addWidget(QLabel("View:"))
-        nav.addWidget(self._proj_combo)
-
-        nav.addWidget(QLabel("Lo%:"))
-        self._sp_pct_lo = NoWheelDoubleSpinBox()
-        self._sp_pct_lo.setRange(0.0, 50.0)
-        self._sp_pct_lo.setDecimals(2)
-        self._sp_pct_lo.setSingleStep(0.01)
-        self._sp_pct_lo.setValue(0.10)
-        self._sp_pct_lo.setFixedWidth(90)
-        self._sp_pct_lo.valueChanged.connect(self._update_viewer)
-        nav.addWidget(self._sp_pct_lo)
-
-        nav.addWidget(QLabel("Hi%:"))
-        self._sp_pct_hi = NoWheelDoubleSpinBox()
-        self._sp_pct_hi.setRange(50.0, 100.0)
-        self._sp_pct_hi.setDecimals(3)
-        self._sp_pct_hi.setSingleStep(0.001)
-        self._sp_pct_hi.setValue(100.0)
-        self._sp_pct_hi.setFixedWidth(110)
-        self._sp_pct_hi.valueChanged.connect(self._update_viewer)
-        nav.addWidget(self._sp_pct_hi)
-
-        vl.addLayout(nav)
 
         # --- Top toolbar: Open / Run / Save ---
         bottom = QHBoxLayout()
@@ -1476,10 +1751,16 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_run.clicked.connect(self._on_run)
         bottom.addWidget(self._btn_run)
 
-        self._btn_save = QPushButton("Save Result\u2026")
+        self._btn_save = QPushButton("Save\u2026")
         self._btn_save.setEnabled(False)
         self._btn_save.clicked.connect(self._on_save)
         bottom.addWidget(self._btn_save)
+
+        self._btn_save_series = QPushButton("Save T-Series\u2026")
+        self._btn_save_series.setEnabled(False)
+        self._btn_save_series.setVisible(False)
+        self._btn_save_series.clicked.connect(self._on_save_t_series)
+        bottom.addWidget(self._btn_save_series)
 
         # --- Settings buttons ---
         self._btn_restore = QPushButton("Restore")
@@ -1602,8 +1883,31 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_max_tile_z.setEnabled(enabled)
 
     def _on_proj_changed(self, text: str):
-        self._z_slider.setEnabled(text == "Slice")
-        self._update_viewer()
+        del text
+
+    def _begin_progress(self, total: int, text: str) -> None:
+        self._progress.setRange(0, max(int(total), 1))
+        self._progress.setValue(0)
+        self._progress.setFormat("%v / %m")
+        self._progress.setVisible(True)
+        self._status.showMessage(text)
+        QApplication.processEvents()
+
+    def _begin_busy_progress(self, text: str) -> None:
+        self._progress.setRange(0, 0)
+        self._progress.setVisible(True)
+        self._status.showMessage(text)
+        QApplication.processEvents()
+
+    def _advance_progress(self, value: int, text: Optional[str] = None) -> None:
+        if self._progress.maximum() > 0:
+            self._progress.setValue(max(0, min(int(value), self._progress.maximum())))
+        if text is not None:
+            self._status.showMessage(text)
+        QApplication.processEvents()
+
+    def _end_progress(self) -> None:
+        self._end_progress()
 
     # -----------------------------------------------------------------------
     # File open
@@ -1629,24 +1933,35 @@ class DeconvolveCIWindow(QMainWindow):
             self._do_load(path)
 
     def _do_load(self, path: str):
-        self._status.showMessage(f"Loading {Path(path).name} …")
-        QApplication.processEvents()
-
         try:
-            data = _load_image(path)
-            self._apply_image_data(data, Path(path).name, Path(path))
+            self._begin_busy_progress(f"Opening {Path(path).name} …")
+            source = _build_file_source(path)
+            self._apply_image_source(
+                source,
+                Path(path).name,
+                source_path=Path(path),
+                source_factory=lambda _path=str(path): _build_file_source(_path),
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", str(exc))
             self._status.showMessage("Load failed", 5000)
+        finally:
+            self._end_progress()
 
-    def _apply_image_data(
-        self, data: dict, display_name: str, source_path: Optional[Path] = None
+    def _apply_image_source(
+        self,
+        source: _BaseTimepointSource,
+        display_name: str,
+        source_path: Optional[Path] = None,
+        source_factory: Optional[Callable[[], _BaseTimepointSource]] = None,
     ):
-        """Apply loaded image data to the UI (shared by file and OMERO open)."""
-        self._input_channels = data["images"]
-        self._metadata = data["metadata"]
-        self._output_channels = []
-        self._pct_cache = {}  # clear percentile cache on new data
+        """Apply a lazy timepoint source to the UI (shared by file and OMERO open)."""
+        self._input_source = source
+        self._input_source_factory = source_factory
+        self._input_channels = []
+        self._loaded_timepoint = None
+        self._metadata = dict(source.metadata)
+        self._preview_outputs_by_t.clear()
         self._input_path = source_path
 
         # Populate UI from metadata
@@ -1689,12 +2004,12 @@ class DeconvolveCIWindow(QMainWindow):
         # Per-channel wavelengths
         ch_info = meta.get("channels", [])
         if ch_info:
-            em_vals = [str(c.get("emission_wavelength", 520))
-                       for c in ch_info]
-            self._le_emission.setText(", ".join(em_vals))
-            ex_vals = [str(c.get("excitation_wavelength", 488))
-                       for c in ch_info]
-            self._le_excitation.setText(", ".join(ex_vals))
+            self._le_emission.setText(
+                _format_channel_values(ch_info, "emission_wavelength", 520.0)
+            )
+            self._le_excitation.setText(
+                _format_channel_values(ch_info, "excitation_wavelength", 488.0)
+            )
         self._le_emission.setStyleSheet(
             _bg("emission_wavelength" in from_file))
         self._le_excitation.setStyleSheet(
@@ -1704,27 +2019,23 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_ri_sample.setStyleSheet(
             "background-color: #ffe0e0; color: black;")  # pastel red
 
+        self._viewer.set_input_data([], self._metadata)
+        self._load_timepoint_into_viewer(int(self._metadata.get("default_t", 0)), force=True)
 
-        # Channel toggle buttons
-        self._rebuild_channel_toggles()
-
-        # Z-slider
-        first = self._input_channels[0]
-        if first.ndim == 3:
-            self._z_slider.setMaximum(first.shape[0] - 1)
-            self._z_slider.setValue(first.shape[0] // 2)
-        else:
-            self._z_slider.setMaximum(0)
-            self._z_slider.setValue(0)
-
-        shape = self._input_channels[0].shape
-        n_ch = len(self._input_channels)
+        size_t = self._metadata.get("size_t", 1)
+        size_z = self._metadata.get("size_z", 1)
+        size_y = self._metadata.get("size_y", "?")
+        size_x = self._metadata.get("size_x", "?")
+        n_ch = int(self._metadata.get("size_c", 0))
         self._file_label.setText(
-            f"{display_name}\n{n_ch} ch, shape={shape}"
+            f"{display_name}\n{n_ch} ch, T={size_t}, Z={size_z}, YX={size_y}×{size_x}"
         )
         self._btn_run.setEnabled(True)
+        self._btn_save_series.setEnabled(self._viewer.has_time_axis())
+        self._btn_save_series.setVisible(self._viewer.has_time_axis())
         self._btn_save.setEnabled(False)
-        self._update_viewer()
+        self._sync_preview_buttons()
+        self._viewer.refresh_view()
         self._status.showMessage(f"Loaded {display_name}", 5000)
 
     # -----------------------------------------------------------------------
@@ -1737,14 +2048,13 @@ class DeconvolveCIWindow(QMainWindow):
                 LoginDialog,
                 OmeroBrowserDialog,
                 OmeroGateway,
-                load_image_data,
             )
         except ImportError:
             QMessageBox.warning(
                 self,
                 "OMERO not available",
                 "omero-browser-qt is not installed.\n\n"
-                "Install with:\n  pip install omero-browser-qt",
+                "Install with:\n  pip install \"omero-browser-qt[viewer]==0.2.2\"",
             )
             return
 
@@ -1787,20 +2097,19 @@ class DeconvolveCIWindow(QMainWindow):
 
         image = images[0]
         name = image.getName()
-        self._status.showMessage(f"Loading {name} from OMERO …")
-        QApplication.processEvents()
-
         try:
-            result = load_image_data(image)
-            volumes = result["images"]
-            meta = result.get("metadata", {})
-            meta = _apply_metadata_defaults(volumes, meta)
-            self._apply_image_data(
-                {"images": volumes, "metadata": meta}, f"OMERO: {name}"
+            self._begin_busy_progress(f"Opening {name} from OMERO …")
+            source = _build_omero_source(image)
+            self._apply_image_source(
+                source,
+                f"OMERO: {name}",
+                source_factory=lambda _image=image: _build_omero_source(_image),
             )
         except Exception as exc:
             QMessageBox.critical(self, "OMERO Error", str(exc))
             self._status.showMessage("OMERO load failed", 5000)
+        finally:
+            self._end_progress()
 
     # -----------------------------------------------------------------------
     # Run deconvolution
@@ -1822,10 +2131,8 @@ class DeconvolveCIWindow(QMainWindow):
         elif offset_text == "manual":
             offset = self._sp_offset.value()
 
-        em_list = [float(s.strip()) for s in self._le_emission.text().split(",")
-                   if s.strip()]
-        ex_list = [float(s.strip()) for s in self._le_excitation.text().split(",")
-                   if s.strip()]
+        em_list = _parse_float_list(self._le_emission.text())
+        ex_list = _parse_float_list(self._le_excitation.text())
 
         niter_list = []
         for s in self._le_niter.text().split(","):
@@ -1888,6 +2195,14 @@ class DeconvolveCIWindow(QMainWindow):
             self._status.showMessage("Stopping …")
             return
 
+        if self._save_worker is not None and self._save_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Save in progress",
+                "A full T-series export is currently running. Please wait for it to finish first.",
+            )
+            return
+
         if not self._input_channels:
             return
 
@@ -1897,8 +2212,8 @@ class DeconvolveCIWindow(QMainWindow):
             "font-weight: bold; padding: 8px; }"
         )
         self._btn_save.setEnabled(False)
-        self._progress.setVisible(True)
-        self._status.showMessage("Running deconvolution …")
+        self._btn_save_series.setEnabled(False)
+        self._begin_busy_progress("Running deconvolution …")
 
         # Signal that deconvolution is active (dot indicator)
         self._monitor_bar.set_active(True)
@@ -1906,9 +2221,10 @@ class DeconvolveCIWindow(QMainWindow):
         # Auto-save settings before each run
         self._save_last_settings()
 
+        current_t = self._viewer.current_timepoint()
         params = self._collect_params()
         self._worker = _DeconvolveWorker(
-            self._input_channels, self._metadata, params, parent=self
+            self._input_channels, self._metadata, params, current_t, parent=self
         )
         self._worker.progress.connect(lambda msg: self._status.showMessage(msg))
         self._worker.finished.connect(self._on_deconv_done)
@@ -1918,13 +2234,14 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_deconv_done(self, result):
         self._monitor_bar.set_active(False)
 
-        self._progress.setVisible(False)
+        self._end_progress()
         self._btn_run.setText("Run Deconvolution")
         self._btn_run.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; "
             "font-weight: bold; padding: 8px; }"
         )
         self._btn_run.setEnabled(True)
+        self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
 
         if isinstance(result, Exception):
             self._worker = None
@@ -1937,11 +2254,11 @@ class DeconvolveCIWindow(QMainWindow):
             return
 
         try:
-            self._output_channels = result
-            self._pct_cache = {}  # clear percentile cache for output
-            self._btn_save.setEnabled(True)
-            self._update_viewer()
-            self._status.showMessage("Deconvolution complete", 5000)
+            timepoint = int(result["timepoint"])
+            self._preview_outputs_by_t[timepoint] = result["channels"]
+            self._viewer.set_preview_result(timepoint, result["channels"])
+            self._sync_preview_buttons()
+            self._status.showMessage(f"Deconvolution complete for T={timepoint + 1}", 5000)
         except Exception as exc:
             traceback.print_exc()
             QMessageBox.critical(self, "Viewer Error", str(exc))
@@ -1953,17 +2270,19 @@ class DeconvolveCIWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _on_save(self):
-        if not self._output_channels:
+        current_t = self._viewer.current_timepoint()
+        preview_channels = self._preview_outputs_by_t.get(current_t)
+        if not preview_channels:
             return
 
         stem = self._input_path.stem if self._input_path else "deconvolved"
         method = self._method_combo.currentText()
         niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
-        suggested = f"{stem}_{method}_{niter_text}i.ome.tiff"
+        suggested = f"{stem}_{method}_{niter_text}i_T{current_t:03d}.ome.tiff"
 
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Deconvolved Image",
+            "Save Deconvolved Preview",
             str(Path(self._last_save_dir) / suggested),
             "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)",
         )
@@ -1972,45 +2291,98 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_save_dir = str(Path(path).parent)
 
         try:
-            from bioio.writers import OmeTiffWriter
-
-            channels = self._output_channels
-            # OmeTiffWriter expects TCZYX (5-D)
-            stack = np.stack(channels, axis=0)  # CZYX
-            data = stack[np.newaxis, ...].astype(np.float32)  # TCZYX
-            if data.ndim == 4:
-                data = data[:, :, np.newaxis, :, :]  # ensure 5-D (add Z)
-
-            # Collect physical pixel sizes from current GUI state
-            meta = self._metadata or {}
-            px_x = meta.get("pixel_size_x")
-            px_z = meta.get("pixel_size_z")
-            physical_pixel_sizes = None
-            if px_x or px_z:
-                from bioio_base.types import PhysicalPixelSizes
-                physical_pixel_sizes = PhysicalPixelSizes(
-                    Z=px_z or 1.0, Y=px_x or 1.0, X=px_x or 1.0
-                )
-
-            # Channel names
-            ch_names = meta.get("channel_names")
-            if not ch_names:
-                ch_info = meta.get("channels", [])
-                ch_names = [
-                    f"Ch{i} em={c.get('emission_wavelength', '?')}"
-                    for i, c in enumerate(ch_info)
-                ]
-
-            OmeTiffWriter.save(
-                data,
-                path,
-                dim_order="TCZYX",
-                physical_pixel_sizes=physical_pixel_sizes,
-                channel_names=ch_names[:len(channels)],
-            )
+            stack = np.stack(preview_channels, axis=0)
+            data = stack[np.newaxis, ...].astype(np.float32)
+            _write_ome_tiff(data, path, self._metadata)
             self._status.showMessage(f"Saved → {Path(path).name}", 5000)
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
+
+    def _on_save_t_series(self):
+        if not self._input_channels:
+            return
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Preview running",
+                "Stop the current preview deconvolution before starting a full T-series export.",
+            )
+            return
+        if self._save_worker is not None and self._save_worker.isRunning():
+            return
+
+        stem = self._input_path.stem if self._input_path else "deconvolved"
+        method = self._method_combo.currentText()
+        niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
+        suggested = f"{stem}_{method}_{niter_text}i_TSERIES.ome.tiff"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Deconvolved T-Series",
+            str(Path(self._last_save_dir) / suggested),
+            "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)",
+        )
+        if not path:
+            return
+        self._last_save_dir = str(Path(path).parent)
+
+        self._save_last_settings()
+        self._begin_busy_progress("Saving full T-series …")
+        self._btn_run.setEnabled(False)
+        self._btn_save.setEnabled(False)
+        self._btn_save_series.setEnabled(False)
+        self._monitor_bar.set_active(True)
+
+        if self._input_source_factory is None:
+            QMessageBox.warning(self, "Save Error", "No image source is available for T-series export.")
+            self._monitor_bar.set_active(False)
+            self._end_progress()
+            self._btn_run.setEnabled(bool(self._input_channels))
+            self._sync_preview_buttons()
+            self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+            return
+
+        params = self._collect_params()
+        try:
+            save_source = self._input_source_factory()
+        except Exception as exc:
+            self._monitor_bar.set_active(False)
+            self._end_progress()
+            self._btn_run.setEnabled(bool(self._input_channels))
+            self._sync_preview_buttons()
+            self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+            QMessageBox.critical(self, "Save Error", str(exc))
+            return
+
+        self._save_worker = _SaveTSeriesWorker(
+            save_source,
+            self._metadata,
+            params,
+            path,
+            parent=self,
+        )
+        self._save_worker.progress.connect(lambda msg: self._status.showMessage(msg))
+        self._save_worker.finished.connect(self._on_save_t_series_done)
+        self._save_worker.finished.connect(self._save_worker.deleteLater)
+        self._save_worker.start()
+
+    def _on_save_t_series_done(self, result):
+        self._monitor_bar.set_active(False)
+        self._end_progress()
+        self._btn_run.setEnabled(bool(self._input_channels))
+        self._sync_preview_buttons()
+        self._btn_save_series.setEnabled(bool(self._input_channels) and self._viewer.has_time_axis())
+        self._save_worker = None
+
+        if isinstance(result, Exception):
+            msg = str(result)
+            if "Stopped by user" in msg:
+                self._status.showMessage("T-series export stopped", 5000)
+            else:
+                QMessageBox.critical(self, "Save Error", msg)
+                self._status.showMessage("T-series export failed", 5000)
+            return
+
+        self._status.showMessage(f"Saved → {Path(result['path']).name}", 5000)
 
     # -----------------------------------------------------------------------
     # Settings Save / Load / Restore
@@ -2055,8 +2427,8 @@ class DeconvolveCIWindow(QMainWindow):
             "integrate_pixels": self._cb_integrate.isChecked(),
             "n_subpixels": self._sp_subpixels.value(),
             "n_pupil": self._sp_n_pupil.value(),
-            "pct_lo": self._sp_pct_lo.value(),
-            "pct_hi": self._sp_pct_hi.value(),
+            "pct_lo": self._viewer.lo_percentile(),
+            "pct_hi": self._viewer.hi_percentile(),
         }
 
     def _apply_settings(self, data: dict):
@@ -2132,8 +2504,10 @@ class DeconvolveCIWindow(QMainWindow):
         _combo(self._micro_combo, "microscope_type")
         _spin(self._sp_subpixels, "n_subpixels")
         _spin(self._sp_n_pupil, "n_pupil")
-        _spin(self._sp_pct_lo, "pct_lo")
-        _spin(self._sp_pct_hi, "pct_hi")
+        if data.get("pct_lo") is not None:
+            self._viewer.set_lo_percentile(float(data["pct_lo"]))
+        if data.get("pct_hi") is not None:
+            self._viewer.set_hi_percentile(float(data["pct_hi"]))
 
         # integrate_pixels checkbox
         val = data.get("integrate_pixels")
@@ -2157,6 +2531,7 @@ class DeconvolveCIWindow(QMainWindow):
         except (OSError, json.JSONDecodeError):
             return
         self._apply_settings(data)
+        self._viewer.refresh_view()
         self._status.showMessage("Settings restored", 3000)
 
     def _on_save_settings(self):
@@ -2188,6 +2563,7 @@ class DeconvolveCIWindow(QMainWindow):
             QMessageBox.warning(self, "Load Error", str(exc))
             return
         self._apply_settings(data)
+        self._viewer.refresh_view()
         self._status.showMessage(f"Settings loaded from {Path(path).name}", 3000)
 
     def _configure_omero_login_dialog(self, dlg):
@@ -2211,125 +2587,60 @@ class DeconvolveCIWindow(QMainWindow):
     # -----------------------------------------------------------------------
     # Viewer
     # -----------------------------------------------------------------------
+    def _load_timepoint_into_viewer(self, timepoint: int, *, force: bool = False) -> None:
+        if self._input_source is None:
+            return
+        target_t = max(0, min(int(timepoint), max(int(self._metadata.get("size_t", 1)) - 1, 0)))
+        if not force and self._loaded_timepoint == target_t and self._input_channels:
+            return
 
-    def _rebuild_channel_toggles(self):
-        """Create one toggle button per channel in the viewer bar."""
-        # Remove old toggles
-        for btn in self._ch_toggles:
-            self._ch_bar.removeWidget(btn)
-            btn.deleteLater()
-        self._ch_toggles.clear()
+        size_z = max(int(self._metadata.get("size_z", 1)), 1)
+        size_c = max(int(self._metadata.get("size_c", 1)), 1)
+        total = size_c * size_z if isinstance(self._input_source, _OmeroTimepointSource) and size_z > 1 else size_c
+        if total > 1:
+            self._begin_progress(total, f"Loading T={target_t + 1}…")
+        else:
+            self._begin_busy_progress(f"Loading T={target_t + 1}…")
 
-        n_ch = len(self._input_channels)
-        colors = _resolve_channel_colors(self._metadata, n_ch)
-        ch_names = self._metadata.get("channel_names", [])
-
-        for i in range(n_ch):
-            name = ch_names[i] if i < len(ch_names) else f"Ch {i}"
-            btn = QPushButton(name)
-            btn.setCheckable(True)
-            btn.setChecked(True)
-            r, g, b = colors[i]
-            btn.setStyleSheet(
-                f"QPushButton {{ color: rgb({r},{g},{b}); font-weight: bold; "
-                f"border: 2px solid rgb({r},{g},{b}); padding: 2px 8px; }}"
-                f"QPushButton:checked {{ background-color: rgba({r},{g},{b},60); }}"
+        try:
+            channels = self._input_source.load_timepoint(
+                target_t,
+                progress_cb=lambda done, total_steps, text: self._advance_progress(done, text),
             )
-            btn.toggled.connect(self._update_viewer)
-            # Insert before the trailing stretch
-            self._ch_bar.insertWidget(self._ch_bar.count() - 1, btn)
-            self._ch_toggles.append(btn)
+            self._input_channels = channels
+            self._loaded_timepoint = target_t
+            self._viewer.set_input_timepoint_data(target_t, channels)
+        finally:
+            self._end_progress()
 
-    def _get_slice(
-        self, channels: list[np.ndarray], ch_idx: int
-    ) -> Optional[np.ndarray]:
-        """Return the 2-D slice/projection to display."""
-        if not channels or ch_idx >= len(channels):
-            return None
-        vol = channels[ch_idx]
-        mode = self._proj_combo.currentText()
+    def _sync_preview_buttons(self) -> None:
+        current_t = self._viewer.current_timepoint()
+        self._btn_save.setEnabled(current_t in self._preview_outputs_by_t)
 
-        if vol.ndim == 2:
-            return vol
-
-        if mode == "MIP":
-            return vol.max(axis=0)
-        elif mode == "SUM":
-            return vol.sum(axis=0)
-        else:  # Slice
-            z = self._z_slider.value()
-            z = min(z, vol.shape[0] - 1)
-            return vol[z]
-
-    def _composite_pixmap(
-        self, channels: list[np.ndarray]
-    ) -> Optional[QPixmap]:
-        """Build an RGB composite from enabled channels."""
-        if not channels:
-            return None
-        n_ch = len(channels)
-        colors = _resolve_channel_colors(self._metadata, n_ch)
-        pct_lo = self._sp_pct_lo.value()
-        pct_hi = self._sp_pct_hi.value()
-        slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float]]] = []
-        mode = self._proj_combo.currentText()
-        side = "in" if channels is self._input_channels else "out"
-        for i in range(n_ch):
-            if i < len(self._ch_toggles) and not self._ch_toggles[i].isChecked():
-                continue
-            s = self._get_slice(channels, i)
-            if s is not None:
-                cache_key = (side, i, pct_lo, pct_hi, mode)
-                if cache_key in self._pct_cache:
-                    lo, hi = self._pct_cache[cache_key]
-                else:
-                    # For Slice mode use the full volume for global contrast;
-                    # for MIP/SUM the projected values differ in range, so
-                    # compute percentiles on the 2-D projection itself.
-                    if mode == "Slice" and channels[i].ndim == 3:
-                        src = channels[i]
-                    else:
-                        src = s
-                    lo = float(np.percentile(src, pct_lo))
-                    hi = float(np.percentile(src, pct_hi))
-                    self._pct_cache[cache_key] = (lo, hi)
-                slices.append((s, colors[i], (lo, hi)))
-        if not slices:
-            return None
-        return _composite_to_pixmap(slices)
+    def _on_viewer_time_changed(self, timepoint: int) -> None:
+        previous_t = self._loaded_timepoint
+        try:
+            self._load_timepoint_into_viewer(int(timepoint))
+        except Exception as exc:
+            if previous_t is not None and previous_t != int(timepoint):
+                self._viewer.set_timepoint(previous_t)
+            QMessageBox.critical(self, "Load Error", str(exc))
+            self._status.showMessage("Timepoint load failed", 5000)
+        self._sync_preview_buttons()
 
     def _update_viewer(self):
-        # Input composite
-        pix_in = self._composite_pixmap(self._input_channels)
-        if pix_in is not None:
-            self._view_input.set_pixmap(pix_in)
-            self._view_input.fit_in_view()
-        else:
-            self._view_input.clear()
-
-        # Output composite
-        pix_out = self._composite_pixmap(self._output_channels)
-        if pix_out is not None:
-            self._view_output.set_pixmap(pix_out)
-            self._view_output.fit_in_view()
-        else:
-            self._view_output.clear()
-
-        # Z label
-        if self._input_channels and self._input_channels[0].ndim == 3:
-            nz = self._input_channels[0].shape[0]
-            z = self._z_slider.value()
-            self._z_label.setText(f"{z}/{nz - 1}")
-        else:
-            self._z_label.setText("—")
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._view_input.fit_in_view()
-        self._view_output.fit_in_view()
+        self._viewer.refresh_view()
 
     def closeEvent(self, event):
         """Ensure background threads are stopped before the window closes."""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.requestInterruption()
+            self._worker.wait(2000)
+            self._worker = None
+        if self._save_worker is not None and self._save_worker.isRunning():
+            self._save_worker.requestInterruption()
+            self._save_worker.wait(2000)
+            self._save_worker = None
         if self._monitor is not None:
             self._monitor.request_stop()
             self._monitor = None

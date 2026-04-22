@@ -1,10 +1,11 @@
-# DECONVOLVE_CI — GPU-Accelerated Richardson-Lucy Deconvolution & PSF Generation
+# DECONVOLVE_CI — GPU-Accelerated Microscopy Deconvolution & PSF Generation
 
 ## Overview
 
-`deconvolve_ci.py` is a PyTorch GPU-accelerated deconvolution and PSF generation
-module for CIDeconvolve. It combines the best mathematical ideas from multiple state-of-the-art
-implementations into a single, cohesive, fast engine.
+`deconvolve_ci.py` is the PyTorch-based deconvolution and PSF-generation engine
+used by CIDeconvolve. It supports both the Richardson-Lucy family of methods
+and sparse-Hessian variational deconvolution, in a single GPU-friendly module
+with CPU fallback.
 
 **Methods**: `ci_rl` (accelerated RL), `ci_rl_tv` (accelerated RL with Total Variation), and `ci_sparse_hessian` (sparse-Hessian variational deconvolution)
 
@@ -14,10 +15,11 @@ implementations into a single, cohesive, fast engine.
 
 ### `ci_rl` — Scaled Heavy Ball Accelerated Richardson-Lucy
 
-Standard Richardson-Lucy deconvolution enhanced with **Scaled Heavy Ball (SHB) momentum
-acceleration** ([Wang & Miller 2014](#ref3)). The SHB technique applies Nesterov-style
-momentum to the RL multiplicative update, achieving 5-10× faster convergence at no extra
-per-iteration cost.
+Standard Richardson-Lucy deconvolution enhanced with **Scaled Heavy Ball (SHB)
+momentum acceleration** ([Wang & Miller 2014](#ref3)). In practice, this adds a
+Nesterov-style extrapolation step to the RL multiplicative update and typically
+reaches a good solution in far fewer iterations, without increasing the per-iteration
+FFT cost.
 
 **Per-iteration update:**
 
@@ -46,19 +48,19 @@ Where:
 
 ### `ci_rl_tv` — SHB-RL with Total Variation Regularization
 
-Same as `ci_rl` but with an additional **Total Variation (TV) penalty** applied after each
-RL update. TV regularization suppresses noise amplification (a well-known RL pathology at
-high iteration counts) while preserving edges.
+Same as `ci_rl`, but with an additional **Total Variation (TV) penalty** applied
+after each RL update. TV regularization helps suppress the noise amplification
+that often appears at high RL iteration counts, while still preserving edges.
 
-**TV factor computation** (following DeconvolutionLab2 RLTV, [Dey et al. 2006](#ref5)):
+**TV factor computation** (implementation-inspired by DeconvolutionLab2 RLTV, [Dey et al. 2006](#ref5)):
 
 1. Forward differences: ∇x, ∇y, ∇z
 2. Gradient magnitude: |∇| = √(gx² + gy² + gz² + ε)
 3. Normalize: ĝ = g / |∇|
 4. Divergence (backward differences): div(ĝ)
-5. TV factor: tv_i = 1 / (λ · div_i + 1)
+5. TV factor: `tv = 1 / (1 − λ · div)`
 
-Applied multiplicatively: x_{k+1} = x_{k+1} · tv(x_k)
+Applied multiplicatively to the post-RL update in the current implementation.
 
 **Spacing awareness**: for anisotropic 3D data the Z derivative terms are scaled by
 `pixel_size_xy / pixel_size_z`, so TV no longer treats coarse axial sampling as if it
@@ -66,9 +68,9 @@ were equal to the lateral spacing.
 
 ### `ci_sparse_hessian` — Sparse-Hessian Variational Deconvolution
 
-`ci_sparse_hessian` uses the same preprocessing, FFT-based forward model, positivity
-constraint, and tiling support as the RL-family methods, but combines an RL-style
-data-fidelity update with a sparse-Hessian regularisation step each iteration.
+`ci_sparse_hessian` uses the same preprocessing, FFT-based forward model,
+positivity constraint, and tiling support as the RL-family methods, but replaces
+TV with a sparse-Hessian regularisation step at each iteration.
 
 **Objective**:
 
@@ -97,33 +99,39 @@ as anisotropic TV, scaling second derivatives and mixed XZ / YZ terms to respect
 
 ---
 
+## Implementation Highlights
+
 ### 1. Scaled Heavy Ball Momentum Acceleration
 **Source**: deconwolf [`method_shb.c`](https://github.com/elgw/deconwolf/blob/master/src/method_shb.c) ([Wernersson et al. 2024](#ref6)), based on
 [Wang & Miller 2014](#ref3).
 
-**What it does**: Adds a momentum term to RL ([Richardson 1972](#ref1); [Lucy 1974](#ref2)) that automatically accelerates convergence.
-The acceleration factor α_k starts near 0 and grows toward 1, with an upper bound that
-guarantees convergence. This is the same mathematical framework as Nesterov's accelerated
-gradient descent, adapted for the multiplicative RL update.
+**What it does**: Adds a momentum term to RL ([Richardson 1972](#ref1);
+[Lucy 1974](#ref2)) to accelerate convergence. The acceleration factor α_k
+starts near 0 and grows toward 1, with an upper bound chosen to preserve
+stability. Mathematically, this is the same general idea as Nesterov-style
+acceleration, adapted to the multiplicative RL update.
 
-**Improvement**: 5-10× fewer iterations vs. vanilla RL for equivalent quality. A 50-iteration
+**Improvement**: Typically 5-10× fewer iterations than vanilla RL for comparable quality. A 50-iteration
 SHB-RL typically matches 200-500 iterations of standard RL.
 
 ### 2. Bertero Boundary Weights
 **Source**: deconwolf [`method_shb.c`](https://github.com/elgw/deconwolf/blob/master/src/method_shb.c), based on [Bertero & Boccacci 2005](#ref4).
 
-**What it does**: Instead of reflection padding (used by sdeconv) or zero-padding with
-no correction (DeconvolutionLab2), Bertero weights correct for the incomplete PSF energy
-at image boundaries. Computed as:
+**What it does**: Instead of reflection padding (used by `sdeconv`) or
+uncorrected zero-padding (common in simpler RL implementations), Bertero
+weights compensate for incomplete PSF support at image boundaries. They are
+computed as:
 
 ```
-W = 1 / (IFFT(FFT(1_padded) · |H|²))
+W = 1 / Hᵀ(1_M)
+  = 1 / IFFT(conj(H) · FFT(1_M))
 ```
 
 where values below threshold σ are zeroed.
 
-**Improvement**: Eliminates the bright/dark edge artifacts common in standard RL. More
-principled than reflection padding, which can introduce gradient discontinuities.
+**Improvement**: Reduces the bright/dark edge artifacts common in standard RL.
+This is more principled than reflection padding, which can introduce artificial
+boundary gradients.
 
 ### 3. I-Divergence Convergence Monitoring
 **Source**: deconwolf, based on [Csiszár 1991](#ref10).
@@ -134,8 +142,9 @@ principled than reflection padding, which can introduce gradient discontinuities
 I_div = (1/N) Σ [d_i · ln(d_i / ŷ_i) − d_i + ŷ_i]
 ```
 
-This is the natural loss function for Poisson noise (the RL algorithm is maximum likelihood
-for Poisson statistics). When I-divergence plateaus, further iterations are amplifying noise.
+This is the natural loss for Poisson noise, which is the noise model underlying
+RL. When I-divergence plateaus, additional iterations are often fitting noise
+rather than improving the reconstruction.
 
 **Modes**:
 - `convergence="fixed"`: Run exactly `niter` iterations (default)
@@ -144,29 +153,32 @@ for Poisson statistics). When I-divergence plateaus, further iterations are ampl
 ### 4. Total Variation Regularization
 **Source**: DeconvolutionLab2 [`RichardsonLucyTV.java`](https://github.com/Biomedical-Imaging-Group/DeconvolutionLab2/blob/master/src/main/java/deconvolution/algorithm/RichardsonLucyTV.java), [Dey et al. 2006](#ref5).
 
-**What it does**: Applies a TV penalty as a multiplicative correction after each RL step.
-TV penalizes the total gradient magnitude, promoting piecewise-constant reconstructions
-that suppress noise while preserving sharp edges.
+**What it does**: Applies a TV penalty as a multiplicative correction after
+each RL step. TV penalizes total gradient magnitude, encouraging piecewise-smooth
+reconstructions that suppress noise while preserving sharp boundaries.
 
 **Parameter**: `tv_lambda` (default 0, i.e. off). Conservative starting values are
 typically `0.00005–0.001`.
 
 ### 5. Automatic Background Estimation
-**What it does**: Estimates the image background level from the mode of the lowest 10%
-of voxel intensities. This is used as:
+**What it does**: Estimates the image background level from the median of the
+lowest 10% of voxel intensities. This value is used as:
 - The positivity floor (clamp values ≥ background instead of ≥ 0)
 - The safe-division epsilon
 
-Can be overridden with `background=<float>` or disabled with `background=0`.
+Can be overridden with `background=<float>`. Passing `background=0` requests a near-zero
+floor, but the implementation still keeps a tiny positive epsilon for numerical stability.
 
 ### 6. Offset, Prefilter, and Initial Estimate
 **Source**: deconwolf preprocessing defaults.
 
-**Offset**: `offset="auto"` adds a positive constant of 5 during processing and removes it
-afterwards. This stabilises low-valued pixels and mitigates ratio blow-up in RL.
+**Offset**: `offset="auto"` adds a positive constant of 5 during processing and
+removes it afterwards. This stabilises low-valued pixels and reduces ratio
+blow-up in RL.
 
-**Prefilter**: `prefilter_sigma > 0` applies Gaussian smoothing in the Anscombe-transformed
-domain before deconvolution, reducing the impact of non-Poissonian detector noise.
+**Prefilter**: `prefilter_sigma > 0` applies Gaussian smoothing in the
+Anscombe-transformed domain before deconvolution, reducing the impact of
+non-Poisson detector noise.
 
 **Initial estimate**:
 - `start="flat"` — uniform mean image
@@ -207,9 +219,9 @@ computed on the lowest quartile of voxels.
 - `damping=<float>` — manual strength (typical range: 1.0–10.0)
 
 ### 9. XY Tiling (Large Image Support)
-**What it does**: Splits large images into overlapping XY tiles that are deconvolved
-independently and stitched back together. This allows processing images that are too
-large to fit in GPU memory as a single volume.
+**What it does**: Splits large images into overlapping XY tiles that are
+deconvolved independently and stitched back together. This makes it possible to
+process images that would not fit in GPU memory as a single volume.
 
 **How it works**:
 1. The image is divided into a grid of tiles (`ny × nx`) in the YX plane
@@ -218,13 +230,14 @@ large to fit in GPU memory as a single volume.
    estimation, and full RL iteration)
 4. Results are stitched by taking only the core (non-overlap) region of each tile
 
-The overlap margin prevents boundary artefacts at tile edges. The tile grid is chosen
-to minimise the aspect ratio of individual tiles.
+The overlap margin reduces tile-edge artefacts. The tile grid is chosen to keep
+individual tiles as balanced as possible in aspect ratio.
 
 **Modes**:
 - `tiling="none"` — no tiling, process the full image at once
 - `tiling="custom"` — automatic tiling based on `max_tile_xy` and `max_tile_z`
   (default: 512 × 512 × 64)
+- `tiling="auto"` — alias of `"custom"`
 
 **Parameters**:
 - `max_tile_xy` (int, default 512): Maximum tile size in the XY dimensions
@@ -236,9 +249,11 @@ to minimise the aspect ratio of individual tiles.
 
 ### `ci_generate_psf` — Vectorial/Scalar PSF with Gibson-Lanni Correction
 
-Generates a physically accurate Point Spread Function using either the **vectorial
-Richards-Wolf** model ([Richards & Wolf 1959](#ref7), for high-NA objectives, NA ≥ 0.9) or the **scalar Kirchhoff**
-model (for lower NA), with **Gibson-Lanni refractive index mismatch correction** ([Gibson & Lanni 1991](#ref8)).
+Generates a physically accurate Point Spread Function using either the
+**vectorial Richards-Wolf** model ([Richards & Wolf 1959](#ref7)) for high-NA
+objectives (`NA ≥ 0.9`) or the **scalar Kirchhoff** model for lower NA, with
+optional **Gibson-Lanni refractive-index mismatch correction**
+([Gibson & Lanni 1991](#ref8)).
 
 ### PSF Models
 
@@ -259,7 +274,8 @@ PSF(ρ,z) = |I|²
 ```
 
 ### Gibson-Lanni Aberration
-Optical path difference accounting for refractive index mismatches ([Gibson & Lanni 1991](#ref8); [Aguet 2009](#ref9)):
+Optical path difference for refractive-index mismatch
+([Gibson & Lanni 1991](#ref8); [Aguet 2009](#ref9)):
 ```
 W(θ) = z_p · √(n_s² − NA²sin²θ)
       + t_i · √(n_i² − NA²sin²θ)
@@ -268,12 +284,14 @@ W(θ) = z_p · √(n_s² − NA²sin²θ)
       − t_g0 · √(n_g0² − NA²sin²θ)
 ```
 
-Parameters: sample RI (n_s), immersion RI (n_i), coverslip RI (n_g), and design values.
+Parameters include sample RI (`n_s`), immersion RI (`n_i`), coverslip RI
+(`n_g`), and their design values.
 
 ### Pixel Integration
-Instead of sampling the PSF only at pixel centers, integrates over the pixel area by
-evaluating on an N×N sub-grid (default N=3) and averaging. This improves accuracy when
-the pixel size is not much smaller than the diffraction limit.
+Instead of sampling the PSF only at pixel centers, the implementation can
+integrate over the pixel area by evaluating the PSF on an `N × N` sub-grid
+(default `N=3`) and averaging. This improves accuracy when the pixel size is
+not much smaller than the diffraction limit.
 
 Controllable via `integrate_pixels=True` (default) or `False` for speed.
 
@@ -286,9 +304,8 @@ With separate wavelengths for excitation and emission. Falls back to PSF² when
 excitation wavelength is not provided.
 
 ### Numerical Integration
-Simpson's rule quadrature with configurable number of pupil samples (default 129).
-
----
+Uses Simpson's rule quadrature with a configurable number of pupil samples
+(default `129`).
 
 ---
 
@@ -306,7 +323,7 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 | PSF model | Vectorial + Scalar | Auto-select based on NA; vectorial essential for high-NA (immersion) objectives |
 | PSF Aberration | Gibson-Lanni | Accounts for real-world RI mismatches; critical for accurate PSF at depth |
 | Pixel integration | Sub-pixel grid | Measurable accuracy gain, optional for speed |
-| Background | Auto-estimate | Mode of lowest 10% voxels — robust to outliers and signal |
+| Background | Auto-estimate | Median of lowest 10% voxels — robust to outliers and signal |
 | Damping | Noise-gated (optional) | Per-voxel γ attenuates background noise; single parameter, auto mode available |
 | Tiling | XY overlap-stitch | Process arbitrarily large images within GPU memory; 16 px overlap removes boundary artefacts |
 | dtype | float32 (GPU) / float64 (CPU) | Optimal throughput on GPU; CPU can afford double precision |
@@ -328,14 +345,14 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 | `offset` | str/float | "auto" | Positive processing offset: `"auto"` (=5), float, or 0 |
 | `prefilter_sigma` | float | 0.0 | Anscombe-domain Gaussian prefilter sigma in pixels |
 | `start` | str | "flat" | Initial estimate: `"flat"`, `"observed"`, or `"lowpass"` |
-| `background` | str/float | "auto" | Background level: "auto", float, or 0 |
+| `background` | str/float | "auto" | Background level: "auto" or float; values ≤ 0 are clamped to a tiny positive floor |
 | `convergence` | str | "auto" | "fixed" (exact niter) or "auto" (I-divergence stop) |
 | `rel_threshold` | float | 0.005 | Relative I-divergence change threshold for auto-stop |
 | `check_every` | int | 5 | Check convergence every N iterations |
 | `pixel_size_xy` | float/None | None | Lateral voxel size used for anisotropic regularization scaling |
 | `pixel_size_z` | float/None | None | Axial voxel size used for anisotropic regularization scaling |
 | `device` | str/None | None | PyTorch device ("cuda", "cpu", or None=auto) |
-| `tiling` | str | "custom" | Tiling mode: "none" or "custom" (auto tile to fit GPU) |
+| `tiling` | str | "custom" | Tiling mode: "none", "custom", or "auto" (automatic tile count from `max_tile_xy` / `max_tile_z`) |
 | `max_tile_xy` | int | 512 | Maximum tile size in XY (pixels) when tiling="custom" |
 | `max_tile_z` | int | 64 | Maximum tile size in Z (slices) when tiling="custom" |
 
@@ -353,7 +370,8 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 | `sparse_hessian_reg` | float | 0.98 | Data-vs-regulariser balance |
 
 All preprocessing, convergence, spacing, device, and tiling parameters listed above also apply.
-The return dictionary has the same structure as `ci_rl_deconvolve`.
+The return dictionary has the same structure as `ci_rl_deconvolve`, but the
+`"convergence"` list stores objective values rather than I-divergence.
 
 ### `ci_generate_psf(na, wavelength_nm, ...) → ndarray`
 
@@ -369,6 +387,12 @@ The return dictionary has the same structure as `ci_rl_deconvolve`.
 | `ri_immersion` | float | 1.515 | Immersion medium refractive index |
 | `ri_sample` | float | 1.33 | Sample refractive index |
 | `ri_coverslip` | float | 1.5 | Coverslip refractive index |
+| `ri_coverslip_design` | float | 1.5 | Design coverslip refractive index |
+| `ri_immersion_design` | float | 1.515 | Design immersion refractive index |
+| `t_g` | float | 170000 | Actual coverslip thickness in nm |
+| `t_g0` | float | 170000 | Design coverslip thickness in nm |
+| `t_i0` | float | 100000 | Design immersion thickness in nm |
+| `z_p` | float | 0.0 | Particle depth below the coverslip in nm |
 | `microscope_type` | str | "widefield" | "widefield" or "confocal" |
 | `excitation_nm` | float/None | None | Excitation wavelength (confocal) |
 | `integrate_pixels` | bool | True | Enable sub-pixel integration |
@@ -460,29 +484,35 @@ The return dictionary has the same structure as `ci_rl_deconvolve`.
 
 ## File Layout
 
+Simplified map of the main public functions and their key helpers:
+
 ```
 deconvolve_ci.py
 ├── ci_generate_psf()              — public PSF generation
-│   ├── _scalar_psf()              — Kirchhoff model (NA < 0.9)
-│   ├── _vectorial_psf()           — Richards-Wolf model (NA ≥ 0.9)
+│   ├── _build_psf_stack()         — core PSF stack builder
+│   ├── _scalar_psf_slice()        — Kirchhoff model slice (NA < 0.9)
+│   ├── _vectorial_psf_slice()     — Richards-Wolf slice (NA ≥ 0.9)
 │   ├── _gibson_lanni_opd()        — aberration phase
-│   ├── _simpson_integrate()       — numerical quadrature
-│   └── _pixel_integrate()         — sub-pixel averaging
+│   ├── _simpsons()                — numerical quadrature
+│   └── _pixel_integrate_psf()     — sub-pixel averaging
 │
 ├── ci_rl_deconvolve()             — public deconvolution
 │   ├── _prepare_otf()             — PSF → OTF with padding
 │   ├── _bertero_weights()         — boundary correction
+│   ├── _axis_scales()             — anisotropy-aware derivative scaling
 │   ├── _estimate_noise_sigma()    — MAD-based noise σ (lowest 25%)
 │   ├── _damping_map()             — per-voxel γ for noise-gated damping
+│   ├── _anscombe_prefilter()      — variance-stabilising prefilter
 │   ├── _resolve_tiling()          — tiling mode → tile count
 │   ├── _ci_deconvolve_tiled()     — tiled deconvolution dispatcher
 │   │   ├── _compute_tile_grid()   — optimal ny×nx layout
 │   │   └── _compute_tile_slices() — tile extents with overlap
-│   ├── _shb_rl_loop()            — main iteration loop
-│   │   ├── _rl_update()          — single RL step on momentum point
-│   │   └── _tv_penalty()         — optional TV correction
-│   ├── _i_divergence()           — convergence metric
-│   └── _estimate_background()    — auto background
+│   ├── _tv_penalty()              — optional TV correction
+│   ├── _i_divergence()            — convergence metric
+│   └── _estimate_background()     — auto background
 │
-└── _to_device() / _to_numpy()    — device transfer helpers
+├── ci_sparse_hessian_deconvolve() — sparse-Hessian variational solver
+│   └── _sparse_hessian_penalty()  — Hessian/sparsity regulariser
+│
+└── _to_tensor() / _to_numpy()     — device transfer helpers
 ```

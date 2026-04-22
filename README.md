@@ -172,6 +172,7 @@ generates MIP montage images.
 
 - Python 3.10 or 3.11
 - PyTorch 2.4+ with CUDA support
+- For OMERO login/browser support and the shared XYZT/3D GUI viewer: `omero-browser-qt[viewer]==0.2.2`
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
@@ -198,6 +199,10 @@ python launcher.py
 
 The launcher saves your last-used settings and can restore them on next
 launch via the **Restore Last Settings** button.
+
+The standalone deconvolution GUI also supports OMERO browsing plus
+synchronized dual-pane XYZT / 3D viewing when the `omero-browser-qt[viewer]`
+dependency is installed.
 
 ---
 
@@ -245,13 +250,14 @@ deconvolve.py           Core deconvolution engine + PSF generation
 deconvolve_ci.py        CI SHB-RL / RLTV / sparse-Hessian implementation (PyTorch)
 launcher.py             PyQt6 GUI launcher
 gui_deconvolve_ci.py    GUI deconvolution panel
+ci_dual_viewer.py       Dual-pane XYZT / 3D viewer widget used by the GUI
 descriptor.json         BIAFLOWS/BIOMERO parameter descriptor
 bioflows_local.py       Local BIAFLOWS compatibility shim
-cideconvolve.slurm      SLURM job script for HPC execution
 Dockerfile              Docker build (CUDA 12.6 runtime + Python 3.11)
 requirements.txt        Python dependencies (local install)
+requirements_gui.txt    Python dependencies for the GUI install
 requirements_docker.txt Python dependencies (Docker)
-vendor/                 Vendored libraries (psf_generator)
+version.txt             Project version marker
 ```
 
 ---
