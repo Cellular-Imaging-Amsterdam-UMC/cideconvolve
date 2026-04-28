@@ -52,6 +52,9 @@ The RL-family methods also support:
 - **Positive offseting** via `--offset`
 - **Anscombe-domain Gaussian prefiltering** via `--prefilter_sigma`
 - **Initial estimate selection** via `--start flat|observed|lowpass`
+- **Enhanced 2D widefield restoration** via `--two_d_mode auto`, which uses a
+  conservative widefield-aware 2D PSF model for `Z=1` data; `legacy_2d` keeps
+  the old pure-2D RL path
 
 For full algorithmic details see [DECONVOLVE_CI.MD](DECONVOLVE_CI.MD).
 
@@ -225,6 +228,7 @@ command line via `wrapper.py`:
 | `--refractive_index` | auto | Immersion medium RI (`air`, `water`, `oil`) |
 | `--sample_ri` | auto | Sample/mounting medium RI (named presets available) |
 | `--microscope_type` | auto | `widefield` or `confocal` |
+| `--two_d_mode` | auto | RL-family 2D widefield mode: `auto` (widefield-aware 2D PSF) or `legacy_2d` |
 | `--emission_wl` | auto | Emission wavelengths in nm (comma-separated) |
 | `--excitation_wl` | auto | Excitation wavelengths in nm (for confocal PSF) |
 | `--background` | auto | Background subtraction: `auto`, numeric value, or `0` to disable |

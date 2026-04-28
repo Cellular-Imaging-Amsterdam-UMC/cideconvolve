@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --tv_lambda @tv_lambda --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --damping @damping --offset @offset --prefilter_sigma @prefilter_sigma --start @start --convergence @convergence --rel_threshold @rel_threshold --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --projection @projection --benchmark @benchmark --bench_crop @bench_crop",
+  "command-line": "python wrapper.py --iterations @iterations --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --tv_lambda @tv_lambda --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --damping @damping --offset @offset --prefilter_sigma @prefilter_sigma --start @start --convergence @convergence --rel_threshold @rel_threshold --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --projection @projection --benchmark @benchmark --bench_crop @bench_crop --two_d_mode @two_d_mode --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
   "inputs": [
     {
       "id": "iterations",
@@ -14,29 +14,6 @@
       "name": "RL iterations",
       "description": "Number of RL iterations per channel, comma-separated. A single value applies to all channels. Example: '150' or '150, 100, 200'.",
       "default-value": "40",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
-      "id": "tiling",
-      "value-key": "@tiling",
-      "command-line-flag": "--tiling",
-      "name": "Tiling",
-      "description": "XY tiling mode for large images. 'none': disable tiling. 'custom': use tile size limits from the Tile limits parameter.",
-      "default-value": "custom",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String",
-      "value-choices": ["none", "custom"]
-    },
-    {
-      "id": "tile_limits",
-      "value-key": "@tile_limits",
-      "command-line-flag": "--tile_limits",
-      "name": "Tile limits",
-      "description": "Maximum tile dimensions as 'max_xy, max_z'. Only used when Tiling is set to 'custom'. The image is split into the minimum number of XY tiles so each tile fits within these limits.",
-      "default-value": "512, 64",
       "set-by-server": false,
       "optional": true,
       "type": "String"
@@ -325,6 +302,56 @@
       "set-by-server": false,
       "optional": true,
       "type": "Boolean"
+    },
+    {
+      "id": "two_d_mode",
+      "value-key": "@two_d_mode",
+      "command-line-flag": "--two_d_mode",
+      "name": "2D widefield mode",
+      "description": "2D widefield deconvolution mode. 'auto' uses the enhanced collapsed-PSF model for single-plane widefield images. 'legacy_2d' uses plain 2D RL.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": ["auto", "legacy_2d"]
+    },
+    {
+      "id": "two_d_wf_aggressiveness",
+      "value-key": "@two_d_wf_aggressiveness",
+      "command-line-flag": "--two_d_wf_aggressiveness",
+      "name": "2D WF aggressiveness",
+      "description": "Aggressiveness of the 2D widefield auto deconvolution. Only used when two_d_mode is 'auto' and the image is a single-plane widefield.",
+      "default-value": "Balanced",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": ["Conservative", "Balanced", "Strong"]
+    },
+    {
+      "id": "two_d_wf_bg_radius_um",
+      "value-key": "@two_d_wf_bg_radius_um",
+      "command-line-flag": "--two_d_wf_bg_radius_um",
+      "name": "2D WF background radius (µm)",
+      "description": "Background estimator neighborhood radius in micrometers for 2D widefield auto mode.",
+      "default-value": 0.5,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0.1,
+      "maximum": 50
+    },
+    {
+      "id": "two_d_wf_bg_scale",
+      "value-key": "@two_d_wf_bg_scale",
+      "command-line-flag": "--two_d_wf_bg_scale",
+      "name": "2D WF background scale",
+      "description": "Multiplier applied to the auto-estimated background in 2D widefield auto mode.",
+      "default-value": 1.0,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0.1,
+      "maximum": 10
     }
   ],
   "schema-version": "cytomine-0.1"

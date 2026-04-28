@@ -34,7 +34,7 @@ if sys.platform == "win32":
         "ci.gui_deconvolve_ci"
     )
 
-from PyQt6.QtCore import Qt, QRectF, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QIcon, QImage, QPainter, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -56,6 +56,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -64,6 +65,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+try:
+    from PyQt6.QtSvg import QSvgRenderer
+except ImportError:
+    QSvgRenderer = None
 
 from ci_dual_viewer import DualViewerWidget
 
@@ -74,6 +79,28 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ICON_PATH = SCRIPT_DIR / "icon.svg"
 LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
 OMERO_SESSION_REUSE_S = 10 * 60
+
+
+def _load_app_icon() -> QIcon:
+    """Build a Windows-friendly multi-size icon from the bundled SVG."""
+    if not ICON_PATH.exists():
+        return QIcon()
+    if QSvgRenderer is None:
+        return QIcon(str(ICON_PATH))
+
+    renderer = QSvgRenderer(str(ICON_PATH))
+    if not renderer.isValid():
+        return QIcon(str(ICON_PATH))
+
+    icon = QIcon()
+    for size in (16, 20, 24, 32, 40, 48, 64, 128, 256):
+        pixmap = QPixmap(QSize(size, size))
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
 
 def _default_settings_dir() -> str:
     """Return Documents folder (Windows) or HOME (Linux) as default dir."""
@@ -531,6 +558,20 @@ def _parse_float_list(text: str) -> list[float]:
     return values
 
 
+def _estimate_two_d_wf_psf_z_nm(
+    wavelength_nm: float,
+    na: float,
+    sample_ri: float,
+    pixel_size_xy_nm: float,
+) -> float:
+    """Return a practical hidden-volume Z step for 2D widefield PSFs."""
+    na_safe = max(float(na), 1e-6)
+    sample_safe = max(float(sample_ri), na_safe + 1e-6)
+    denom = max(sample_safe - np.sqrt(max(sample_safe ** 2 - na_safe ** 2, 1e-9)), 1e-6)
+    nyquist_nm = wavelength_nm / (2.0 * denom)
+    return float(max(min(nyquist_nm, 1000.0), pixel_size_xy_nm / 2.0))
+
+
 def _format_channel_values(
     channels: list[dict],
     key: str,
@@ -674,6 +715,7 @@ class _ResourceMonitor(QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._stop = threading.Event()
+        self._cpu_count = max(os.cpu_count() or 1, 1)
 
         # psutil
         self._psutil = None
@@ -747,7 +789,11 @@ class _ResourceMonitor(QThread):
                 pass
             if self._proc:
                 try:
-                    m["cpu_pct"] = self._proc.cpu_percent()
+                    proc_cpu_pct = float(self._proc.cpu_percent())
+                    m["cpu_pct"] = min(
+                        max(proc_cpu_pct / float(self._cpu_count), 0.0),
+                        100.0,
+                    )
                 except Exception:
                     pass
         # --- GPU utilisation & VRAM ---
@@ -1091,7 +1137,23 @@ def _deconvolve_channel_stacks(
         if params["microscope_type"] != "confocal":
             ex_wl = None
 
-        if ch_data.ndim == 3:
+        use_2d_wf_auto = (
+            ch_data.ndim == 2
+            and params["microscope_type"] == "widefield"
+            and params["method"] in ("ci_rl", "ci_rl_tv")
+            and params["two_d_mode"] == "auto"
+        )
+
+        psf_pixel_size_z_nm = params["pixel_size_z_nm"]
+        if use_2d_wf_auto:
+            n_z_psf = 65
+            psf_pixel_size_z_nm = _estimate_two_d_wf_psf_z_nm(
+                em_wl,
+                params["na"],
+                params["ri_sample"],
+                params["pixel_size_xy_nm"],
+            )
+        elif ch_data.ndim == 3:
             nz_img, _, _ = ch_data.shape
             n_z_psf = max(2 * nz_img - 1, 1) | 1
         else:
@@ -1110,7 +1172,7 @@ def _deconvolve_channel_stacks(
             na=params["na"],
             wavelength_nm=em_wl,
             pixel_size_xy_nm=params["pixel_size_xy_nm"],
-            pixel_size_z_nm=params["pixel_size_z_nm"],
+            pixel_size_z_nm=psf_pixel_size_z_nm,
             n_xy=n_xy_psf,
             n_z=n_z_psf,
             ri_immersion=params["ri_immersion"],
@@ -1129,6 +1191,13 @@ def _deconvolve_channel_stacks(
             n_pupil=params["n_pupil"],
             device=params["device"],
         )
+
+        if ch_data.ndim == 2 and psf.ndim == 3 and not use_2d_wf_auto:
+            if psf.shape[0] != 1:
+                raise ValueError(
+                    f"Expected a singleton-Z PSF for 2D data, got shape {psf.shape}."
+                )
+            psf = psf[0]
 
         if psf.ndim == 3 and ch_data.ndim == 3 and psf.shape[0] > ch_data.shape[0]:
             start = (psf.shape[0] - ch_data.shape[0]) // 2
@@ -1158,11 +1227,8 @@ def _deconvolve_channel_stacks(
             rel_threshold=params["rel_threshold"],
             check_every=params["check_every"],
             pixel_size_xy=params["pixel_size_xy_nm"],
-            pixel_size_z=params["pixel_size_z_nm"],
+            pixel_size_z=psf_pixel_size_z_nm if use_2d_wf_auto else params["pixel_size_z_nm"],
             device=params["device"],
-            tiling=params["tiling"],
-            max_tile_xy=params["max_tile_xy"],
-            max_tile_z=params["max_tile_z"],
         )
         if params["method"] == "ci_sparse_hessian":
             out = ci_sparse_hessian_deconvolve(
@@ -1178,6 +1244,11 @@ def _deconvolve_channel_stacks(
                 psf,
                 tv_lambda=params["tv_lambda"],
                 damping=params["damping"],
+                microscope_type=params["microscope_type"],
+                two_d_mode=params["two_d_mode"],
+                two_d_wf_aggressiveness=params["two_d_wf_aggressiveness"],
+                two_d_wf_bg_radius_um=params["two_d_wf_bg_radius_um"],
+                two_d_wf_bg_scale=params["two_d_wf_bg_scale"],
                 **common,
             )
         results.append(_solver_output_to_zyx(out["result"].copy()))
@@ -1353,8 +1424,9 @@ class DeconvolveCIWindow(QMainWindow):
         super().__init__()
         gpu_info = _detect_gpu_info()
         self.setWindowTitle(f"CI Deconvolve — {gpu_info}")
-        if ICON_PATH.exists():
-            self.setWindowIcon(QIcon(str(ICON_PATH)))
+        app_icon = _load_app_icon()
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
         self.setMinimumSize(1430, 700)
 
         # State
@@ -1374,6 +1446,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_settings_dir: str = _default_settings_dir()
         self._omero_gw = None  # OmeroGateway instance (lazy)
         self._omero_session_deadline: float = 0.0
+        self._excitation_saved: str = "488"  # remembered when field is disabled
 
         self._build_ui()
 
@@ -1410,6 +1483,12 @@ class DeconvolveCIWindow(QMainWindow):
         title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         ctrl_layout.addWidget(title)
 
+        def _set_field_tooltip(form_layout: QFormLayout, widget: QWidget, text: str) -> None:
+            widget.setToolTip(text)
+            label = form_layout.labelForField(widget)
+            if label is not None:
+                label.setToolTip(text)
+
         # --- Method ---
         method_group = QGroupBox("Method")
         ml = QFormLayout()
@@ -1420,7 +1499,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
 
-        self._le_niter = QLineEdit("150")
+        self._le_niter = QLineEdit("50")
         self._le_niter.setToolTip(
             "Iterations per channel, comma-separated.\n"
             "E.g. '50' for all channels, or '50, 80' for ch1=50, ch2=80."
@@ -1442,30 +1521,6 @@ class DeconvolveCIWindow(QMainWindow):
 
         advanced_section = CollapsibleSection("Advanced Parameters", expanded=False)
         advanced_layout = advanced_section.content_layout()
-
-        # --- Tiling ---
-        tiling_group = QGroupBox("Tiling")
-        tl = QFormLayout()
-        tiling_group.setLayout(tl)
-
-        self._tiling_combo = NoWheelComboBox()
-        self._tiling_combo.addItems(["custom", "none"])
-        self._tiling_combo.currentTextChanged.connect(self._on_tiling_changed)
-        tl.addRow("Tiling:", self._tiling_combo)
-
-        self._sp_max_tile_xy = NoWheelSpinBox()
-        self._sp_max_tile_xy.setRange(64, 4096)
-        self._sp_max_tile_xy.setSingleStep(64)
-        self._sp_max_tile_xy.setValue(512)
-        tl.addRow("Max tile XY:", self._sp_max_tile_xy)
-
-        self._sp_max_tile_z = NoWheelSpinBox()
-        self._sp_max_tile_z.setRange(8, 512)
-        self._sp_max_tile_z.setSingleStep(8)
-        self._sp_max_tile_z.setValue(64)
-        tl.addRow("Max tile Z:", self._sp_max_tile_z)
-
-        advanced_layout.addWidget(tiling_group)
 
         # --- Method tuning ---
         method_adv_group = QGroupBox("Method Tuning")
@@ -1494,6 +1549,12 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_damping.setEnabled(False)
         aml.addRow("Damping value:", self._sp_damping)
         self._damping_value_label = aml.labelForField(self._sp_damping)  # type: ignore
+
+        self._two_d_mode_combo = NoWheelComboBox()
+        self._two_d_mode_combo.addItems(["Auto", "Legacy 2D"])
+        self._two_d_mode_combo.currentTextChanged.connect(self._refresh_two_d_wf_expert_state)
+        aml.addRow("2D WF model:", self._two_d_mode_combo)
+        self._two_d_mode_label = aml.labelForField(self._two_d_mode_combo)  # type: ignore
 
         self._sp_sparse_weight = NoWheelDoubleSpinBox()
         self._sp_sparse_weight.setRange(0.0, 1.0)
@@ -1560,6 +1621,35 @@ class DeconvolveCIWindow(QMainWindow):
 
         advanced_layout.addWidget(method_adv_group)
 
+        # --- 2D widefield expert ---
+        wf2d_group = QGroupBox("2D Widefield Expert")
+        wf2d_layout = QFormLayout()
+        wf2d_group.setLayout(wf2d_layout)
+        self._two_d_wf_group = wf2d_group
+
+        self._two_d_wf_aggr_combo = NoWheelComboBox()
+        self._two_d_wf_aggr_combo.addItems(
+            ["Very Conservative", "Conservative", "Balanced", "Strong", "Very Strong"]
+        )
+        self._two_d_wf_aggr_combo.setCurrentText("Balanced")
+        wf2d_layout.addRow("2D WF aggressiveness:", self._two_d_wf_aggr_combo)
+
+        self._sp_two_d_wf_bg_radius = NoWheelDoubleSpinBox()
+        self._sp_two_d_wf_bg_radius.setRange(0.05, 10.0)
+        self._sp_two_d_wf_bg_radius.setDecimals(2)
+        self._sp_two_d_wf_bg_radius.setSingleStep(0.05)
+        self._sp_two_d_wf_bg_radius.setValue(0.50)
+        wf2d_layout.addRow("Background estimator radius (um):", self._sp_two_d_wf_bg_radius)
+
+        self._sp_two_d_wf_bg_scale = NoWheelDoubleSpinBox()
+        self._sp_two_d_wf_bg_scale.setRange(0.10, 3.00)
+        self._sp_two_d_wf_bg_scale.setDecimals(2)
+        self._sp_two_d_wf_bg_scale.setSingleStep(0.05)
+        self._sp_two_d_wf_bg_scale.setValue(1.00)
+        wf2d_layout.addRow("Auto background scale:", self._sp_two_d_wf_bg_scale)
+
+        advanced_layout.addWidget(wf2d_group)
+
         # --- Optics / PSF ---
         optics_group = QGroupBox("Optics / PSF")
         ol = QFormLayout()
@@ -1594,6 +1684,7 @@ class DeconvolveCIWindow(QMainWindow):
 
         self._micro_combo = NoWheelComboBox()
         self._micro_combo.addItems(["widefield", "confocal"])
+        self._micro_combo.setCurrentText("confocal")
         self._micro_combo.currentTextChanged.connect(self._on_micro_changed)
         ol.addRow("Microscope:", self._micro_combo)
 
@@ -1602,7 +1693,7 @@ class DeconvolveCIWindow(QMainWindow):
             "Excitation wavelength(s) in nm, comma-separated per channel.\n"
             "Used only for confocal PSF generation."
         )
-        self._le_excitation.setEnabled(False)
+        self._le_excitation.setEnabled(True)
         ol.addRow("Excitation (nm):", self._le_excitation)
 
         ctrl_layout.addWidget(optics_group)
@@ -1654,36 +1745,32 @@ class DeconvolveCIWindow(QMainWindow):
         cov_group.setLayout(cl)
 
         self._sp_tg = NoWheelDoubleSpinBox()
-        self._sp_tg.setRange(0, 1e7)
-        self._sp_tg.setDecimals(0)
-        self._sp_tg.setSingleStep(1000)
-        self._sp_tg.setValue(170000)
-        self._sp_tg.setSuffix(" nm")
-        cl.addRow("Coverslip thickness:", self._sp_tg)
+        self._sp_tg.setRange(0.0, 1e4)
+        self._sp_tg.setDecimals(3)
+        self._sp_tg.setSingleStep(0.001)
+        self._sp_tg.setValue(170.000)
+        cl.addRow("Coverslip thickness (um):", self._sp_tg)
 
         self._sp_tg0 = NoWheelDoubleSpinBox()
-        self._sp_tg0.setRange(0, 1e7)
-        self._sp_tg0.setDecimals(0)
-        self._sp_tg0.setSingleStep(1000)
-        self._sp_tg0.setValue(170000)
-        self._sp_tg0.setSuffix(" nm")
-        cl.addRow("Coverslip thickness (design):", self._sp_tg0)
+        self._sp_tg0.setRange(0.0, 1e4)
+        self._sp_tg0.setDecimals(3)
+        self._sp_tg0.setSingleStep(0.001)
+        self._sp_tg0.setValue(170.000)
+        cl.addRow("Coverslip thickness (design) (um):", self._sp_tg0)
 
         self._sp_ti0 = NoWheelDoubleSpinBox()
-        self._sp_ti0.setRange(0, 1e7)
-        self._sp_ti0.setDecimals(0)
-        self._sp_ti0.setSingleStep(1000)
-        self._sp_ti0.setValue(100000)
-        self._sp_ti0.setSuffix(" nm")
-        cl.addRow("Immersion thickness (design):", self._sp_ti0)
+        self._sp_ti0.setRange(0.0, 1e4)
+        self._sp_ti0.setDecimals(3)
+        self._sp_ti0.setSingleStep(0.001)
+        self._sp_ti0.setValue(100.000)
+        cl.addRow("Immersion thickness (design) (um):", self._sp_ti0)
 
         self._sp_zp = NoWheelDoubleSpinBox()
-        self._sp_zp.setRange(0, 1e7)
-        self._sp_zp.setDecimals(0)
-        self._sp_zp.setSingleStep(100)
+        self._sp_zp.setRange(0.0, 1e4)
+        self._sp_zp.setDecimals(3)
+        self._sp_zp.setSingleStep(0.001)
         self._sp_zp.setValue(0)
-        self._sp_zp.setSuffix(" nm")
-        cl.addRow("Particle depth (z_p):", self._sp_zp)
+        cl.addRow("Particle depth (z_p) (um):", self._sp_zp)
 
         advanced_layout.addWidget(cov_group)
 
@@ -1711,6 +1798,237 @@ class DeconvolveCIWindow(QMainWindow):
         advanced_layout.addStretch()
         ctrl_layout.addWidget(advanced_section)
 
+        _set_field_tooltip(
+            ml,
+            self._method_combo,
+            "Choose the deconvolution algorithm. `ci_rl` is the standard Richardson-Lucy "
+            "workflow, `ci_rl_tv` adds edge-preserving TV regularization, and "
+            "`ci_sparse_hessian` favors sparse filament-like structure with a different prior.",
+        )
+        _set_field_tooltip(
+            ml,
+            self._le_niter,
+            "Maximum iteration count per channel. Higher values can recover more detail but "
+            "also amplify noise and halos. You can enter a comma-separated list to use "
+            "different counts per channel.",
+        )
+        _set_field_tooltip(
+            ml,
+            self._conv_combo,
+            "`auto` stops early when improvement becomes small, while `fixed` always runs the "
+            "full iteration count. `auto` is usually the safer starting point for RL methods.",
+        )
+        _set_field_tooltip(
+            ml,
+            self._sp_rel_thresh,
+            "Relative improvement threshold used by `auto` convergence. Smaller values run "
+            "longer before stopping; larger values stop earlier.",
+        )
+
+        _set_field_tooltip(
+            aml,
+            self._sp_tv_lambda,
+            "Strength of total-variation regularization for `ci_rl_tv`. Increase it to suppress "
+            "noise and ringing; reduce it if fine structure starts looking over-smoothed.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._damping_combo,
+            "Noise-gated damping for RL-family methods. `auto` picks a practical default, "
+            "`manual` lets you tune the value directly, and `none` disables damping.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._sp_damping,
+            "Manual damping strength. Higher values make updates more conservative in noisy, "
+            "near-background regions; lower values make RL more aggressive.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._two_d_mode_combo,
+            "How 2D widefield images are handled. `Auto` uses the widefield-aware collapsed-PSF "
+            "model, while `Legacy 2D` keeps the older simpler behavior.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._sp_sparse_weight,
+            "Main regularization strength for `ci_sparse_hessian`. Increase it to enforce "
+            "stronger structure priors; reduce it if the result becomes too constrained.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._sp_sparse_reg,
+            "Regularization balance for `ci_sparse_hessian`. Values closer to 1.0 generally "
+            "make the sparse prior stronger and the result smoother.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._bg_combo,
+            "Background treatment during deconvolution. `auto` estimates a sensible floor from "
+            "the image, while `manual` uses the value you provide below.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._sp_bg_value,
+            "Manual background intensity. This should approximate the residual camera/background "
+            "offset that should remain unsharpened.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._offset_combo,
+            "Constant added before RL iterations to avoid unstable updates near zero intensity. "
+            "`auto` is usually safest; `none` disables it entirely.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._sp_offset,
+            "Manual pre-deconvolution offset value. Larger offsets make RL less aggressive in "
+            "dark regions, but too much can flatten weak signal.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._sp_prefilter,
+            "Optional Gaussian prefilter sigma in pixels. Use a small value when the raw data is "
+            "very noisy and RL starts to chase pixel-level noise.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._start_combo,
+            "Initial estimate for iterative deconvolution. `flat` is robust, `observed` starts "
+            "from the input image, and `lowpass` starts from a smoothed version.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._sp_check_every,
+            "How often convergence is evaluated when `Convergence` is set to `auto`. Lower "
+            "values check more frequently but add a little overhead.",
+        )
+        _set_field_tooltip(
+            aml,
+            self._device_combo,
+            "Processing device. `auto` chooses CUDA when available, otherwise CPU. Select "
+            "`cpu` if you want deterministic fallback or your GPU is too small.",
+        )
+
+        _set_field_tooltip(
+            wf2d_layout,
+            self._two_d_wf_aggr_combo,
+            "Controls how aggressively the 3D widefield PSF is collapsed for 2D RL. "
+            "`Very Conservative` keeps weighting close to the focal plane, while `Very Strong` "
+            "includes more out-of-focus blur and usually gives a more aggressive correction.",
+        )
+        _set_field_tooltip(
+            wf2d_layout,
+            self._sp_two_d_wf_bg_radius,
+            "Spatial radius used for the local background estimator in 2D widefield auto mode. "
+            "Use a larger radius for broad background haze and a smaller one for tight local background.",
+        )
+        _set_field_tooltip(
+            wf2d_layout,
+            self._sp_two_d_wf_bg_scale,
+            "Multiplier applied to the automatically estimated 2D widefield background. Increase "
+            "it if the result is too aggressive in the background; decrease it if haze remains.",
+        )
+
+        _set_field_tooltip(
+            ol,
+            self._sp_na,
+            "Objective numerical aperture. This is one of the most important PSF parameters: a "
+            "higher NA usually means a tighter PSF and higher achievable resolution.",
+        )
+        _set_field_tooltip(
+            ol,
+            self._le_emission,
+            "Emission wavelength for each channel in nanometers, comma-separated if needed. "
+            "Used directly in PSF generation, so accurate values matter.",
+        )
+        _set_field_tooltip(
+            ol,
+            self._sp_px_xy,
+            "Lateral pixel size in nanometers. This sets the image sampling in X/Y and is used "
+            "to scale the PSF correctly.",
+        )
+        _set_field_tooltip(
+            ol,
+            self._sp_px_z,
+            "Axial spacing between planes in nanometers. Important for 3D deconvolution and for "
+            "matching the PSF to the real Z sampling of the data.",
+        )
+        _set_field_tooltip(
+            ol,
+            self._micro_combo,
+            "Microscope model used for PSF generation. `widefield` and `confocal` use different "
+            "optical assumptions, and confocal also uses the excitation wavelength.",
+        )
+        _set_field_tooltip(
+            ol,
+            self._le_excitation,
+            "Excitation wavelength for each channel in nanometers. Used for confocal PSF "
+            "generation; ignored for widefield data.",
+        )
+
+        _set_field_tooltip(
+            rl,
+            self._sp_ri_imm,
+            "Refractive index of the immersion medium on the objective side, for example oil or water.",
+        )
+        _set_field_tooltip(
+            rl,
+            self._medium_combo,
+            "Convenience preset for the sample or mounting medium. Choosing a medium updates the "
+            "`RI sample` field to a typical refractive index.",
+        )
+        _set_field_tooltip(
+            rl,
+            self._sp_ri_sample,
+            "Refractive index of the sample or mounting medium around the fluorophores. Mismatch "
+            "between sample, coverslip, and immersion media can noticeably change the PSF.",
+        )
+
+        _set_field_tooltip(
+            cl,
+            self._sp_tg,
+            "Actual coverslip thickness in micrometers. Use the real coverslip value when known, "
+            "especially if you are working far from the objective design conditions.",
+        )
+        _set_field_tooltip(
+            cl,
+            self._sp_tg0,
+            "Design coverslip thickness expected by the optical system or objective. A mismatch "
+            "between actual and design thickness contributes to spherical aberration.",
+        )
+        _set_field_tooltip(
+            cl,
+            self._sp_ti0,
+            "Design immersion-path thickness used by the optical model. Usually leave this at the "
+            "objective default unless you have a specific calibration reason to change it.",
+        )
+        _set_field_tooltip(
+            cl,
+            self._sp_zp,
+            "Emitter depth below the coverslip in micrometers. Increase this when the structure of "
+            "interest is deeper in the sample and depth-induced aberration should be modeled.",
+        )
+
+        _set_field_tooltip(
+            pl,
+            self._cb_integrate,
+            "Integrate the PSF over the finite pixel area instead of sampling only at pixel "
+            "centers. Usually improves realism a bit, at the cost of more PSF computation time.",
+        )
+        _set_field_tooltip(
+            pl,
+            self._sp_subpixels,
+            "Subdivisions per pixel used when pixel integration is enabled. Higher values give a "
+            "more accurate integrated PSF but increase computation cost.",
+        )
+        _set_field_tooltip(
+            pl,
+            self._sp_n_pupil,
+            "Sampling density of the pupil function used during PSF generation. Higher values can "
+            "improve PSF accuracy but are slower and use more memory.",
+        )
+
         ctrl_layout.addStretch()
 
         # ---- Right: image viewer ----
@@ -1727,22 +2045,52 @@ class DeconvolveCIWindow(QMainWindow):
         bottom.setContentsMargins(0, 0, 0, 4)
 
         btn_open = QPushButton("Open\u2026")
+        btn_open.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_open.clicked.connect(self._on_open)
         bottom.addWidget(btn_open)
 
         btn_open_zarr = QPushButton("Open Zarr\u2026")
+        btn_open_zarr.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_open_zarr.clicked.connect(self._on_open_zarr)
         bottom.addWidget(btn_open_zarr)
 
         btn_open_omero = QPushButton("Open OMERO\u2026")
+        btn_open_omero.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_open_omero.clicked.connect(self._on_open_omero)
         bottom.addWidget(btn_open_omero)
 
+        middle_bar = QWidget()
+        middle_bar.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        middle_layout = QHBoxLayout(middle_bar)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setSpacing(8)
+
         self._file_label = QLabel("No file loaded")
         self._file_label.setWordWrap(False)
-        bottom.addWidget(self._file_label, stretch=1)
+        self._file_label.setToolTip("No file loaded")
+        self._file_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        middle_layout.addWidget(self._file_label, stretch=1)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 0)  # indeterminate
+        self._progress.setVisible(False)
+        self._progress.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self._progress.setMinimumWidth(180)
+        middle_layout.addWidget(self._progress, stretch=2)
+
+        bottom.addWidget(middle_bar, stretch=1)
 
         self._btn_run = QPushButton("Run Deconvolution")
+        self._btn_run.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._btn_run.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; "
             "font-weight: bold; padding: 8px; }"
@@ -1752,11 +2100,13 @@ class DeconvolveCIWindow(QMainWindow):
         bottom.addWidget(self._btn_run)
 
         self._btn_save = QPushButton("Save\u2026")
+        self._btn_save.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._btn_save.setEnabled(False)
         self._btn_save.clicked.connect(self._on_save)
         bottom.addWidget(self._btn_save)
 
         self._btn_save_series = QPushButton("Save T-Series\u2026")
+        self._btn_save_series.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._btn_save_series.setEnabled(False)
         self._btn_save_series.setVisible(False)
         self._btn_save_series.clicked.connect(self._on_save_t_series)
@@ -1764,26 +2114,23 @@ class DeconvolveCIWindow(QMainWindow):
 
         # --- Settings buttons ---
         self._btn_restore = QPushButton("Restore")
+        self._btn_restore.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._btn_restore.setToolTip("Restore parameter values from the previous run")
         self._btn_restore.setEnabled(LAST_SETTINGS_PATH.exists())
         self._btn_restore.clicked.connect(self._on_restore_settings)
         bottom.addWidget(self._btn_restore)
 
         btn_save_settings = QPushButton("Save Settings\u2026")
+        btn_save_settings.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_save_settings.setToolTip("Save current parameter values to a JSON file")
         btn_save_settings.clicked.connect(self._on_save_settings)
         bottom.addWidget(btn_save_settings)
 
         btn_load_settings = QPushButton("Load Settings\u2026")
+        btn_load_settings.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_load_settings.setToolTip("Load parameter values from a JSON file")
         btn_load_settings.clicked.connect(self._on_load_settings)
         bottom.addWidget(btn_load_settings)
-
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 0)  # indeterminate
-        self._progress.setVisible(False)
-        self._progress.setMaximumWidth(120)
-        bottom.addWidget(self._progress)
 
         root.insertLayout(0, bottom)
         root.addWidget(splitter, stretch=1)
@@ -1821,6 +2168,7 @@ class DeconvolveCIWindow(QMainWindow):
             (self._tv_lambda_label, self._sp_tv_lambda),
             (self._damping_label, self._damping_combo),
             (self._damping_value_label, self._sp_damping),
+            (self._two_d_mode_label, self._two_d_mode_combo),
             (self._sparse_weight_label, self._sp_sparse_weight),
             (self._sparse_reg_label, self._sp_sparse_reg),
         ):
@@ -1838,6 +2186,10 @@ class DeconvolveCIWindow(QMainWindow):
         if self._damping_value_label is not None:
             self._damping_value_label.setVisible(is_rl_family)
         self._sp_damping.setVisible(is_rl_family)
+        if self._two_d_mode_label is not None:
+            self._two_d_mode_label.setVisible(is_rl_family)
+        self._two_d_mode_combo.setVisible(is_rl_family)
+        self._two_d_wf_group.setVisible(is_rl_family)
 
         if self._sparse_weight_label is not None:
             self._sparse_weight_label.setVisible(is_sparse)
@@ -1847,6 +2199,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_sparse_reg.setVisible(is_sparse)
 
         self._on_damping_changed(self._damping_combo.currentText())
+        self._refresh_two_d_wf_expert_state()
 
     def _on_bg_changed(self, text: str):
         self._sp_bg_value.setEnabled(text == "manual")
@@ -1864,23 +2217,31 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_check_every.setEnabled(auto)
 
     def _on_micro_changed(self, text: str):
-        self._le_excitation.setEnabled(text == "confocal")
-        # Auto-set iterations: 50 for confocal, 150 for widefield
         if text == "confocal":
+            self._le_excitation.setEnabled(True)
+            self._le_excitation.setText(self._excitation_saved)
             self._le_niter.setText("50")
         else:
+            current = self._le_excitation.text()
+            if current != "N/A":
+                self._excitation_saved = current
+            self._le_excitation.setText("N/A")
+            self._le_excitation.setEnabled(False)
             self._le_niter.setText("150")
+        self._refresh_two_d_wf_expert_state()
+
+    def _refresh_two_d_wf_expert_state(self, _text: str = ""):
+        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv")
+        widefield = self._micro_combo.currentText() == "widefield"
+        auto_mode = self._two_d_mode_combo.currentText() == "Auto"
+        enabled = rl_family and widefield and auto_mode
+        self._two_d_wf_group.setEnabled(enabled)
 
     def _on_medium_changed(self, text: str):
         """Set RI sample spinbox from embedding medium combo selection."""
         ri = self._medium_ri_map.get(text)
         if ri is not None:
             self._sp_ri_sample.setValue(ri)
-
-    def _on_tiling_changed(self, text: str):
-        enabled = text == "custom"
-        self._sp_max_tile_xy.setEnabled(enabled)
-        self._sp_max_tile_z.setEnabled(enabled)
 
     def _on_proj_changed(self, text: str):
         del text
@@ -1907,7 +2268,7 @@ class DeconvolveCIWindow(QMainWindow):
         QApplication.processEvents()
 
     def _end_progress(self) -> None:
-        self._end_progress()
+        self._progress.setVisible(False)
 
     # -----------------------------------------------------------------------
     # File open
@@ -2007,9 +2368,12 @@ class DeconvolveCIWindow(QMainWindow):
             self._le_emission.setText(
                 _format_channel_values(ch_info, "emission_wavelength", 520.0)
             )
-            self._le_excitation.setText(
-                _format_channel_values(ch_info, "excitation_wavelength", 488.0)
-            )
+            ex_text = _format_channel_values(ch_info, "excitation_wavelength", 488.0)
+            self._excitation_saved = ex_text
+            if self._micro_combo.currentText() == "confocal":
+                self._le_excitation.setText(ex_text)
+                self._le_excitation.setEnabled(True)
+            # (widefield: field stays N/A and disabled)
         self._le_emission.setStyleSheet(
             _bg("emission_wavelength" in from_file))
         self._le_excitation.setStyleSheet(
@@ -2027,7 +2391,8 @@ class DeconvolveCIWindow(QMainWindow):
         size_y = self._metadata.get("size_y", "?")
         size_x = self._metadata.get("size_x", "?")
         n_ch = int(self._metadata.get("size_c", 0))
-        self._file_label.setText(
+        self._file_label.setText(display_name)
+        self._file_label.setToolTip(
             f"{display_name}\n{n_ch} ch, T={size_t}, Z={size_z}, YX={size_y}×{size_x}"
         )
         self._btn_run.setEnabled(True)
@@ -2157,6 +2522,10 @@ class DeconvolveCIWindow(QMainWindow):
             "niter_list": niter_list,
             "tv_lambda": self._sp_tv_lambda.value(),
             "damping": damping,
+            "two_d_mode": "auto" if self._two_d_mode_combo.currentText() == "Auto" else "legacy_2d",
+            "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText().strip().lower(),
+            "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
+            "two_d_wf_bg_scale": self._sp_two_d_wf_bg_scale.value(),
             "offset": offset,
             "prefilter_sigma": self._sp_prefilter.value(),
             "start": self._start_combo.currentText(),
@@ -2174,17 +2543,14 @@ class DeconvolveCIWindow(QMainWindow):
             "pixel_size_z_nm": self._sp_px_z.value(),
             "ri_immersion": self._sp_ri_imm.value(),
             "ri_sample": self._sp_ri_sample.value(),
-            "t_g": self._sp_tg.value(),
-            "t_g0": self._sp_tg0.value(),
-            "t_i0": self._sp_ti0.value(),
-            "z_p": self._sp_zp.value(),
+            "t_g": self._sp_tg.value() * 1000.0,
+            "t_g0": self._sp_tg0.value() * 1000.0,
+            "t_i0": self._sp_ti0.value() * 1000.0,
+            "z_p": self._sp_zp.value() * 1000.0,
             "microscope_type": self._micro_combo.currentText(),
             "integrate_pixels": self._cb_integrate.isChecked(),
             "n_subpixels": self._sp_subpixels.value(),
             "n_pupil": self._sp_n_pupil.value(),
-            "tiling": self._tiling_combo.currentText(),
-            "max_tile_xy": self._sp_max_tile_xy.value(),
-            "max_tile_z": self._sp_max_tile_z.value(),
         }
 
     def _on_run(self):
@@ -2396,6 +2762,10 @@ class DeconvolveCIWindow(QMainWindow):
             "tv_lambda": self._sp_tv_lambda.value(),
             "damping": self._damping_combo.currentText(),
             "damping_value": self._sp_damping.value(),
+            "two_d_mode": self._two_d_mode_combo.currentText(),
+            "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText(),
+            "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
+            "two_d_wf_bg_scale": self._sp_two_d_wf_bg_scale.value(),
             "background": self._bg_combo.currentText(),
             "background_value": self._sp_bg_value.value(),
             "offset": self._offset_combo.currentText(),
@@ -2408,21 +2778,18 @@ class DeconvolveCIWindow(QMainWindow):
             "rel_threshold": self._sp_rel_thresh.value(),
             "check_every": self._sp_check_every.value(),
             "device": self._device_combo.currentText(),
-            "tiling": self._tiling_combo.currentText(),
-            "max_tile_xy": self._sp_max_tile_xy.value(),
-            "max_tile_z": self._sp_max_tile_z.value(),
             "na": self._sp_na.value(),
             "emission_wavelengths": self._le_emission.text(),
-            "excitation_wavelengths": self._le_excitation.text(),
+            "excitation_wavelengths": self._excitation_saved if not self._le_excitation.isEnabled() else self._le_excitation.text(),
             "pixel_size_xy_nm": self._sp_px_xy.value(),
             "pixel_size_z_nm": self._sp_px_z.value(),
             "ri_immersion": self._sp_ri_imm.value(),
             "ri_sample": self._sp_ri_sample.value(),
             "embedding_medium": self._medium_combo.currentText(),
-            "t_g": self._sp_tg.value(),
-            "t_g0": self._sp_tg0.value(),
-            "t_i0": self._sp_ti0.value(),
-            "z_p": self._sp_zp.value(),
+            "t_g": self._sp_tg.value() * 1000.0,
+            "t_g0": self._sp_tg0.value() * 1000.0,
+            "t_i0": self._sp_ti0.value() * 1000.0,
+            "z_p": self._sp_zp.value() * 1000.0,
             "microscope_type": self._micro_combo.currentText(),
             "integrate_pixels": self._cb_integrate.isChecked(),
             "n_subpixels": self._sp_subpixels.value(),
@@ -2455,6 +2822,24 @@ class DeconvolveCIWindow(QMainWindow):
         _spin(self._sp_tv_lambda, "tv_lambda")
         _combo(self._damping_combo, "damping")
         _spin(self._sp_damping, "damping_value")
+        two_d_mode = data.get("two_d_mode")
+        if two_d_mode is not None:
+            if str(two_d_mode).strip().lower() == "auto":
+                self._two_d_mode_combo.setCurrentText("Auto")
+            elif str(two_d_mode).strip().lower() in {"legacy_2d", "legacy 2d"}:
+                self._two_d_mode_combo.setCurrentText("Legacy 2D")
+        aggr = data.get("two_d_wf_aggressiveness")
+        if aggr is not None:
+            lookup = {
+                "very conservative": "Very Conservative",
+                "conservative": "Conservative",
+                "balanced": "Balanced",
+                "strong": "Strong",
+                "very strong": "Very Strong",
+            }
+            self._two_d_wf_aggr_combo.setCurrentText(lookup.get(str(aggr).strip().lower(), str(aggr)))
+        _spin(self._sp_two_d_wf_bg_radius, "two_d_wf_bg_radius_um")
+        _spin(self._sp_two_d_wf_bg_scale, "two_d_wf_bg_scale")
         _combo(self._bg_combo, "background")
         _spin(self._sp_bg_value, "background_value")
         _combo(self._offset_combo, "offset")
@@ -2467,12 +2852,13 @@ class DeconvolveCIWindow(QMainWindow):
         _spin(self._sp_rel_thresh, "rel_threshold")
         _spin(self._sp_check_every, "check_every")
         _combo(self._device_combo, "device")
-        _combo(self._tiling_combo, "tiling")
-        _spin(self._sp_max_tile_xy, "max_tile_xy")
-        _spin(self._sp_max_tile_z, "max_tile_z")
         _spin(self._sp_na, "na")
         _line(self._le_emission, "emission_wavelengths")
-        _line(self._le_excitation, "excitation_wavelengths")
+        ex_val = data.get("excitation_wavelengths")
+        if ex_val is not None:
+            self._excitation_saved = str(ex_val)
+            if self._le_excitation.isEnabled():
+                self._le_excitation.setText(self._excitation_saved)
         _spin(self._sp_px_xy, "pixel_size_xy_nm")
         _spin(self._sp_px_z, "pixel_size_z_nm")
         _spin(self._sp_ri_imm, "ri_immersion")
@@ -2497,10 +2883,18 @@ class DeconvolveCIWindow(QMainWindow):
                         self._medium_combo.blockSignals(True)
                         self._medium_combo.setCurrentIndex(idx)
                         self._medium_combo.blockSignals(False)
-        _spin(self._sp_tg, "t_g")
-        _spin(self._sp_tg0, "t_g0")
-        _spin(self._sp_ti0, "t_i0")
-        _spin(self._sp_zp, "z_p")
+        t_g = data.get("t_g")
+        if t_g is not None:
+            self._sp_tg.setValue(float(t_g) / 1000.0)
+        t_g0 = data.get("t_g0")
+        if t_g0 is not None:
+            self._sp_tg0.setValue(float(t_g0) / 1000.0)
+        t_i0 = data.get("t_i0")
+        if t_i0 is not None:
+            self._sp_ti0.setValue(float(t_i0) / 1000.0)
+        z_p = data.get("z_p")
+        if z_p is not None:
+            self._sp_zp.setValue(float(z_p) / 1000.0)
         _combo(self._micro_combo, "microscope_type")
         _spin(self._sp_subpixels, "n_subpixels")
         _spin(self._sp_n_pupil, "n_pupil")
@@ -2670,8 +3064,9 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("CI Deconvolve")
-    if ICON_PATH.exists():
-        app.setWindowIcon(QIcon(str(ICON_PATH)))
+    app_icon = _load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
 
     window = DeconvolveCIWindow()
     window.show()

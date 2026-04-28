@@ -445,6 +445,20 @@ def load_image(
 # Phase 3: PSF Generation from Metadata
 # ===========================================================================
 
+
+def _estimate_two_d_wf_psf_z_nm(
+    wavelength_nm: float,
+    na: float,
+    sample_ri: float,
+    pixel_size_xy_nm: float,
+) -> float:
+    """Return a practical hidden-volume Z step for 2D widefield PSFs."""
+    na_safe = max(float(na), 1e-6)
+    sample_safe = max(float(sample_ri), na_safe + 1e-6)
+    denom = max(sample_safe - np.sqrt(max(sample_safe ** 2 - na_safe ** 2, 1e-9)), 1e-6)
+    nyquist_nm = wavelength_nm / (2.0 * denom)
+    return float(max(min(nyquist_nm, 1000.0), pixel_size_xy_nm / 2.0))
+
 def generate_psf(
     metadata: dict[str, Any],
     channel_idx: int = 0,
@@ -458,6 +472,7 @@ def generate_psf(
     t_g0: float = 170e3,
     t_i0: float = 100e3,
     z_p: float = 0.0,
+    two_d_mode: str = "auto",
 ) -> np.ndarray:
     """Generate a physically accurate PSF from microscopy metadata.
 
@@ -514,9 +529,21 @@ def generate_psf(
         if psf_size_xy % 2 == 0:
             psf_size_xy += 1
 
+    use_2d_wf_auto = (
+        n_z <= 1
+        and microscope_type == "widefield"
+        and str(two_d_mode).strip().lower() == "auto"
+    )
+
     # 3D vs 2D
     is_3d = n_z > 1
-    n_defocus = max(2 * n_z - 1, 1) if is_3d else 1
+    if use_2d_wf_auto:
+        n_defocus = 65
+        pix_z_nm = _estimate_two_d_wf_psf_z_nm(
+            wavelength_nm, na, sample_ri, pix_xy_nm,
+        )
+    else:
+        n_defocus = max(2 * n_z - 1, 1) if is_3d else 1
 
     psf = ci_generate_psf(
         na=na,
@@ -540,7 +567,7 @@ def generate_psf(
     )
 
     # ci_generate_psf always returns 3D (n_z, n_xy, n_xy) — squeeze for 2D
-    if not is_3d:
+    if not is_3d and not use_2d_wf_auto:
         psf = psf.squeeze(axis=0)
 
     logger.info("PSF generated: shape=%s, sum=%.6f", psf.shape, psf.sum())
@@ -561,272 +588,6 @@ METHODS = {
         "description": "CI sparse-Hessian variational deconvolution (PyTorch GPU)",
     },
 }
-
-
-# ---------------------------------------------------------------------------
-# XY tiling helpers (large image support)
-# ---------------------------------------------------------------------------
-
-# Default maximum tile dimensions for "custom" tiling mode.  When the
-# image exceeds these limits the auto-calculator splits it into the
-# smallest number of tiles that keeps every tile within bounds.
-# OpenCL device limits are [1024, 1024, 64].  We use smaller XY values
-# because the extracted tile includes overlap margins on each side
-# (core + 2*overlap must stay within 1024).
-MAX_TILE_Z = 64
-MAX_TILE_XY = 512
-# Extra pixels extracted around each tile and discarded after
-# deconvolution to eliminate FFT edge artifacts (bright stripes).
-TILE_MARGIN = 16
-
-
-def _auto_n_tiles(
-    shape: tuple[int, ...],
-    max_z: int = MAX_TILE_Z,
-    max_xy: int = MAX_TILE_XY,
-) -> int:
-    """Return the minimum number of XY tiles so each tile fits within limits.
-
-    Only XY is tiled; Z is never split.  If the image already fits
-    within *max_z* and *max_xy* the function returns 1 (no tiling).
-    If Z alone exceeds *max_z* tiling cannot help, so 1 is returned
-    (the backend will have to cope or fail).
-    """
-    if len(shape) < 3:
-        return 1  # 2-D image, no tiling needed
-    Z, H, W = shape[:3]
-    ny = max(1, -(-H // max_xy))  # ceil division
-    nx = max(1, -(-W // max_xy))
-    n_tiles = ny * nx
-    if n_tiles <= 1:
-        return 1
-    return n_tiles
-
-
-def _resolve_tiling(
-    tiling: str,
-    shape: tuple[int, ...],
-    max_xy: int = MAX_TILE_XY,
-    max_z: int = MAX_TILE_Z,
-) -> int:
-    """Resolve *tiling* mode to a concrete tile count.
-
-    Accepted values: ``"none"`` (no tiling) or ``"custom"`` (compute
-    from image shape using *max_xy* / *max_z* limits).
-    """
-    if isinstance(tiling, str):
-        mode = tiling.strip().lower()
-        if mode == "none":
-            return 1
-        if mode in ("custom", "auto"):
-            return _auto_n_tiles(shape, max_z=max_z, max_xy=max_xy)
-        raise ValueError(
-            f"tiling must be 'none' or 'custom', got '{tiling}'"
-        )
-    # Legacy: accept integer (0/1 = none, >1 = explicit tile count)
-    return max(int(tiling), 1)
-
-
-def _compute_tile_grid(
-    shape_yx: tuple[int, int], n_tiles: int,
-) -> tuple[int, int]:
-    """Return (ny, nx) tile counts that best cover *shape_yx*.
-
-    Tries to keep tiles roughly square by minimising aspect-ratio skew.
-    """
-    if n_tiles <= 1:
-        return (1, 1)
-    best = (1, n_tiles)
-    best_ratio = float("inf")
-    for ny in range(1, n_tiles + 1):
-        if n_tiles % ny != 0:
-            continue
-        nx = n_tiles // ny
-        tile_h = shape_yx[0] / ny
-        tile_w = shape_yx[1] / nx
-        ratio = max(tile_h, tile_w) / max(min(tile_h, tile_w), 1)
-        if ratio < best_ratio:
-            best_ratio = ratio
-            best = (ny, nx)
-    return best
-
-
-def _compute_tile_slices(
-    shape_zyx: tuple[int, int, int],
-    ny: int,
-    nx: int,
-    overlap: int,
-) -> list[dict]:
-    """Return a list of tile descriptors with overlap margins.
-
-    Each descriptor is a dict with:
-        'extract'  – (z, y, x) slices to cut from the source image
-        'insert'   – (z, y, x) slices where the blended core goes in output
-        'core'     – (z, y, x) slices within the *tile* that map to 'insert'
-        'blend_y'  – (top, bottom) overlap widths inside the tile
-        'blend_x'  – (left, right) overlap widths inside the tile
-    """
-    _, H, W = shape_zyx
-    tile_h = H / ny
-    tile_w = W / nx
-    tiles = []
-    for iy in range(ny):
-        y0_core = round(iy * tile_h)
-        y1_core = round((iy + 1) * tile_h)
-        y0_ext = max(y0_core - overlap, 0)
-        y1_ext = min(y1_core + overlap, H)
-        ov_top = y0_core - y0_ext
-        ov_bot = y1_ext - y1_core
-        for ix in range(nx):
-            x0_core = round(ix * tile_w)
-            x1_core = round((ix + 1) * tile_w)
-            x0_ext = max(x0_core - overlap, 0)
-            x1_ext = min(x1_core + overlap, W)
-            ov_left = x0_core - x0_ext
-            ov_right = x1_ext - x1_core
-            tiles.append({
-                "extract": (slice(None), slice(y0_ext, y1_ext), slice(x0_ext, x1_ext)),
-                "insert":  (slice(None), slice(y0_core, y1_core), slice(x0_core, x1_core)),
-                "core":    (slice(None), slice(ov_top, ov_top + y1_core - y0_core),
-                             slice(ov_left, ov_left + x1_core - x0_core)),
-                "blend_y": (ov_top, ov_bot),
-                "blend_x": (ov_left, ov_right),
-            })
-    return tiles
-
-
-def _blend_tile(tile_result: np.ndarray, desc: dict) -> np.ndarray:
-    """Apply linear ramp blending in overlap zones and return core region."""
-    ov_top, ov_bot = desc["blend_y"]
-    ov_left, ov_right = desc["blend_x"]
-    _, core_y, core_x = desc["core"]
-    core_h = core_y.stop - core_y.start
-    core_w = core_x.stop - core_x.start
-
-    # Build 2-D weight map for the full tile (Z is broadcast)
-    tile_h = tile_result.shape[1]
-    tile_w = tile_result.shape[2]
-    weight = np.ones((tile_h, tile_w), dtype=np.float32)
-
-    # Top overlap ramp
-    if ov_top > 0:
-        ramp = np.linspace(0, 1, ov_top + 1, dtype=np.float32)[1:]  # exclude 0
-        weight[:ov_top, :] *= ramp[:, np.newaxis]
-    # Bottom overlap ramp
-    if ov_bot > 0:
-        ramp = np.linspace(1, 0, ov_bot + 1, dtype=np.float32)[:-1]  # exclude 0
-        weight[tile_h - ov_bot:, :] *= ramp[:, np.newaxis]
-    # Left overlap ramp
-    if ov_left > 0:
-        ramp = np.linspace(0, 1, ov_left + 1, dtype=np.float32)[1:]
-        weight[:, :ov_left] *= ramp[np.newaxis, :]
-    # Right overlap ramp
-    if ov_right > 0:
-        ramp = np.linspace(1, 0, ov_right + 1, dtype=np.float32)[:-1]
-        weight[:, tile_w - ov_right:] *= ramp[np.newaxis, :]
-
-    # Apply weight and extract the region that maps back to the output
-    weighted = tile_result * weight[np.newaxis, :, :]
-
-    # The output slot is core-sized; we need the full overlap extent
-    # We return (weighted_patch, weight_patch) for the *extended* region
-    # so the caller can accumulate numerator/denominator.
-    return weighted, weight
-
-
-def _pad_to_shape(
-    arr: np.ndarray, target_shape: tuple[int, ...],
-) -> np.ndarray:
-    """Centre-pad *arr* with zeros so it matches *target_shape*.
-
-    Used when a backend returns a slightly smaller array than the input.
-    """
-    if arr.shape == target_shape:
-        return arr
-    out = np.zeros(target_shape, dtype=arr.dtype)
-    offsets = tuple((t - a) // 2 for t, a in zip(target_shape, arr.shape))
-    slices = tuple(slice(o, o + min(a, t))
-                   for o, a, t in zip(offsets, arr.shape, target_shape))
-    src_slices = tuple(slice(0, min(a, t))
-                       for a, t in zip(arr.shape, target_shape))
-    out[slices] = arr[src_slices]
-    return out
-
-
-def _deconvolve_tiled(
-    image: np.ndarray,
-    psf: np.ndarray,
-    n_tiles: int,
-    method: str,
-    **kwargs,
-) -> np.ndarray:
-    """Split *image* into XY tiles, deconvolve each, and blend back."""
-    overlap = max(psf.shape[-1], psf.shape[-2]) // 2
-    margin = TILE_MARGIN
-
-    ny, nx = _compute_tile_grid(image.shape[1:], n_tiles)
-    min_tile_yx = min(image.shape[1] / ny, image.shape[2] / nx)
-    if min_tile_yx < max(psf.shape[-2:]):
-        # Tiles too small for meaningful deconvolution — fall back
-        logger.warning(
-            "n_tiles=%d produces tiles smaller than PSF; falling back to "
-            "no tiling.", n_tiles,
-        )
-        return deconvolve(image, psf, method=method, tiling="none", **kwargs)
-
-    tiles = _compute_tile_slices(image.shape, ny, nx, overlap)
-    logger.info(
-        "Tiled deconvolution: %d tiles (%d×%d grid), overlap=%d, margin=%d px",
-        n_tiles, ny, nx, overlap, margin,
-    )
-
-    Z, H, W = image.shape
-    # Accumulate with weighted blending
-    numerator = np.zeros_like(image, dtype=np.float64)
-    denominator = np.zeros(image.shape, dtype=np.float64)
-
-    for idx, desc in enumerate(tiles):
-        # --- expand extraction by margin to capture edge artifacts ---
-        _, ey, ex = desc["extract"]
-        y0_m = max(ey.start - margin, 0)
-        y1_m = min(ey.stop + margin, H)
-        x0_m = max(ex.start - margin, 0)
-        x1_m = min(ex.stop + margin, W)
-        ext_expanded = (slice(None), slice(y0_m, y1_m), slice(x0_m, x1_m))
-        tile_img = image[ext_expanded].copy()
-
-        logger.info(
-            "  Tile %d/%d  shape=%s", idx + 1, len(tiles), tile_img.shape,
-        )
-        tile_result = deconvolve(
-            tile_img, psf, method=method, tiling="none", **kwargs,
-        )
-
-        # Fix shape if backend returned a different size
-        if tile_result.shape != tile_img.shape:
-            logger.debug(
-                "  Tile result shape %s != input %s; padding to match.",
-                tile_result.shape, tile_img.shape,
-            )
-            tile_result = _pad_to_shape(tile_result, tile_img.shape)
-
-        # Crop margin back to the original extract region
-        crop_y0 = ey.start - y0_m
-        crop_y1 = crop_y0 + (ey.stop - ey.start)
-        crop_x0 = ex.start - x0_m
-        crop_x1 = crop_x0 + (ex.stop - ex.start)
-        tile_cropped = tile_result[:, crop_y0:crop_y1, crop_x0:crop_x1]
-
-        weighted, weight = _blend_tile(tile_cropped, desc)
-        # Place the full extended region back (extract slices)
-        ext = desc["extract"]
-        numerator[ext] += weighted.astype(np.float64)
-        denominator[ext] += weight[np.newaxis, :, :].astype(np.float64)
-
-    # Normalise
-    denominator = np.maximum(denominator, 1e-12)
-    result = (numerator / denominator).astype(np.float32)
-    return np.clip(result, 0, None)
 
 
 def deconvolve(
@@ -854,10 +615,11 @@ def deconvolve(
     # Physical voxel size
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
-    # XY tiling for large images
-    tiling: str = "custom",
-    max_tile_xy: int = MAX_TILE_XY,
-    max_tile_z: int = MAX_TILE_Z,
+    microscope_type: str = "widefield",
+    two_d_mode: str = "auto",
+    two_d_wf_aggressiveness: str = "balanced",
+    two_d_wf_bg_radius_um: float = 0.5,
+    two_d_wf_bg_scale: float = 1.0,
 ) -> np.ndarray:
     """Deconvolve an image using the specified method and PSF.
 
@@ -878,6 +640,19 @@ def deconvolve(
         Background subtraction (default: 'auto').
     damping : str or float
         Noise-gated damping for RL-family methods (default: 0 / disabled).
+    microscope_type : str
+        Microscope mode. ``"widefield"`` enables the enhanced 2-D path when
+        *image* is single-plane and *two_d_mode* is ``"auto"``.
+    two_d_mode : str
+        ``"auto"`` enables the enhanced 2-D widefield model; ``"legacy_2d"``
+        keeps the historical pure-2-D behavior.
+    two_d_wf_aggressiveness : str
+        Expert tuning for 2-D widefield auto mode: ``"conservative"``,
+        ``"balanced"``, or ``"strong"``.
+    two_d_wf_bg_radius_um : float
+        Background-estimator neighborhood radius in µm for 2-D WF auto mode.
+    two_d_wf_bg_scale : float
+        Multiplier applied to the auto-estimated 2-D widefield background.
     device : str, optional
         Force device ('cpu' or 'cuda'). Auto-detected if None.
     tv_lambda : float
@@ -886,14 +661,6 @@ def deconvolve(
         Hessian-vs-sparsity balance for ci_sparse_hessian (default: 0.6).
     sparse_hessian_reg : float
         Data-vs-regulariser balance for ci_sparse_hessian (default: 0.98).
-    tiling : str
-        Tiling mode.  ``"custom"`` (default) computes the minimum
-        number of XY tiles so each tile fits within *max_tile_xy*
-        pixels per side.  ``"none"`` disables tiling.
-    max_tile_xy : int
-        Maximum XY tile dimension (default: 512).
-    max_tile_z : int
-        Maximum Z tile dimension (default: 64).
 
     Returns
     -------
@@ -903,21 +670,6 @@ def deconvolve(
     if method not in METHODS:
         raise ValueError(
             f"Unknown method '{method}'. Available: {list(METHODS.keys())}"
-        )
-
-    # --- XY tiling dispatch (before any backend) ---
-    n_tiles = _resolve_tiling(tiling, image.shape, max_xy=max_tile_xy, max_z=max_tile_z)
-    if n_tiles > 1 and image.ndim == 3:
-        return _deconvolve_tiled(
-            image, psf, n_tiles, method=method,
-            niter=niter, background=background, damping=damping,
-            device=device, tv_lambda=tv_lambda,
-            sparse_hessian_weight=sparse_hessian_weight,
-            sparse_hessian_reg=sparse_hessian_reg,
-            pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
-            offset=offset, prefilter_sigma=prefilter_sigma, start=start,
-            convergence=convergence, rel_threshold=rel_threshold,
-            check_every=check_every,
         )
 
     # Crop PSF to image size when it is larger (e.g. n_defocus = 2*nz-1).
@@ -945,8 +697,11 @@ def deconvolve(
         prefilter_sigma=prefilter_sigma, start=start,
         convergence=convergence, rel_threshold=rel_threshold,
         pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
+        microscope_type=microscope_type, two_d_mode=two_d_mode,
+        two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+        two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+        two_d_wf_bg_scale=two_d_wf_bg_scale,
         check_every=check_every, device=device,
-        tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
     )
 
 
@@ -973,10 +728,12 @@ def _deconvolve_ci_method(
     check_every: int = 5,
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
+    microscope_type: str = "widefield",
+    two_d_mode: str = "auto",
+    two_d_wf_aggressiveness: str = "balanced",
+    two_d_wf_bg_radius_um: float = 0.5,
+    two_d_wf_bg_scale: float = 1.0,
     device: Optional[str] = None,
-    tiling: str = "custom",
-    max_tile_xy: int = MAX_TILE_XY,
-    max_tile_z: int = MAX_TILE_Z,
 ) -> np.ndarray:
     from deconvolve_ci import (
         ci_rl_deconvolve,
@@ -997,9 +754,6 @@ def _deconvolve_ci_method(
         pixel_size_xy=pixel_size_xy,
         pixel_size_z=pixel_size_z,
         device=device,
-        tiling=tiling,
-        max_tile_xy=max_tile_xy,
-        max_tile_z=max_tile_z,
     )
 
     if method == "ci_sparse_hessian":
@@ -1012,6 +766,11 @@ def _deconvolve_ci_method(
         result = ci_rl_deconvolve(
             tv_lambda=tv_lambda,
             damping=damping,
+            microscope_type=microscope_type,
+            two_d_mode=two_d_mode,
+            two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+            two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+            two_d_wf_bg_scale=two_d_wf_bg_scale,
             **common,
         )
     return result["result"]
@@ -1056,13 +815,14 @@ def deconvolve_image(
     convergence: str = "auto",
     rel_threshold: float = 0.005,
     check_every: int = 5,
+    two_d_mode: str = "auto",
+    two_d_wf_aggressiveness: str = "balanced",
+    two_d_wf_bg_radius_um: float = 0.5,
+    two_d_wf_bg_scale: float = 1.0,
     device: Optional[str] = None,
     tv_lambda: float = 1e-4,
     sparse_hessian_weight: float = 0.6,
     sparse_hessian_reg: float = 0.98,
-    tiling: str = "custom",
-    max_tile_xy: int = MAX_TILE_XY,
-    max_tile_z: int = MAX_TILE_Z,
 ) -> dict[str, Any]:
     """Load, generate PSFs, and deconvolve all channels of an OME-TIFF image.
 
@@ -1129,12 +889,20 @@ def deconvolve_image(
             ri_coverslip_design=ri_coverslip_design,
             ri_immersion_design=ri_immersion_design,
             t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
+            two_d_mode=two_d_mode if method in ("ci_rl", "ci_rl_tv") else "legacy_2d",
         )
         psfs.append(psf)
 
         # Match PSF dimensionality to image
         img = images[ch_idx]
-        if img.ndim == 2 and psf.ndim == 3:
+        keep_hidden_2d_psf = (
+            img.ndim == 2
+            and psf.ndim == 3
+            and metadata.get("microscope_type", "widefield") == "widefield"
+            and method in ("ci_rl", "ci_rl_tv")
+            and str(two_d_mode).strip().lower() == "auto"
+        )
+        if img.ndim == 2 and psf.ndim == 3 and not keep_hidden_2d_psf:
             psf = psf[psf.shape[0] // 2]  # Take central slice
         elif img.ndim == 3 and psf.ndim == 2:
             # Expand 2D PSF into 3D (single-plane)
@@ -1158,7 +926,11 @@ def deconvolve_image(
             sparse_hessian_reg=sparse_hessian_reg,
             pixel_size_xy=metadata.get("pixel_size_x"),
             pixel_size_z=metadata.get("pixel_size_z"),
-            tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
+            microscope_type=metadata.get("microscope_type", "widefield"),
+            two_d_mode=two_d_mode,
+            two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+            two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+            two_d_wf_bg_scale=two_d_wf_bg_scale,
         )
         results.append(result)
 

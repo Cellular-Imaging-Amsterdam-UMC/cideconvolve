@@ -334,6 +334,10 @@ Uses Simpson's rule quadrature with a configurable number of pupil samples
 
 ### `ci_rl_deconvolve(image, psf, **kwargs) → dict`
 
+For single-plane widefield data, `ci_rl_deconvolve` can now run in an enhanced
+2D mode that uses a conservative widefield-aware PSF model instead of the
+historical center-slice-only 2D PSF approximation.
+
 **Parameters**:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -351,6 +355,8 @@ Uses Simpson's rule quadrature with a configurable number of pupil samples
 | `check_every` | int | 5 | Check convergence every N iterations |
 | `pixel_size_xy` | float/None | None | Lateral voxel size used for anisotropic regularization scaling |
 | `pixel_size_z` | float/None | None | Axial voxel size used for anisotropic regularization scaling |
+| `microscope_type` | str | "widefield" | `widefield` enables the enhanced 2D widefield path when `image` is 2D and `two_d_mode="auto"` |
+| `two_d_mode` | str | "auto" | `auto` uses the enhanced 2D widefield model; `legacy_2d` keeps the historical pure-2D RL path |
 | `device` | str/None | None | PyTorch device ("cuda", "cpu", or None=auto) |
 | `tiling` | str | "custom" | Tiling mode: "none", "custom", or "auto" (automatic tile count from `max_tile_xy` / `max_tile_z`) |
 | `max_tile_xy` | int | 512 | Maximum tile size in XY (pixels) when tiling="custom" |

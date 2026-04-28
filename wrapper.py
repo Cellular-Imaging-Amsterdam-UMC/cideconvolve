@@ -41,8 +41,6 @@ from bioflows_local import (
 
 # Import deconvolve first (handles torch-before-numpy DLL load order)
 from deconvolve import (
-    MAX_TILE_XY,
-    MAX_TILE_Z,
     deconvolve,
     deconvolve_image,
     generate_psf,
@@ -567,9 +565,6 @@ def _run_plate_zarr(
     niter_list: list,
     method: str,
     device,
-    tiling: str,
-    max_tile_xy: int,
-    max_tile_z: int,
     na,
     refractive_index,
     sample_ri: float,
@@ -596,6 +591,10 @@ def _run_plate_zarr(
     t_g0: float,
     t_i0: float,
     z_p: float,
+    two_d_mode: str = "auto",
+    two_d_wf_aggressiveness: str = "balanced",
+    two_d_wf_bg_radius_um: float = 0.5,
+    two_d_wf_bg_scale: float = 1.0,
     projection: str = "none",
 ) -> None:
     """Process an HCS plate zarr: deconvolve every field and write output plate zarr."""
@@ -683,7 +682,11 @@ def _run_plate_zarr(
                 sparse_hessian_reg=sparse_hessian_reg,
                 pixel_size_xy=meta.get("pixel_size_x"),
                 pixel_size_z=meta.get("pixel_size_z"),
-                tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
+                microscope_type=meta.get("microscope_type", "widefield"),
+                two_d_mode=two_d_mode,
+                two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+                two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+                two_d_wf_bg_scale=two_d_wf_bg_scale,
             )
             result_channels.append(result)
 
@@ -714,8 +717,6 @@ def main(argv):
         niter_list = [max(1, int(s.strip())) for s in iter_raw.split(",") if s.strip()]
         if not niter_list:
             niter_list = [40]
-        tiling_raw = getattr(parameters, "tiling", "custom")
-        tile_limits_raw = str(getattr(parameters, "tile_limits", "512, 64"))
         method = getattr(parameters, "method", "ci_rl")
         device_param = getattr(parameters, "device", "auto")
         device = None if device_param in (None, "auto") else device_param
@@ -785,15 +786,11 @@ def main(argv):
         benchmark = _to_bool(getattr(parameters, "benchmark", False))
         bench_crop = _to_bool(getattr(parameters, "bench_crop", False))
 
-        # Parse tiling
-        tiling = str(tiling_raw).strip().lower()
-        if tiling not in ("none", "custom"):
-            tiling = "none"  # fallback
-
-        # Parse tile limits (max_xy, max_z)
-        _lim_parts = [s.strip() for s in tile_limits_raw.split(",") if s.strip()]
-        max_tile_xy = int(_lim_parts[0]) if len(_lim_parts) >= 1 else MAX_TILE_XY
-        max_tile_z = int(_lim_parts[1]) if len(_lim_parts) >= 2 else MAX_TILE_Z
+        # 2D widefield parameters
+        two_d_mode = str(getattr(parameters, "two_d_mode", "auto")).strip().lower()
+        two_d_wf_aggressiveness = str(getattr(parameters, "two_d_wf_aggressiveness", "Balanced")).strip()
+        two_d_wf_bg_radius_um = float(getattr(parameters, "two_d_wf_bg_radius_um", 0.5))
+        two_d_wf_bg_scale = float(getattr(parameters, "two_d_wf_bg_scale", 1.0))
 
         print("=" * 70)
         print("CIDeconvolve - BIAFLOWS Workflow")
@@ -802,9 +799,6 @@ def main(argv):
         print(f"  Output dir   : {bj.output_dir}")
         print(f"  Method       : {method}")
         print(f"  Iterations   : {', '.join(str(n) for n in niter_list)}")
-        print(f"  Tiling       : {tiling}")
-        if tiling == "custom":
-            print(f"  Tile limits  : max_xy={max_tile_xy}, max_z={max_tile_z}")
         print(f"  Device       : {device_param}")
         print(f"  Projection   : {projection}")
         if method == "ci_rl_tv":
@@ -856,9 +850,6 @@ def main(argv):
                 niter_list=niter_list,
                 device=device,
                 bench_crop=bench_crop,
-                max_tile_xy=max_tile_xy,
-                max_tile_z=max_tile_z,
-                tiling=tiling,
                 na=na_override,
                 refractive_index=ri_override,
                 sample_ri=sample_ri,
@@ -913,9 +904,6 @@ def main(argv):
                     niter_list=niter_list,
                     method=method,
                     device=device,
-                    tiling=tiling,
-                    max_tile_xy=max_tile_xy,
-                    max_tile_z=max_tile_z,
                     na=na_override,
                     refractive_index=ri_override,
                     sample_ri=sample_ri,
@@ -939,6 +927,10 @@ def main(argv):
                     ri_coverslip_design=ri_override,
                     ri_immersion_design=ri_override,
                     t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
+                    two_d_mode=two_d_mode,
+                    two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+                    two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+                    two_d_wf_bg_scale=two_d_wf_bg_scale,
                     projection=projection,
                 )
             except Exception as exc:
@@ -974,9 +966,6 @@ def main(argv):
                     img_path,
                     method=method,
                     niter=niter_list,
-                    tiling=tiling,
-                    max_tile_xy=max_tile_xy,
-                    max_tile_z=max_tile_z,
                     device=device,
                     na=na_override,
                     refractive_index=ri_override,
@@ -1004,6 +993,10 @@ def main(argv):
                     t_g0=t_g0,
                     t_i0=t_i0,
                     z_p=z_p,
+                    two_d_mode=two_d_mode,
+                    two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+                    two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+                    two_d_wf_bg_scale=two_d_wf_bg_scale,
                 )
 
                 if result is None:
@@ -1600,9 +1593,6 @@ def _run_benchmark(
     niter_list,
     device,
     bench_crop,
-    max_tile_xy,
-    max_tile_z,
-    tiling,
     na,
     refractive_index,
     sample_ri,
@@ -1692,24 +1682,25 @@ def _run_benchmark(
         meta = data["metadata"]
         images = data["images"]
 
-    # If bench_crop, centre-crop each channel to tile limits
+    # If bench_crop, centre-crop each channel to a default tile size
+    _DEFAULT_CROP = 512
     if bench_crop:
         import tifffile
         cropped = []
         for ch in images:
             if ch.ndim == 3:
                 nz, ny, nx = ch.shape
-                cz = min(nz, max_tile_z)
-                cy = min(ny, max_tile_xy)
-                cx = min(nx, max_tile_xy)
+                cz = min(nz, 64)
+                cy = min(ny, _DEFAULT_CROP)
+                cx = min(nx, _DEFAULT_CROP)
                 z0 = (nz - cz) // 2
                 y0 = (ny - cy) // 2
                 x0 = (nx - cx) // 2
                 cropped.append(ch[z0:z0+cz, y0:y0+cy, x0:x0+cx])
             else:
                 ny, nx = ch.shape
-                cy = min(ny, max_tile_xy)
-                cx = min(nx, max_tile_xy)
+                cy = min(ny, _DEFAULT_CROP)
+                cx = min(nx, _DEFAULT_CROP)
                 y0 = (ny - cy) // 2
                 x0 = (nx - cx) // 2
                 cropped.append(ch[y0:y0+cy, x0:x0+cx])
@@ -1730,9 +1721,6 @@ def _run_benchmark(
     print(f"\n  Benchmarking {len(available_methods)} method(s)")
 
     common_kw = dict(
-        tiling=tiling,
-        max_tile_xy=max_tile_xy,
-        max_tile_z=max_tile_z,
         device=device,
         na=na,
         refractive_index=refractive_index,

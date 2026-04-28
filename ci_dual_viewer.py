@@ -11,20 +11,25 @@ from typing import Optional
 
 import numpy as np
 from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QPainter, QPixmap, QWheelEvent
+from PyQt6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSlider,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -174,18 +179,35 @@ def _project_stack(stack: np.ndarray, mode: str, z_index: int) -> np.ndarray:
     raise ValueError(f"Unsupported projection mode: {mode}")
 
 
+def _percentile_from_hist(bin_edges: np.ndarray, counts: np.ndarray, pct: float) -> float:
+    """Return a percentile value from a precomputed histogram (fast, O(n_bins))."""
+    total = int(counts.sum())
+    if total == 0:
+        return float(bin_edges[0])
+    target = pct / 100.0 * total
+    cumsum = np.cumsum(counts)
+    idx = int(np.searchsorted(cumsum, target))
+    idx = min(idx, len(bin_edges) - 2)
+    prev_cum = int(cumsum[idx - 1]) if idx > 0 else 0
+    bin_frac = (target - prev_cum) / max(float(counts[idx]), 1.0)
+    return float(bin_edges[idx] + bin_frac * (bin_edges[idx + 1] - bin_edges[idx]))
+
+
 def _composite_to_pixmap(
-    slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float]]],
+    slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]],
 ) -> QPixmap:
     if not slices:
         return QPixmap()
     height, width = slices[0][0].shape
     canvas = np.zeros((height, width, 3), dtype=np.float64)
-    for arr, (cr, cg, cb), (lo, hi) in slices:
+    for arr, (cr, cg, cb), (lo, hi, gamma) in slices:
         if hi <= lo:
             hi = lo + 1.0
         norm = (arr.astype(np.float64) - lo) / (hi - lo)
         np.clip(norm, 0.0, 1.0, out=norm)
+        gamma_safe = max(float(gamma), 1e-3)
+        if abs(gamma_safe - 1.0) > 1e-6:
+            np.power(norm, 1.0 / gamma_safe, out=norm)
         canvas[..., 0] += norm * (cr / 255.0)
         canvas[..., 1] += norm * (cg / 255.0)
         canvas[..., 2] += norm * (cb / 255.0)
@@ -372,7 +394,7 @@ class _PaneWidget(QWidget):
 
     def load_3d(
         self,
-        stacks: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float]]],
+        stacks: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]],
         *,
         method: str,
         slider_val: float,
@@ -396,9 +418,9 @@ class _PaneWidget(QWidget):
             if reference_shape is None:
                 reference_shape = tuple(int(v) for v in stack.shape)
             work = stack[::downsample, ::downsample, ::downsample] if downsample > 1 else stack
-            lo, hi = contrast
+            lo, hi, gamma = contrast
             gain = slider_val if _VOLUME_METHOD_UI[method]["role"] == "gain" else 1.0
-            data = self._prepare_volume_data(work, lo, hi, method, gain)
+            data = self._prepare_volume_data(work, lo, hi, gamma, method, gain)
             cmap = _ChannelColormap(color, translucent_boost=(method == "translucent"))
             volume = vispy_scene.visuals.Volume(
                 data,
@@ -501,6 +523,7 @@ class _PaneWidget(QWidget):
         stack: np.ndarray,
         lo: float,
         hi: float,
+        gamma: float,
         method: str,
         gain: float,
     ) -> np.ndarray:
@@ -508,6 +531,9 @@ class _PaneWidget(QWidget):
         denom = hi - lo if hi > lo else 1.0
         volume = (volume - lo) / denom
         np.clip(volume, 0.0, 1.0, out=volume)
+        gamma_safe = max(float(gamma), 1e-3)
+        if abs(gamma_safe - 1.0) > 1e-6:
+            np.power(volume, 1.0 / gamma_safe, out=volume)
         if method == "translucent":
             np.power(volume, 0.5, out=volume)
             volume *= gain
@@ -525,6 +551,808 @@ class _PaneWidget(QWidget):
         self._schedule_camera_emit()
 
 
+class _HistogramWidget(QWidget):
+    markerDragged = pyqtSignal(str, str, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._original_bin_edges = np.array([0.0, 1.0], dtype=np.float64)
+        self._deconvolved_bin_edges = np.array([0.0, 1.0], dtype=np.float64)
+        self._original_counts = np.zeros(1, dtype=np.float64)
+        self._deconvolved_counts = np.zeros(1, dtype=np.float64)
+        self._channel_color = (255, 255, 255)
+        self._original_range = (0.0, 1.0)
+        self._deconvolved_range = (0.0, 1.0)
+        self._has_original = False
+        self._has_deconvolved = False
+        self._log_scale = True
+        self._drag_target: tuple[str, str] | None = None
+        self._plot_rects: dict[str, QRectF] = {}
+        self.setMinimumHeight(240)
+
+    def set_histogram(
+        self,
+        original_bin_edges: np.ndarray,
+        deconvolved_bin_edges: np.ndarray,
+        original_counts: np.ndarray,
+        deconvolved_counts: np.ndarray,
+        channel_color: tuple[int, int, int],
+        original_range: tuple[float, float],
+        deconvolved_range: tuple[float, float],
+        has_original: bool,
+        has_deconvolved: bool,
+        *,
+        log_scale: bool,
+    ) -> None:
+        self._original_bin_edges = np.asarray(original_bin_edges, dtype=np.float64)
+        self._deconvolved_bin_edges = np.asarray(deconvolved_bin_edges, dtype=np.float64)
+        self._original_counts = np.asarray(original_counts, dtype=np.float64)
+        self._deconvolved_counts = np.asarray(deconvolved_counts, dtype=np.float64)
+        self._channel_color = tuple(int(v) for v in channel_color)
+        self._original_range = (float(original_range[0]), float(original_range[1]))
+        self._deconvolved_range = (float(deconvolved_range[0]), float(deconvolved_range[1]))
+        self._has_original = bool(has_original)
+        self._has_deconvolved = bool(has_deconvolved)
+        self._log_scale = bool(log_scale)
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#1a1d20"))
+
+        outer_rect = self.rect().adjusted(12, 12, -12, -28)
+        if outer_rect.width() <= 0 or outer_rect.height() <= 0:
+            return
+
+        any_original = self._has_original and self._original_counts.size > 0 and np.any(self._original_counts > 0)
+        any_deconvolved = (
+            self._has_deconvolved
+            and self._deconvolved_counts.size > 0
+            and np.any(self._deconvolved_counts > 0)
+        )
+        if (
+            self._original_bin_edges.size < 2
+            and self._deconvolved_bin_edges.size < 2
+        ) or (not any_original and not any_deconvolved):
+            painter.setPen(QColor("#aeb4ba"))
+            painter.drawText(outer_rect, Qt.AlignmentFlag.AlignCenter, "No histogram data")
+            return
+
+        gap = 12
+        half_height = max((outer_rect.height() - gap) / 2.0, 32.0)
+        original_rect = QRectF(
+            outer_rect.left(),
+            outer_rect.top(),
+            outer_rect.width(),
+            half_height,
+        )
+        deconvolved_rect = QRectF(
+            outer_rect.left(),
+            original_rect.bottom() + gap,
+            outer_rect.width(),
+            half_height,
+        )
+        self._plot_rects = {
+            "original": original_rect,
+            "deconvolved": deconvolved_rect,
+        }
+
+        if any_original:
+            y_original = np.log1p(self._original_counts) if self._log_scale else self._original_counts
+            max_count_original = max(1.0, float(np.max(y_original)))
+        else:
+            y_original = np.zeros_like(self._original_counts, dtype=np.float64)
+            max_count_original = 1.0
+        if any_deconvolved:
+            y_deconvolved = (
+                np.log1p(self._deconvolved_counts)
+                if self._log_scale
+                else self._deconvolved_counts
+            )
+            max_count_deconvolved = max(1.0, float(np.max(y_deconvolved)))
+        else:
+            y_deconvolved = np.zeros_like(self._deconvolved_counts, dtype=np.float64)
+            max_count_deconvolved = 1.0
+
+        def _x_for_value(value: float, rect: QRectF, bin_edges: np.ndarray) -> int:
+            axis_min = float(bin_edges[0])
+            axis_max = float(bin_edges[-1]) if float(bin_edges[-1]) > axis_min else axis_min + 1.0
+            pct = (float(value) - axis_min) / max(axis_max - axis_min, 1e-12)
+            pct = min(max(pct, 0.0), 1.0)
+            return int(rect.left() + pct * rect.width())
+
+        def _draw_histogram(
+            rect: QRectF,
+            title: str,
+            bin_edges: np.ndarray,
+            values: np.ndarray,
+            color: QColor,
+            width_px: int,
+            value_range: tuple[float, float],
+            max_count: float,
+        ) -> None:
+            painter.fillRect(rect.adjusted(1, 1, -1, -1), QColor("#0b0c0e"))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#343a40")))
+            painter.drawRect(rect)
+            painter.setPen(QColor("#d7dce1"))
+            painter.drawText(
+                rect.adjusted(6, 4, -6, -4),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                title,
+            )
+            pen = QPen(color, max(1, width_px - 1))
+            painter.setPen(pen)
+            baseline = int(rect.bottom()) - 1
+            width = max(int(rect.width()), 1)
+            top = int(rect.top()) + 20
+            height = max(baseline - top, 1)
+            n_bins = max(len(bin_edges) - 1, 1)
+            column_values = np.zeros(width, dtype=np.float64)
+            if len(values):
+                x_columns = ((np.arange(n_bins, dtype=np.float64) + 0.5) * width / n_bins).astype(np.int32)
+                np.clip(x_columns, 0, width - 1, out=x_columns)
+                np.maximum.at(column_values, x_columns, np.asarray(values[:n_bins], dtype=np.float64))
+            for col, value in enumerate(column_values):
+                if value <= 0:
+                    continue
+                x = int(rect.left()) + col
+                y = baseline - int((float(value) / max_count) * height)
+                y = max(y, top)
+                painter.drawLine(x, baseline, x, y)
+            marker_pen = QPen(color, 2)
+            painter.setPen(marker_pen)
+            for edge_value in value_range:
+                x = _x_for_value(edge_value, rect, bin_edges)
+                painter.drawLine(x, int(rect.top()), x, int(rect.bottom()))
+                painter.setBrush(color)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(x - 4, baseline - 4, 8, 8)
+                painter.setPen(marker_pen)
+            axis_min = float(bin_edges[0])
+            axis_max = float(bin_edges[-1]) if float(bin_edges[-1]) > axis_min else axis_min + 1.0
+            axis_label_rect = rect.adjusted(4, 0, -4, 0)
+            painter.setPen(QColor("#d7dce1"))
+            painter.drawText(
+                axis_label_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
+                f"{axis_min:.1f}",
+            )
+            painter.drawText(
+                axis_label_rect,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+                f"{axis_max:.1f}",
+            )
+
+        r, g, b = self._channel_color
+        if any_original:
+            _draw_histogram(
+                original_rect,
+                "Original",
+                self._original_bin_edges,
+                y_original,
+                QColor(r, g, b, 220),
+                2,
+                self._original_range,
+                max_count_original,
+            )
+        else:
+            painter.fillRect(original_rect.adjusted(1, 1, -1, -1), QColor("#0b0c0e"))
+            painter.setPen(QPen(QColor("#343a40")))
+            painter.drawRect(original_rect)
+            painter.setPen(QColor("#70757c"))
+            painter.drawText(original_rect, Qt.AlignmentFlag.AlignCenter, "Original: no data")
+        if any_deconvolved:
+            _draw_histogram(
+                deconvolved_rect,
+                "Deconvolved",
+                self._deconvolved_bin_edges,
+                y_deconvolved,
+                QColor(r, g, b, 220),
+                2,
+                self._deconvolved_range,
+                max_count_deconvolved,
+            )
+        else:
+            painter.fillRect(deconvolved_rect.adjusted(1, 1, -1, -1), QColor("#0b0c0e"))
+            painter.setPen(QPen(QColor("#343a40")))
+            painter.drawRect(deconvolved_rect)
+            painter.setPen(QColor("#70757c"))
+            painter.drawText(deconvolved_rect, Qt.AlignmentFlag.AlignCenter, "Deconvolved: no data")
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        target = self._marker_at_position(event.position().x(), event.position().y())
+        if target is not None:
+            self._drag_target = target
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_target is not None:
+            pane, edge = self._drag_target
+            value = self._value_for_position(pane, event.position().x())
+            self.markerDragged.emit(pane, edge, value)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_target = None
+        super().mouseReleaseEvent(event)
+
+    def _marker_at_position(self, x_pos: float, y_pos: float) -> tuple[str, str] | None:
+        for pane, rect in self._plot_rects.items():
+            if not rect.contains(x_pos, y_pos):
+                continue
+            value_range = self._original_range if pane == "original" else self._deconvolved_range
+            for edge, value in (("min", value_range[0]), ("max", value_range[1])):
+                marker_x = self._value_for_marker_x(pane, value)
+                if abs(marker_x - x_pos) <= 8:
+                    return pane, edge
+        return None
+
+    def _value_for_marker_x(self, pane: str, value: float) -> float:
+        rect = self._plot_rects.get(pane)
+        if rect is None:
+            return 0.0
+        bin_edges = self._original_bin_edges if pane == "original" else self._deconvolved_bin_edges
+        axis_min = float(bin_edges[0])
+        axis_max = float(bin_edges[-1]) if float(bin_edges[-1]) > axis_min else axis_min + 1.0
+        pct = (float(value) - axis_min) / max(axis_max - axis_min, 1e-12)
+        pct = min(max(pct, 0.0), 1.0)
+        return rect.left() + pct * rect.width()
+
+    def _value_for_position(self, pane: str, x_pos: float) -> float:
+        rect = self._plot_rects.get(pane)
+        if rect is None:
+            return 0.0
+        bin_edges = self._original_bin_edges if pane == "original" else self._deconvolved_bin_edges
+        axis_min = float(bin_edges[0])
+        axis_max = float(bin_edges[-1]) if float(bin_edges[-1]) > axis_min else axis_min + 1.0
+        pct = (float(x_pos) - rect.left()) / max(rect.width(), 1e-12)
+        pct = min(max(pct, 0.0), 1.0)
+        return axis_min + pct * (axis_max - axis_min)
+
+
+class _AdvancedScalingWindow(QWidget):
+    closed = pyqtSignal()
+    channelVisibilityChanged = pyqtSignal(int, bool)
+    channelColorChanged = pyqtSignal(int, object)
+    channelLevelsChanged = pyqtSignal(int, object)
+    autoRequested = pyqtSignal(int)
+    resetRequested = pyqtSignal(int)
+
+    _SLIDER_STEPS = 1000
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("Advanced Scaling")
+        self.resize(420, 680)
+
+        self._updating = False
+        self._channel_names: list[str] = []
+        self._channel_colors: list[tuple[int, int, int]] = []
+        self._channel_visible: list[bool] = []
+        self._channel_levels: list[dict[str, object]] = []
+        self._channel_maxima: list[dict[str, float]] = []
+        self._histograms: list[dict[str, object]] = []
+        self._current_range_max: dict[str, float] = {"original": 1.0, "deconvolved": 1.0}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Channel", "Show"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._table.itemChanged.connect(self._on_item_changed)
+        self._table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        root.addWidget(self._table, stretch=1)
+
+        self._log_hist_check = QCheckBox("Log histogram")
+        self._log_hist_check.setChecked(True)
+        self._log_hist_check.toggled.connect(self._refresh_histogram)
+        root.addWidget(self._log_hist_check)
+
+        legend = QHBoxLayout()
+        self._original_legend = QLabel("Original")
+        self._original_legend.setStyleSheet("font-weight: 700;")
+        legend.addWidget(self._original_legend)
+        self._deconvolved_legend = QLabel("Deconvolved")
+        self._deconvolved_legend.setStyleSheet("font-weight: 700; color: #f3f4f6;")
+        legend.addWidget(self._deconvolved_legend)
+        legend.addStretch()
+        root.addLayout(legend)
+
+        self._histogram = _HistogramWidget()
+        self._histogram.markerDragged.connect(self._on_histogram_marker_dragged)
+        root.addWidget(self._histogram)
+
+        self._selected_label = QLabel("No channel selected")
+        self._selected_label.setStyleSheet("font-weight: 700;")
+        root.addWidget(self._selected_label)
+
+        root.addLayout(
+            self._build_value_row(
+                "Original min:",
+                "_original_min_slider",
+                "_original_min_spin",
+                self._on_original_min_slider,
+                self._on_original_min_spin,
+            )
+        )
+        root.addLayout(
+            self._build_value_row(
+                "Original max:",
+                "_original_max_slider",
+                "_original_max_spin",
+                self._on_original_max_slider,
+                self._on_original_max_spin,
+            )
+        )
+        root.addLayout(
+            self._build_value_row(
+                "Deconv min:",
+                "_deconv_min_slider",
+                "_deconv_min_spin",
+                self._on_deconv_min_slider,
+                self._on_deconv_min_spin,
+            )
+        )
+        root.addLayout(
+            self._build_value_row(
+                "Deconv max:",
+                "_deconv_max_slider",
+                "_deconv_max_spin",
+                self._on_deconv_max_slider,
+                self._on_deconv_max_spin,
+            )
+        )
+        root.addLayout(self._build_gamma_row())
+
+        buttons = QHBoxLayout()
+        self._auto_button = QPushButton("Auto")
+        self._auto_button.clicked.connect(self._on_auto_clicked)
+        buttons.addWidget(self._auto_button)
+        self._reset_button = QPushButton("Reset")
+        self._reset_button.clicked.connect(self._on_reset_clicked)
+        buttons.addWidget(self._reset_button)
+        buttons.addStretch()
+        self._close_button = QPushButton("Close")
+        self._close_button.clicked.connect(self.close)
+        buttons.addWidget(self._close_button)
+        root.addLayout(buttons)
+
+    def _build_value_row(self, label_text: str, slider_name: str, spin_name: str, slider_slot, spin_slot) -> QHBoxLayout:
+        layout = QHBoxLayout()
+        layout.setSpacing(8)
+        label = QLabel(label_text)
+        label.setMinimumWidth(88)
+        layout.addWidget(label)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, self._SLIDER_STEPS)
+        slider.valueChanged.connect(slider_slot)
+        setattr(self, slider_name, slider)
+        layout.addWidget(slider, stretch=1)
+        spin = QDoubleSpinBox()
+        spin.setDecimals(3)
+        spin.setSingleStep(1.0)
+        spin.setRange(0.0, 1.0)
+        spin.valueChanged.connect(spin_slot)
+        setattr(self, spin_name, spin)
+        layout.addWidget(spin)
+        return layout
+
+    def _build_gamma_row(self) -> QHBoxLayout:
+        layout = QHBoxLayout()
+        layout.setSpacing(8)
+        label = QLabel("Viewer gamma:")
+        label.setMinimumWidth(88)
+        layout.addWidget(label)
+        self._gamma_slider = QSlider(Qt.Orientation.Horizontal)
+        self._gamma_slider.setRange(10, 500)
+        self._gamma_slider.valueChanged.connect(self._on_gamma_slider)
+        layout.addWidget(self._gamma_slider, stretch=1)
+        self._gamma_spin = QDoubleSpinBox()
+        self._gamma_spin.setDecimals(2)
+        self._gamma_spin.setRange(0.10, 5.00)
+        self._gamma_spin.setSingleStep(0.05)
+        self._gamma_spin.valueChanged.connect(self._on_gamma_spin)
+        layout.addWidget(self._gamma_spin)
+        return layout
+
+    def set_channel_data(
+        self,
+        names: list[str],
+        colors: list[tuple[int, int, int]],
+        visible: list[bool],
+        levels: list[dict[str, object]],
+        maxima: list[dict[str, float]],
+        histograms: list[dict[str, object]],
+    ) -> None:
+        selected_row = self.current_channel()
+        if selected_row < 0:
+            selected_row = 0
+
+        self._channel_names = list(names)
+        self._channel_colors = list(colors)
+        self._channel_visible = list(visible)
+        self._channel_levels = [dict(level) for level in levels]
+        self._channel_maxima = [dict(v) for v in maxima]
+        self._histograms = [dict(v) for v in histograms]
+
+        self._updating = True
+        self._table.blockSignals(True)
+        self._table.setRowCount(len(names))
+        for row, name in enumerate(names):
+            name_item = QTableWidgetItem(name)
+            name_item.setIcon(self._color_icon(colors[row]))
+            name_item.setData(Qt.ItemDataRole.ForegroundRole, QColor(*colors[row]))
+            self._table.setItem(row, 0, name_item)
+
+            show_item = self._table.item(row, 1)
+            if show_item is None:
+                show_item = QTableWidgetItem("")
+                show_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                self._table.setItem(row, 1, show_item)
+            show_item.setCheckState(
+                Qt.CheckState.Checked if visible[row] else Qt.CheckState.Unchecked
+            )
+        self._table.blockSignals(False)
+        self._updating = False
+
+        if names:
+            selected_row = max(0, min(selected_row, len(names) - 1))
+            self._table.selectRow(selected_row)
+        self._refresh_selected_channel()
+
+    def set_channel_visibility(self, index: int, visible: bool) -> None:
+        if index < 0 or index >= self._table.rowCount():
+            return
+        item = self._table.item(index, 1)
+        if item is None:
+            return
+        self._updating = True
+        item.setCheckState(Qt.CheckState.Checked if visible else Qt.CheckState.Unchecked)
+        self._updating = False
+        if index < len(self._channel_visible):
+            self._channel_visible[index] = bool(visible)
+
+    def set_channel_color(self, index: int, color: tuple[int, int, int]) -> None:
+        if index < 0 or index >= self._table.rowCount():
+            return
+        rgb = tuple(int(v) for v in color)
+        if index < len(self._channel_colors):
+            self._channel_colors[index] = rgb
+        item = self._table.item(index, 0)
+        if item is not None:
+            item.setIcon(self._color_icon(rgb))
+            item.setData(Qt.ItemDataRole.ForegroundRole, QColor(*rgb))
+        self._refresh_histogram()
+
+    def current_channel(self) -> int:
+        selection_model = self._table.selectionModel()
+        indexes = selection_model.selectedRows() if selection_model else []
+        if not indexes:
+            return -1
+        return int(indexes[0].row())
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def _color_icon(self, color: tuple[int, int, int]) -> QIcon:
+        pix = QPixmap(12, 12)
+        pix.fill(QColor(*color))
+        return QIcon(pix)
+
+    def _value_to_slider(self, value: float) -> int:
+        return self._value_to_slider_for_max(value, 1.0)
+
+    def _value_to_slider_for_max(self, value: float, range_max: float) -> int:
+        if range_max <= 0:
+            return 0
+        return int(round((float(value) / range_max) * self._SLIDER_STEPS))
+
+    def _slider_to_value(self, slider_value: int) -> float:
+        return self._slider_to_value_for_max(slider_value, 1.0)
+
+    def _slider_to_value_for_max(self, slider_value: int, range_max: float) -> float:
+        if range_max <= 0:
+            return 0.0
+        return float(slider_value) / self._SLIDER_STEPS * range_max
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self._log_hist_check,
+            self._gamma_slider,
+            self._gamma_spin,
+            self._auto_button,
+            self._reset_button,
+        ):
+            widget.setEnabled(enabled)
+
+    def _refresh_selected_channel(self) -> None:
+        idx = self.current_channel()
+        if idx < 0 or idx >= len(self._channel_levels):
+            self._selected_label.setText("No channel selected")
+            self._set_controls_enabled(False)
+            self._set_range_controls_enabled("original", False)
+            self._set_range_controls_enabled("deconvolved", False)
+            return
+
+        self._set_controls_enabled(True)
+        self._selected_label.setText(self._channel_names[idx])
+        maxima = self._channel_maxima[idx] if idx < len(self._channel_maxima) else {}
+        original_range_max = max(float(maxima.get("original", 0.0)), 1.0)
+        deconvolved_range_max = max(float(maxima.get("deconvolved", 0.0)), 1.0)
+        self._current_range_max = {
+            "original": original_range_max,
+            "deconvolved": deconvolved_range_max,
+        }
+
+        levels = self._normalize_levels(idx)
+        self._updating = True
+        self._apply_range_controls("original", levels["original"], original_range_max)
+        self._apply_range_controls("deconvolved", levels["deconvolved"], deconvolved_range_max)
+        self._gamma_spin.setValue(float(levels["gamma"]))
+        self._gamma_slider.setValue(int(round(float(levels["gamma"]) * 100)))
+        self._updating = False
+
+        histogram = self._histograms[idx] if idx < len(self._histograms) else {}
+        has_original = bool(histogram.get("has_original", False))
+        has_deconvolved = bool(histogram.get("has_deconvolved", False))
+        self._set_range_controls_enabled("original", has_original)
+        self._set_range_controls_enabled("deconvolved", has_deconvolved)
+        self._refresh_histogram()
+
+    def _refresh_histogram(self) -> None:
+        idx = self.current_channel()
+        if idx < 0 or idx >= len(self._histograms):
+            return
+        histogram = self._histograms[idx]
+        levels = self._normalize_levels(idx)
+        color = self._channel_colors[idx] if idx < len(self._channel_colors) else (255, 255, 255)
+        legend_style = f"font-weight: 700; color: rgb({color[0]},{color[1]},{color[2]});"
+        self._original_legend.setStyleSheet(
+            legend_style
+            if bool(histogram.get("has_original", False))
+            else "font-weight: 700; color: #70757c;"
+        )
+        self._deconvolved_legend.setStyleSheet(
+            legend_style
+            if bool(histogram.get("has_deconvolved", False))
+            else "font-weight: 700; color: #70757c;"
+        )
+        self._histogram.set_histogram(
+            np.asarray(histogram.get("original_bin_edges", np.array([0.0, 1.0], dtype=np.float64))),
+            np.asarray(histogram.get("deconvolved_bin_edges", np.array([0.0, 1.0], dtype=np.float64))),
+            np.asarray(histogram.get("original", np.zeros(1, dtype=np.float64))),
+            np.asarray(histogram.get("deconvolved", np.zeros(1, dtype=np.float64))),
+            color,
+            (
+                float(levels["original"]["min"]),
+                float(levels["original"]["max"]),
+            ),
+            (
+                float(levels["deconvolved"]["min"]),
+                float(levels["deconvolved"]["max"]),
+            ),
+            has_original=bool(histogram.get("has_original", False)),
+            has_deconvolved=bool(histogram.get("has_deconvolved", False)),
+            log_scale=self._log_hist_check.isChecked(),
+        )
+
+    def _apply_selected_levels(
+        self,
+        *,
+        pane: Optional[str] = None,
+        lo: Optional[float] = None,
+        hi: Optional[float] = None,
+        gamma: Optional[float] = None,
+        emit: bool = True,
+    ) -> None:
+        idx = self.current_channel()
+        if idx < 0 or idx >= len(self._channel_levels):
+            return
+        levels = self._normalize_levels(idx)
+        original = dict(levels["original"])
+        deconvolved = dict(levels["deconvolved"])
+        gamma_val = float(levels["gamma"] if gamma is None else gamma)
+
+        if pane == "original":
+            lo_val = float(original["min"] if lo is None else lo)
+            hi_val = float(original["max"] if hi is None else hi)
+            pane_max = self._current_range_max["original"]
+            lo_val = min(max(lo_val, 0.0), pane_max)
+            hi_val = min(max(hi_val, lo_val), pane_max)
+            original = {"min": lo_val, "max": hi_val}
+        elif pane == "deconvolved":
+            lo_val = float(deconvolved["min"] if lo is None else lo)
+            hi_val = float(deconvolved["max"] if hi is None else hi)
+            pane_max = self._current_range_max["deconvolved"]
+            lo_val = min(max(lo_val, 0.0), pane_max)
+            hi_val = min(max(hi_val, lo_val), pane_max)
+            deconvolved = {"min": lo_val, "max": hi_val}
+
+        gamma_val = min(max(gamma_val, 0.10), 5.00)
+        self._channel_levels[idx] = {
+            "original": original,
+            "deconvolved": deconvolved,
+            "gamma": gamma_val,
+        }
+
+        self._updating = True
+        self._apply_range_controls("original", original, self._current_range_max["original"])
+        self._apply_range_controls("deconvolved", deconvolved, self._current_range_max["deconvolved"])
+        self._gamma_spin.setValue(gamma_val)
+        self._gamma_slider.setValue(int(round(gamma_val * 100)))
+        self._updating = False
+        self._refresh_histogram()
+        if emit:
+            self.channelLevelsChanged.emit(
+                idx,
+                {
+                    "original": dict(original),
+                    "deconvolved": dict(deconvolved),
+                    "gamma": gamma_val,
+                },
+            )
+
+    def _normalize_levels(self, index: int) -> dict[str, object]:
+        maxima = self._channel_maxima[index] if index < len(self._channel_maxima) else {}
+        original_max = max(float(maxima.get("original", 0.0)), 0.0)
+        deconvolved_max = max(float(maxima.get("deconvolved", 0.0)), 0.0)
+
+        levels = dict(self._channel_levels[index]) if index < len(self._channel_levels) else {}
+        original = dict(levels.get("original") or {"min": 0.0, "max": original_max})
+        deconvolved = dict(levels.get("deconvolved") or {"min": 0.0, "max": deconvolved_max})
+        gamma = min(max(float(levels.get("gamma", 1.0)), 0.10), 5.00)
+
+        original["min"] = min(max(float(original.get("min", 0.0)), 0.0), original_max)
+        original["max"] = min(max(float(original.get("max", original_max)), original["min"]), original_max)
+        deconvolved["min"] = min(max(float(deconvolved.get("min", 0.0)), 0.0), deconvolved_max)
+        deconvolved["max"] = min(max(float(deconvolved.get("max", deconvolved_max)), deconvolved["min"]), deconvolved_max)
+
+        normalized = {
+            "original": {"min": float(original["min"]), "max": float(original["max"])},
+            "deconvolved": {"min": float(deconvolved["min"]), "max": float(deconvolved["max"])},
+            "gamma": gamma,
+        }
+        if index < len(self._channel_levels):
+            self._channel_levels[index] = normalized
+        return normalized
+
+    def _apply_range_controls(self, pane: str, values: dict[str, float], range_max: float) -> None:
+        min_slider = getattr(self, f"_{'original' if pane == 'original' else 'deconv'}_min_slider")
+        max_slider = getattr(self, f"_{'original' if pane == 'original' else 'deconv'}_max_slider")
+        min_spin = getattr(self, f"_{'original' if pane == 'original' else 'deconv'}_min_spin")
+        max_spin = getattr(self, f"_{'original' if pane == 'original' else 'deconv'}_max_spin")
+        min_spin.setRange(0.0, range_max)
+        max_spin.setRange(0.0, range_max)
+        min_spin.setValue(float(values["min"]))
+        max_spin.setValue(float(values["max"]))
+        min_slider.setValue(self._value_to_slider_for_max(float(values["min"]), range_max))
+        max_slider.setValue(self._value_to_slider_for_max(float(values["max"]), range_max))
+
+    def _set_range_controls_enabled(self, pane: str, enabled: bool) -> None:
+        prefix = "_original" if pane == "original" else "_deconv"
+        for suffix in ("_min_slider", "_min_spin", "_max_slider", "_max_spin"):
+            getattr(self, f"{prefix}{suffix}").setEnabled(enabled)
+
+    def _on_selection_changed(self) -> None:
+        if self._updating:
+            return
+        self._refresh_selected_channel()
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating or item.column() != 1:
+            return
+        visible = item.checkState() == Qt.CheckState.Checked
+        row = item.row()
+        if row < len(self._channel_visible):
+            self._channel_visible[row] = visible
+        self.channelVisibilityChanged.emit(row, visible)
+
+    def _on_cell_double_clicked(self, row: int, column: int) -> None:
+        if column != 0 or row < 0 or row >= len(self._channel_colors):
+            return
+        color = QColorDialog.getColor(QColor(*self._channel_colors[row]), self, "Select channel color")
+        if not color.isValid():
+            return
+        self.channelColorChanged.emit(row, (color.red(), color.green(), color.blue()))
+
+    def _on_original_min_slider(self, value: int) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(
+            pane="original",
+            lo=self._slider_to_value_for_max(value, self._current_range_max["original"]),
+        )
+
+    def _on_original_min_spin(self, value: float) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(pane="original", lo=float(value))
+
+    def _on_original_max_slider(self, value: int) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(
+            pane="original",
+            hi=self._slider_to_value_for_max(value, self._current_range_max["original"]),
+        )
+
+    def _on_original_max_spin(self, value: float) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(pane="original", hi=float(value))
+
+    def _on_deconv_min_slider(self, value: int) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(
+            pane="deconvolved",
+            lo=self._slider_to_value_for_max(value, self._current_range_max["deconvolved"]),
+        )
+
+    def _on_deconv_min_spin(self, value: float) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(pane="deconvolved", lo=float(value))
+
+    def _on_deconv_max_slider(self, value: int) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(
+            pane="deconvolved",
+            hi=self._slider_to_value_for_max(value, self._current_range_max["deconvolved"]),
+        )
+
+    def _on_deconv_max_spin(self, value: float) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(pane="deconvolved", hi=float(value))
+
+    def _on_gamma_slider(self, value: int) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(gamma=float(value) / 100.0)
+
+    def _on_gamma_spin(self, value: float) -> None:
+        if self._updating:
+            return
+        self._apply_selected_levels(gamma=float(value))
+
+    def _on_auto_clicked(self) -> None:
+        idx = self.current_channel()
+        if idx >= 0:
+            self.autoRequested.emit(idx)
+
+    def _on_reset_clicked(self) -> None:
+        idx = self.current_channel()
+        if idx >= 0:
+            self.resetRequested.emit(idx)
+
+    def _on_histogram_marker_dragged(self, pane: str, edge: str, value: float) -> None:
+        if pane == "original":
+            self._apply_selected_levels(pane="original", lo=value if edge == "min" else None, hi=value if edge == "max" else None)
+        elif pane == "deconvolved":
+            self._apply_selected_levels(pane="deconvolved", lo=value if edge == "min" else None, hi=value if edge == "max" else None)
+
+
 class DualViewerWidget(QWidget):
     timepointChanged = pyqtSignal(int)
 
@@ -536,6 +1364,9 @@ class DualViewerWidget(QWidget):
         self._preview_by_t: dict[int, list[np.ndarray]] = {}
         self._channel_buttons: list[QPushButton] = []
         self._channel_colors: list[tuple[int, int, int]] = []
+        self._channel_scaling: list[dict[str, float]] = []
+        self._advanced_scaling_window: Optional[_AdvancedScalingWindow] = None
+        self._advanced_scaling_active = False
         self._available_volume_methods = list(_VOLUME_METHODS)
         self._active_volume_method = _VOLUME_METHODS[0]
         self._volume_method_values = {
@@ -544,6 +1375,20 @@ class DualViewerWidget(QWidget):
         self._syncing_camera = False
         self._reset_3d_on_next_render = False
         self._fit_on_next_render = False
+        # Histogram cache: id(numpy_array) -> (bin_edges, counts).
+        # Cleared when new image data is loaded so stale entries don't accumulate.
+        self._hist_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        # SUM projection cache: id(stack) -> precomputed 2-D sum plane.
+        # Held here so the array stays alive and its id() is stable for
+        # _hist_cache keying (SUM values are n_z× larger than stack values
+        # and need their own histogram range).
+        self._sum_cache: dict[int, np.ndarray] = {}
+        # Debounce timer for 2-D contrast changes: only redraw 300 ms after the
+        # last spin-box change, avoiding expensive re-renders on every keystroke.
+        self._contrast_2d_timer = QTimer(self)
+        self._contrast_2d_timer.setSingleShot(True)
+        self._contrast_2d_timer.setInterval(300)
+        self._contrast_2d_timer.timeout.connect(self._refresh_view)
         self._refresh_3d_timer = QTimer(self)
         self._refresh_3d_timer.setSingleShot(True)
         self._refresh_3d_timer.setInterval(150)
@@ -602,8 +1447,8 @@ class DualViewerWidget(QWidget):
         self._fit_button.clicked.connect(self.fit_views)
         top.addWidget(self._fit_button)
 
-        lo_group = QWidget()
-        lo_layout = QHBoxLayout(lo_group)
+        self._lo_group = QWidget()
+        lo_layout = QHBoxLayout(self._lo_group)
         lo_layout.setContentsMargins(0, 0, 0, 0)
         lo_layout.setSpacing(6)
         lo_layout.addWidget(QLabel("Lo%:"))
@@ -614,10 +1459,10 @@ class DualViewerWidget(QWidget):
         self._lo_spin.setValue(0.1)
         self._lo_spin.valueChanged.connect(self._on_contrast_changed)
         lo_layout.addWidget(self._lo_spin)
-        top.addWidget(lo_group)
+        top.addWidget(self._lo_group)
 
-        hi_group = QWidget()
-        hi_layout = QHBoxLayout(hi_group)
+        self._hi_group = QWidget()
+        hi_layout = QHBoxLayout(self._hi_group)
         hi_layout.setContentsMargins(0, 0, 0, 0)
         hi_layout.setSpacing(6)
         hi_layout.addWidget(QLabel("Hi%:"))
@@ -628,7 +1473,11 @@ class DualViewerWidget(QWidget):
         self._hi_spin.setValue(100.0)
         self._hi_spin.valueChanged.connect(self._on_contrast_changed)
         hi_layout.addWidget(self._hi_spin)
-        top.addWidget(hi_group)
+        top.addWidget(self._hi_group)
+
+        self._advanced_scaling_button = QPushButton("Advanced Scaling")
+        self._advanced_scaling_button.clicked.connect(self._open_advanced_scaling)
+        top.addWidget(self._advanced_scaling_button)
         top.addStretch()
 
         root.addLayout(top)
@@ -717,6 +1566,8 @@ class DualViewerWidget(QWidget):
         root.addWidget(self._time_bar)
 
     def set_input_data(self, channels: list[np.ndarray], metadata: dict) -> None:
+        self._hist_cache.clear()
+        self._sum_cache.clear()
         self._input_channels = channels
         self._loaded_input_timepoint = None
         self._metadata = metadata
@@ -724,6 +1575,7 @@ class DualViewerWidget(QWidget):
         channels_meta = self._display_channels()
         self._channel_colors = _resolve_channel_colors(channels_meta)
         self._rebuild_channel_buttons(channels_meta)
+        self._reset_channel_scaling()
         self._refresh_volume_method_options(channels_meta)
         size_t = max(int(metadata.get("size_t", 1)), 1)
         size_z = max(int(metadata.get("size_z", 1)), 1)
@@ -741,20 +1593,40 @@ class DualViewerWidget(QWidget):
         self._update_labels()
         self._fit_on_next_render = True
         self._ensure_mode_valid()
+        self._sync_advanced_scaling_window()
         self._refresh_view()
 
     def set_input_timepoint_data(self, timepoint: int, channels_zyx: list[np.ndarray]) -> None:
+        self._hist_cache.clear()
+        self._sum_cache.clear()
         self._input_channels = list(channels_zyx)
         self._loaded_input_timepoint = int(timepoint)
+        self._ensure_channel_scaling_defaults()
         self._ensure_mode_valid()
+        self._sync_advanced_scaling_window()
         self._refresh_view()
 
     def clear_preview_results(self) -> None:
+        self._hist_cache.clear()
+        self._sum_cache.clear()
         self._preview_by_t.clear()
+        self._sync_advanced_scaling_window()
         self._refresh_view()
 
     def set_preview_result(self, timepoint: int, channels_zyx: list[np.ndarray]) -> None:
+        # Evict cached histograms and SUM planes for the previous deconvolved
+        # arrays at this timepoint so a rerun doesn't reuse stale data.
+        old = self._preview_by_t.get(int(timepoint))
+        if old:
+            for arr in old:
+                key = id(arr)
+                self._hist_cache.pop(key, None)
+                sum_plane = self._sum_cache.pop(key, None)
+                if sum_plane is not None:
+                    self._hist_cache.pop(id(sum_plane), None)
         self._preview_by_t[int(timepoint)] = channels_zyx
+        self._ensure_channel_scaling_defaults()
+        self._sync_advanced_scaling_window()
         self._refresh_view()
 
     def current_timepoint(self) -> int:
@@ -795,6 +1667,180 @@ class DualViewerWidget(QWidget):
     def refresh_view(self) -> None:
         self._refresh_view()
 
+    def _reset_channel_scaling(self) -> None:
+        self._channel_scaling = []
+        self._ensure_channel_scaling_defaults()
+
+    def _ensure_channel_scaling_defaults(self) -> None:
+        channel_count = len(self._display_channels())
+        while len(self._channel_scaling) < channel_count:
+            idx = len(self._channel_scaling)
+            self._channel_scaling.append(
+                {
+                    "original": {
+                        "min": 0.0,
+                        "max": self._pane_channel_max_value(idx, "original"),
+                    },
+                    "deconvolved": {
+                        "min": 0.0,
+                        "max": self._pane_channel_max_value(idx, "deconvolved"),
+                    },
+                    "gamma": 1.0,
+                }
+            )
+        if len(self._channel_scaling) > channel_count:
+            self._channel_scaling = self._channel_scaling[:channel_count]
+        for idx, state in enumerate(self._channel_scaling):
+            original_max = self._pane_channel_max_value(idx, "original")
+            deconvolved_max = self._pane_channel_max_value(idx, "deconvolved")
+            if not isinstance(state.get("original"), dict):
+                state["original"] = {"min": 0.0, "max": original_max}
+            if not isinstance(state.get("deconvolved"), dict):
+                state["deconvolved"] = {"min": 0.0, "max": deconvolved_max}
+            original_state = dict(state.get("original") or {})
+            deconvolved_state = dict(state.get("deconvolved") or {})
+            if original_max > 0.0 and float(original_state.get("max", 0.0)) <= 0.0:
+                original_state["max"] = original_max
+            if deconvolved_max > 0.0 and float(deconvolved_state.get("max", 0.0)) <= 0.0:
+                deconvolved_state["max"] = deconvolved_max
+            state["original"] = original_state
+            state["deconvolved"] = deconvolved_state
+            state["gamma"] = min(max(float(state.get("gamma", 1.0)), 0.10), 5.00)
+
+    def _set_advanced_scaling_active(self, active: bool) -> None:
+        self._advanced_scaling_active = bool(active)
+        enabled = not self._advanced_scaling_active
+        self._lo_group.setEnabled(enabled)
+        self._hi_group.setEnabled(enabled)
+        if self._advanced_scaling_active:
+            self._advanced_scaling_button.setStyleSheet("font-weight: 700;")
+        else:
+            self._advanced_scaling_button.setStyleSheet("")
+
+    def _ensure_advanced_scaling_window(self) -> _AdvancedScalingWindow:
+        if self._advanced_scaling_window is None:
+            window = _AdvancedScalingWindow(self)
+            window.closed.connect(self._on_advanced_scaling_closed)
+            window.channelVisibilityChanged.connect(self._on_advanced_channel_visibility_changed)
+            window.channelColorChanged.connect(self._on_advanced_channel_color_changed)
+            window.channelLevelsChanged.connect(self._on_advanced_channel_levels_changed)
+            window.autoRequested.connect(self._on_advanced_channel_auto_requested)
+            window.resetRequested.connect(self._on_advanced_channel_reset_requested)
+            self._advanced_scaling_window = window
+        return self._advanced_scaling_window
+
+    def _open_advanced_scaling(self) -> None:
+        if not self._display_channels():
+            return
+        window = self._ensure_advanced_scaling_window()
+        self._sync_advanced_scaling_window()
+        self._set_advanced_scaling_active(True)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self._refresh_view()
+
+    def _on_advanced_scaling_closed(self) -> None:
+        self._set_advanced_scaling_active(False)
+        self._refresh_view()
+
+    def _sync_advanced_scaling_window(self) -> None:
+        window = self._advanced_scaling_window
+        if window is None:
+            return
+        self._ensure_channel_scaling_defaults()
+        channels = self._display_channels()
+        visible = [btn.isChecked() for btn in self._channel_buttons]
+        names = [str(ch.get("name", f"Ch {idx}")) for idx, ch in enumerate(channels)]
+        colors = [
+            self._channel_colors[idx] if idx < len(self._channel_colors) else _FALLBACK_PALETTE[idx % len(_FALLBACK_PALETTE)]
+            for idx in range(len(channels))
+        ]
+        maxima = [self._channel_maxima(idx) for idx in range(len(channels))]
+        histograms = [self._channel_histogram_bundle(idx) for idx in range(len(channels))]
+        window.set_channel_data(
+            names,
+            colors,
+            visible,
+            self._channel_scaling[:len(channels)],
+            maxima,
+            histograms,
+        )
+
+    def _pane_channel_source(self, index: int, pane: str) -> Optional[np.ndarray]:
+        if pane == "original":
+            if 0 <= index < len(self._input_channels):
+                return self._input_channels[index]
+            return None
+        preview = self._preview_by_t.get(self.current_timepoint())
+        if preview and 0 <= index < len(preview):
+            return preview[index]
+        return None
+
+    def _pane_channel_max_value(self, index: int, pane: str) -> float:
+        source = self._pane_channel_source(index, pane)
+        if source is None:
+            return 0.0
+        arr = np.asarray(source, dtype=np.float64)
+        if arr.size == 0:
+            return 0.0
+        try:
+            max_val = float(np.nanmax(arr))
+        except ValueError:
+            return 0.0
+        if not np.isfinite(max_val):
+            return 0.0
+        return max(max_val, 0.0)
+
+    def _channel_maxima(self, index: int) -> dict[str, float]:
+        original_max = self._pane_channel_max_value(index, "original")
+        deconvolved_max = self._pane_channel_max_value(index, "deconvolved")
+        return {
+            "original": original_max,
+            "deconvolved": deconvolved_max,
+            "shared": max(original_max, deconvolved_max, 1.0),
+        }
+
+    def _channel_histogram_counts(self, index: int, pane: str, hist_max: float) -> np.ndarray:
+        source = self._pane_channel_source(index, pane)
+        if source is None:
+            return np.zeros(512, dtype=np.int64)
+        arr = np.asarray(source, dtype=np.float64)
+        if arr.size == 0:
+            return np.zeros(512, dtype=np.int64)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return np.zeros(512, dtype=np.int64)
+        finite = np.clip(finite, 0.0, hist_max)
+        counts, _ = np.histogram(finite, bins=512, range=(0.0, hist_max))
+        return counts.astype(np.int64, copy=False)
+
+    def _channel_histogram_bundle(self, index: int) -> dict[str, object]:
+        maxima = self._channel_maxima(index)
+        original_hist_max = max(float(maxima.get("original", 0.0)), 1.0)
+        deconvolved_hist_max = max(float(maxima.get("deconvolved", 0.0)), 1.0)
+        return {
+            "original_bin_edges": np.linspace(0.0, original_hist_max, 513, dtype=np.float64),
+            "deconvolved_bin_edges": np.linspace(0.0, deconvolved_hist_max, 513, dtype=np.float64),
+            "original": self._channel_histogram_counts(index, "original", original_hist_max),
+            "deconvolved": self._channel_histogram_counts(index, "deconvolved", deconvolved_hist_max),
+            "has_original": self._pane_channel_source(index, "original") is not None,
+            "has_deconvolved": self._pane_channel_source(index, "deconvolved") is not None,
+        }
+
+    def _channel_contrast(self, stack: np.ndarray, index: int, pane: str, projection: str = "Slice") -> tuple[float, float, float]:
+        if self._advanced_scaling_active and 0 <= index < len(self._channel_scaling):
+            maxima = self._channel_maxima(index)
+            pane_max = max(float(maxima.get(pane, 0.0)), 0.0)
+            levels = self._channel_scaling[index]
+            pane_levels = dict(levels.get(pane) or {})
+            lo = min(max(float(pane_levels.get("min", 0.0)), 0.0), pane_max)
+            hi = min(max(float(pane_levels.get("max", pane_max)), lo), pane_max)
+            gamma = min(max(float(levels.get("gamma", 1.0)), 0.10), 5.00)
+            return lo, hi, gamma
+        lo, hi = self._cached_percentiles(stack, self._lo_spin.value(), self._hi_spin.value(), projection)
+        return lo, hi, 1.0
+
     def _display_channels(self) -> list[dict]:
         channels = list(self._metadata.get("channels", []))
         names = self._metadata.get("channel_names", [])
@@ -819,17 +1865,38 @@ class DualViewerWidget(QWidget):
         self._channel_buttons.clear()
         for i, channel in enumerate(channels):
             name = channel.get("name", f"Ch {i}")
-            r, g, b = self._channel_colors[i]
             btn = QPushButton(name)
             btn.setCheckable(True)
             btn.setChecked(bool(channel.get("active", True)))
-            btn.setStyleSheet(
-                f"QPushButton {{ color: rgb({r},{g},{b}); font-weight: bold; border: 2px solid rgb({r},{g},{b}); padding: 2px 8px; }}"
-                f"QPushButton:checked {{ background-color: rgba({r},{g},{b},60); }}"
-            )
-            btn.toggled.connect(self._refresh_view)
+            btn.toggled.connect(lambda checked, idx=i: self._on_channel_button_toggled(idx, checked))
             self._channel_bar.insertWidget(self._channel_bar.count() - 1, btn)
             self._channel_buttons.append(btn)
+            self._apply_channel_button_style(i)
+
+    def _apply_channel_button_style(self, index: int) -> None:
+        if index < 0 or index >= len(self._channel_buttons) or index >= len(self._channel_colors):
+            return
+        r, g, b = self._channel_colors[index]
+        self._channel_buttons[index].setStyleSheet(
+            f"QPushButton {{ color: rgb({r},{g},{b}); font-weight: bold; border: 2px solid rgb({r},{g},{b}); padding: 2px 8px; }}"
+            f"QPushButton:checked {{ background-color: rgba({r},{g},{b},60); }}"
+        )
+
+    def _on_channel_button_toggled(self, index: int, checked: bool) -> None:
+        window = self._advanced_scaling_window
+        if window is not None:
+            window.set_channel_visibility(index, checked)
+        self._refresh_view()
+
+    def _set_channel_button_checked(self, index: int, checked: bool) -> None:
+        if index < 0 or index >= len(self._channel_buttons):
+            return
+        btn = self._channel_buttons[index]
+        if btn.isChecked() == checked:
+            return
+        btn.blockSignals(True)
+        btn.setChecked(checked)
+        btn.blockSignals(False)
 
     def _active_channel_indices(self) -> list[int]:
         return [
@@ -853,13 +1920,112 @@ class DualViewerWidget(QWidget):
     def _on_time_changed(self, value: int) -> None:
         self._update_labels()
         self.timepointChanged.emit(value)
+        self._sync_advanced_scaling_window()
         self._refresh_view()
 
     def _on_contrast_changed(self) -> None:
         if self._mode_combo.currentText() == _THREE_D_MODE:
             self._schedule_3d_refresh()
         else:
-            self._refresh_view()
+            # Debounce: wait until the user pauses before re-rendering, so
+            # rapidly spinning the spinbox doesn't queue dozens of expensive
+            # percentile + pixmap operations.
+            self._contrast_2d_timer.start()
+
+    def _on_advanced_channel_visibility_changed(self, index: int, visible: bool) -> None:
+        self._set_channel_button_checked(index, visible)
+        self._refresh_view()
+
+    def _on_advanced_channel_color_changed(self, index: int, color: object) -> None:
+        if index < 0 or index >= len(self._channel_colors):
+            return
+        rgb = tuple(int(v) for v in color)
+        self._channel_colors[index] = rgb
+        channels_meta = self._metadata.setdefault("channels", [])
+        while len(channels_meta) <= index:
+            channels_meta.append({})
+        channels_meta[index]["color"] = rgb
+        self._apply_channel_button_style(index)
+        if self._advanced_scaling_window is not None:
+            self._advanced_scaling_window.set_channel_color(index, rgb)
+        self._refresh_view()
+
+    def _on_advanced_channel_levels_changed(self, index: int, payload: object) -> None:
+        if index < 0:
+            return
+        self._ensure_channel_scaling_defaults()
+        if index >= len(self._channel_scaling):
+            return
+        data = dict(payload) if isinstance(payload, dict) else {}
+        original = dict(data.get("original") or self._channel_scaling[index].get("original") or {})
+        deconvolved = dict(data.get("deconvolved") or self._channel_scaling[index].get("deconvolved") or {})
+        gamma = float(data.get("gamma", self._channel_scaling[index].get("gamma", 1.0)))
+        self._channel_scaling[index] = {
+            "original": {
+                "min": float(original.get("min", 0.0)),
+                "max": float(original.get("max", self._pane_channel_max_value(index, "original"))),
+            },
+            "deconvolved": {
+                "min": float(deconvolved.get("min", 0.0)),
+                "max": float(deconvolved.get("max", self._pane_channel_max_value(index, "deconvolved"))),
+            },
+            "gamma": gamma,
+        }
+        self._on_contrast_changed()
+
+    def _on_advanced_channel_auto_requested(self, index: int) -> None:
+        if index < 0 or index >= len(self._channel_scaling):
+            return
+        bundle = self._channel_histogram_bundle(index)
+        original_bin_edges = np.asarray(bundle["original_bin_edges"], dtype=np.float64)
+        deconvolved_bin_edges = np.asarray(bundle["deconvolved_bin_edges"], dtype=np.float64)
+        original_counts = np.asarray(bundle["original"], dtype=np.float64)
+        deconvolved_counts = np.asarray(bundle["deconvolved"], dtype=np.float64)
+        original_max = self._pane_channel_max_value(index, "original")
+        deconvolved_max = self._pane_channel_max_value(index, "deconvolved")
+        if bool(bundle.get("has_original", False)) and np.any(original_counts > 0):
+            original_lo = _percentile_from_hist(original_bin_edges, original_counts, self._lo_spin.value())
+            original_hi = _percentile_from_hist(original_bin_edges, original_counts, self._hi_spin.value())
+        else:
+            original_lo = 0.0
+            original_hi = original_max
+        if bool(bundle.get("has_deconvolved", False)) and np.any(deconvolved_counts > 0):
+            deconvolved_lo = _percentile_from_hist(deconvolved_bin_edges, deconvolved_counts, self._lo_spin.value())
+            deconvolved_hi = _percentile_from_hist(deconvolved_bin_edges, deconvolved_counts, self._hi_spin.value())
+        else:
+            deconvolved_lo = 0.0
+            deconvolved_hi = deconvolved_max
+        gamma = float(self._channel_scaling[index].get("gamma", 1.0))
+        self._channel_scaling[index] = {
+            "original": {
+                "min": float(max(original_lo, 0.0)),
+                "max": float(min(max(original_hi, original_lo), original_max)),
+            },
+            "deconvolved": {
+                "min": float(max(deconvolved_lo, 0.0)),
+                "max": float(min(max(deconvolved_hi, deconvolved_lo), deconvolved_max)),
+            },
+            "gamma": gamma,
+        }
+        self._sync_advanced_scaling_window()
+        self._on_contrast_changed()
+
+    def _on_advanced_channel_reset_requested(self, index: int) -> None:
+        if index < 0 or index >= len(self._channel_scaling):
+            return
+        self._channel_scaling[index] = {
+            "original": {
+                "min": 0.0,
+                "max": self._pane_channel_max_value(index, "original"),
+            },
+            "deconvolved": {
+                "min": 0.0,
+                "max": self._pane_channel_max_value(index, "deconvolved"),
+            },
+            "gamma": 1.0,
+        }
+        self._sync_advanced_scaling_window()
+        self._on_contrast_changed()
 
     def _on_volume_method_changed(self, index: int) -> None:
         if index < 0 or index >= len(self._available_volume_methods):
@@ -958,13 +2124,13 @@ class DualViewerWidget(QWidget):
         self._input_pane.set_mode(_TWO_D_MODE)
         self._output_pane.set_mode(_TWO_D_MODE)
 
-        input_pixmap = self._build_2d_pixmap(self._input_channels, projection)
+        input_pixmap = self._build_2d_pixmap(self._input_channels, projection, pane="original")
         self._input_pane.set_pixmap(input_pixmap)
 
         preview = self._preview_by_t.get(timepoint)
         if preview:
             output_was_placeholder = self._output_pane._display_stack.currentIndex() == 1
-            output_pixmap = self._build_2d_pixmap(preview, projection)
+            output_pixmap = self._build_2d_pixmap(preview, projection, pane="deconvolved")
             self._output_pane.set_pixmap(output_pixmap)
             if output_was_placeholder:
                 self._output_pane.copy_2d_view_from(self._input_pane)
@@ -989,7 +2155,7 @@ class DualViewerWidget(QWidget):
             input_camera_state = self._input_pane.camera_state()
             output_camera_state = self._output_pane.camera_state()
 
-        input_stacks = self._build_3d_channel_payload(self._input_channels)
+        input_stacks = self._build_3d_channel_payload(self._input_channels, pane="original")
         self._input_pane.load_3d(
             input_stacks,
             method=self._active_volume_method,
@@ -1004,7 +2170,7 @@ class DualViewerWidget(QWidget):
         preview = self._preview_by_t.get(timepoint)
         if preview:
             output_was_placeholder = self._output_pane._display_stack.currentIndex() == 1
-            output_stacks = self._build_3d_channel_payload(preview)
+            output_stacks = self._build_3d_channel_payload(preview, pane="deconvolved")
             self._output_pane.load_3d(
                 output_stacks,
                 method=self._active_volume_method,
@@ -1023,40 +2189,64 @@ class DualViewerWidget(QWidget):
             )
         self._reset_3d_on_next_render = False
 
+    def _cached_percentiles(
+        self, stack: np.ndarray, lo_pct: float, hi_pct: float, projection: str = "Slice"
+    ) -> tuple[float, float]:
+        """Return (lo, hi) contrast limits using a per-array cached histogram.
+
+        For Slice/MIP the 3-D stack is used directly — its value range covers
+        both projections.  For SUM the summed plane is cached separately (in
+        ``_sum_cache``) so it stays alive with a stable id(); SUM values are
+        n_z× larger than per-slice values and need their own histogram range.
+        """
+        if projection == "SUM":
+            stack_key = id(stack)
+            if stack_key not in self._sum_cache:
+                self._sum_cache[stack_key] = stack.sum(axis=0).astype(np.float64)
+            src = self._sum_cache[stack_key]
+        else:
+            src = stack
+        key = id(src)
+        if key not in self._hist_cache:
+            flat = src.ravel()
+            vmin, vmax = float(flat.min()), float(flat.max())
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+            counts, bin_edges = np.histogram(flat, bins=1024, range=(vmin, vmax))
+            self._hist_cache[key] = (bin_edges, counts)
+        bin_edges, counts = self._hist_cache[key]
+        lo = _percentile_from_hist(bin_edges, counts, lo_pct)
+        hi = _percentile_from_hist(bin_edges, counts, hi_pct)
+        return lo, hi
+
     def _build_2d_pixmap(
         self,
         channels_zyx: list[np.ndarray],
         projection: str,
+        *,
+        pane: str,
     ) -> QPixmap:
-        slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float]]] = []
-        lo_pct = self._lo_spin.value()
-        hi_pct = self._hi_spin.value()
+        slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]] = []
         for idx in self._active_channel_indices():
             if idx >= len(channels_zyx):
                 continue
             stack = channels_zyx[idx]
             plane = _project_stack(stack, projection, self._z_slider.value())
-            contrast_src = stack if projection == "Slice" else plane
-            lo = float(np.percentile(contrast_src, lo_pct))
-            hi = float(np.percentile(contrast_src, hi_pct))
-            slices.append((plane, self._channel_colors[idx], (lo, hi)))
+            slices.append((plane, self._channel_colors[idx], self._channel_contrast(stack, idx, pane, projection)))
         return _composite_to_pixmap(slices)
 
     def _build_3d_channel_payload(
         self,
         channels_zyx: list[np.ndarray],
-    ) -> list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float]]]:
-        result: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float]]] = []
-        lo_pct = self._lo_spin.value()
-        hi_pct = self._hi_spin.value()
+        *,
+        pane: str,
+    ) -> list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]]:
+        result: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float, float]]] = []
         for idx in self._active_channel_indices():
             if idx >= len(channels_zyx):
                 continue
             stack = channels_zyx[idx]
-            mid_z = min(stack.shape[0] // 2, stack.shape[0] - 1)
-            lo = float(np.percentile(stack[mid_z], lo_pct))
-            hi = float(np.percentile(stack[mid_z], hi_pct))
-            result.append((stack, self._channel_colors[idx], (lo, hi)))
+            result.append((stack, self._channel_colors[idx], self._channel_contrast(stack, idx, pane)))
         return result
 
     def _reset_3d_views(self) -> None:

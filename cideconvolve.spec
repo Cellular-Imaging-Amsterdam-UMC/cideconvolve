@@ -1,0 +1,231 @@
+# cideconvolve.spec — PyInstaller build spec (single-file)
+# Build with:  pyinstaller cideconvolve.spec
+#              (run from the repository root)
+#
+# Produces:  dist/cideconvolve.exe  (single-file executable)
+#
+# NOTE: The .exe icon requires a Windows .ico file.
+#       Convert icon.svg to icon.ico first, e.g. with Inkscape:
+#           inkscape icon.svg --export-type=png --export-filename=icon.png
+#           python -c "from PIL import Image; Image.open('icon.png').save('icon.ico')"
+#       Or use an online SVG→ICO converter and place icon.ico in this folder.
+
+import os
+import pkgutil
+from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+block_cipher = None
+
+# ── Collect full PyQt6 ecosystem ──────────────────────────────────────────────
+pyqt6_datas, pyqt6_binaries, pyqt6_hiddenimports = collect_all('PyQt6')
+
+# ── Collect vispy (optional 3-D viewer in ci_dual_viewer) ────────────────────
+vispy_datas, vispy_binaries, vispy_hiddenimports = collect_all('vispy')
+
+# ── Collect torch (GPU deconvolution in deconvolve_ci) ───────────────────────
+torch_datas, torch_binaries, torch_hiddenimports = collect_all('torch')
+
+# ── Collect zarr + numcodecs (zarr I/O support) ──────────────────────────────
+zarr_datas, zarr_binaries, zarr_hiddenimports = collect_all('zarr')
+numcodecs_datas, numcodecs_binaries, numcodecs_hiddenimports = collect_all('numcodecs')
+
+# ── Collect OME metadata stack (bioio → ome-types → xsdata) ─────────────────
+ome_datas,    ome_binaries,    ome_hiddenimports    = collect_all('ome_types')
+xsdata_datas, xsdata_binaries, xsdata_hiddenimports = collect_all('xsdata')
+xspb_datas,   xspb_binaries,   xspb_hiddenimports   = collect_all('xsdata_pydantic_basemodel')
+
+# ── Collect pydantic (runtime validation used by ome-types / bioio) ──────────
+pyd_datas,  pyd_binaries,  pyd_hiddenimports  = collect_all('pydantic')
+pyde_datas, pyde_binaries, pyde_hiddenimports = collect_all('pydantic_extra_types')
+
+# ── Collect dask (lazy array loading in bioio) ───────────────────────────────
+dask_datas, dask_binaries, dask_hiddenimports = collect_all('dask')
+
+# ── Collect OpenGL (vispy rendering back-end) ────────────────────────────────
+ogl_datas, ogl_binaries, ogl_hiddenimports = collect_all('OpenGL')
+
+# ── Collect full OMERO + Ice ecosystem ───────────────────────────────────────
+omero_datas, omero_binaries, omero_hiddenimports = collect_all('omero')
+# Top-level Ice stubs generated as separate modules (omero_model_*, Glacier2_*, etc.)
+ice_toplevel = [
+    name for _, name, _ in pkgutil.iter_modules()
+    if name.startswith(('omero_', 'Glacier2', 'IcePatch2', 'IceBox', 'IceGrid', 'IceStorm'))
+]
+
+# ── Collect imagecodecs (TIFF/OME-TIFF codec extensions required by tifffile) ─
+imc_datas, imc_binaries, imc_hiddenimports = collect_all('imagecodecs')
+
+# ── Collect omero_browser_qt (icons + source used by tree_model.__file__) ─────
+obqt_datas, obqt_binaries, obqt_hiddenimports = collect_all('omero_browser_qt')
+
+# ── Collect bioio reader plugins (as installed per requirements_gui.txt) ─────
+bioio_datas,    bioio_binaries,    bioio_hiddenimports    = collect_all('bioio')
+bioio_b_datas,  bioio_b_binaries,  bioio_b_hiddenimports  = collect_all('bioio_base')
+bioio_ot_datas, bioio_ot_binaries, bioio_ot_hiddenimports = collect_all('bioio_ome_tiff')
+bioio_oz_datas, bioio_oz_binaries, bioio_oz_hiddenimports = collect_all('bioio_ome_zarr')
+bioio_cz_datas, bioio_cz_binaries, bioio_cz_hiddenimports = collect_all('bioio_czi')
+bioio_nd_datas, bioio_nd_binaries, bioio_nd_hiddenimports = collect_all('bioio_nd2')
+
+# ── Resolve exe icon (needs .ico on Windows) ─────────────────────────────────
+_icon = 'icon.ico' if os.path.exists('icon.ico') else None
+
+a = Analysis(
+    ['gui_deconvolve_ci.py'],
+    pathex=['.'],
+    binaries=(
+        pyqt6_binaries + vispy_binaries + ogl_binaries + torch_binaries
+        + zarr_binaries + numcodecs_binaries
+        + ome_binaries + omero_binaries + obqt_binaries
+        + xsdata_binaries + xspb_binaries
+        + pyd_binaries + pyde_binaries + dask_binaries
+        + imc_binaries
+        + bioio_binaries + bioio_b_binaries
+        + bioio_ot_binaries + bioio_oz_binaries
+        + bioio_cz_binaries + bioio_nd_binaries
+    ),
+    datas=[
+        ('icon.svg', '.'),          # runtime window icon (loaded by the app)
+    ] + pyqt6_datas + vispy_datas + ogl_datas + torch_datas
+      + zarr_datas + numcodecs_datas
+      + ome_datas + omero_datas + obqt_datas
+      + xsdata_datas + xspb_datas
+      + pyd_datas + pyde_datas + dask_datas
+      + imc_datas
+      + bioio_datas + bioio_b_datas
+      + bioio_ot_datas + bioio_oz_datas
+      + bioio_cz_datas + bioio_nd_datas,
+    hiddenimports=[
+        # ── local modules ───────────────────────────────────────────────────
+        'ci_dual_viewer',
+        'deconvolve_ci',
+        'deconvolve',
+        'wrapper',
+        # ── numeric / array ─────────────────────────────────────────────────
+        'numpy',
+        'numpy.core',
+        'numpy.lib',
+        # ── image I/O ───────────────────────────────────────────────────────
+        'nd2',
+        'tifffile',
+        'bioio',
+        'bioio.writers',
+        'bioio_base',
+        'bioio_base.types',
+        'bioio_ome_tiff',           # bioio reader plugin for OME-TIFF
+        'bioio_ome_zarr',           # bioio reader plugin for OME-Zarr
+        'bioio_nd2',                # bioio reader plugin for ND2
+        'bioio_czi',                # bioio reader plugin for CZI
+        # ── vispy back-end ──────────────────────────────────────────────────
+        'vispy',
+        'vispy.scene',
+        'vispy.color',
+        'vispy.visuals',
+        'vispy.visuals.volume',
+        'vispy.visuals.transforms',
+        'vispy.app.backends._pyqt6',
+        # ── OpenGL (vispy renderer) ─────────────────────────────────────────
+        'OpenGL',
+        'OpenGL.GL',
+        'OpenGL.platform.win32',
+        # ── OMERO + Ice (optional Open OMERO… button) ───────────────────────
+        'omero',
+        'omero.gateway',
+        'omero.util',
+        'omero.util.sessions',
+        'omero.rtypes',
+        'omero.model',
+        'omero.api',
+        'omero.sys',
+        'omero.clients',
+        'omero.cmd',
+        'omero.cmd.graphs',
+        'Ice',
+        'IcePy',
+        'Glacier2',
+        'omero_browser_qt',
+        'omero_browser_qt.browser_dialog',
+        'omero_browser_qt.gateway',
+        'omero_browser_qt.image_loader',
+        'omero_browser_qt.login_dialog',
+        'omero_browser_qt.rendering',
+        'omero_browser_qt.scale_bar',
+        'omero_browser_qt.selection_context',
+        'omero_browser_qt.tree_model',
+        'omero_browser_qt.widgets',
+        'omero_browser_qt.view_backends',
+        # ── GPU / hardware monitoring ───────────────────────────────────────
+        'psutil',
+        'pynvml',
+        # ── OME metadata / serialisation stack ─────────────────────────────
+        'ome_types',
+        'xsdata',
+        'xsdata_pydantic_basemodel',
+        'xsdata_pydantic_basemodel.hooks',
+        'xsdata_pydantic_basemodel.hooks.class_type',
+        'xsdata_pydantic_basemodel.hooks.cli',
+        'pydantic',
+        'pydantic_extra_types',
+        # ── dask (lazy loading) ─────────────────────────────────────────────
+        'dask',
+        'dask.array',
+        'dask.dataframe',
+        # ── numcodecs (zarr compression codecs) ─────────────────────────────
+        'numcodecs',
+        'numcodecs.abc',
+        'numcodecs.blosc',
+        'numcodecs.zstd',
+        'numcodecs.gzip',
+        'numcodecs.lz4',
+        'numcodecs.lzma',
+        'numcodecs.zlib',
+        'numcodecs.bz2',
+        'numcodecs.compat',
+        'numcodecs.registry',
+    ] + pyqt6_hiddenimports + vispy_hiddenimports + ogl_hiddenimports
+      + torch_hiddenimports
+      + zarr_hiddenimports + numcodecs_hiddenimports
+      + ome_hiddenimports + omero_hiddenimports + obqt_hiddenimports + ice_toplevel
+      + xsdata_hiddenimports + xspb_hiddenimports
+      + pyd_hiddenimports + pyde_hiddenimports + dask_hiddenimports
+      + imc_hiddenimports
+      + bioio_hiddenimports + bioio_b_hiddenimports
+      + bioio_ot_hiddenimports + bioio_oz_hiddenimports
+      + bioio_cz_hiddenimports + bioio_nd_hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        'PyQt5', 'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets',
+        'tkinter', '_tkinter',
+        'scipy', 'sklearn', 'IPython', 'matplotlib',
+        'pytest',
+        'notebook', 'nbformat', 'jupyter',
+        'zmq', 'jedi', 'parso',
+        'mkdocs', 'mkdocstrings',
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    name='cideconvolve',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    icon=_icon,             # icon.ico (see note at the top of this file)
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
