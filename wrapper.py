@@ -15,6 +15,7 @@ Usage (local):
 import csv
 import logging
 import os
+import platform
 import shutil
 import sys
 import threading
@@ -119,12 +120,68 @@ def _format_bytes(mb):
 
 def _normalise_image(arr: np.ndarray) -> np.ndarray:
     """Normalise image to [0, 1] range."""
-    img = np.asarray(arr, dtype=np.float64)
+    img = np.asarray(arr, dtype=np.float32)
     lo = float(np.min(img))
     hi = float(np.max(img))
     if hi <= lo:
-        return np.zeros_like(img, dtype=np.float64)
+        return np.zeros_like(img, dtype=np.float32)
     return (img - lo) / (hi - lo)
+
+
+_METRIC_MAX_Z = 32
+_METRIC_MAX_YX = 512
+_METRIC_RADIUS_CACHE: dict[tuple[int, ...], tuple[np.ndarray, float]] = {}
+
+
+def _metric_stride_slice(size: int, limit: int) -> slice:
+    """Return a deterministic stride slice capped to roughly limit samples."""
+    if size <= limit:
+        return slice(None)
+    return slice(0, size, int(np.ceil(size / limit)))
+
+
+def _metric_sample(arr: np.ndarray) -> np.ndarray:
+    """Sample image data before expensive metric calculations."""
+    data = np.asarray(arr)
+    if data.ndim == 3:
+        slices = (
+            _metric_stride_slice(data.shape[0], _METRIC_MAX_Z),
+            _metric_stride_slice(data.shape[1], _METRIC_MAX_YX),
+            _metric_stride_slice(data.shape[2], _METRIC_MAX_YX),
+        )
+    elif data.ndim == 2:
+        slices = (
+            _metric_stride_slice(data.shape[0], _METRIC_MAX_YX),
+            _metric_stride_slice(data.shape[1], _METRIC_MAX_YX),
+        )
+    else:
+        slices = tuple(_metric_stride_slice(size, _METRIC_MAX_YX) for size in data.shape)
+    return np.asarray(data[slices])
+
+
+def _metric_sample_summary(arr: np.ndarray) -> str:
+    """Return a compact description of metric sampling."""
+    data = np.asarray(arr)
+    sampled = _metric_sample(data)
+    if data.shape == sampled.shape:
+        return f"full shape {data.shape}"
+    return f"full shape {data.shape} -> sampled {sampled.shape}"
+
+
+def _metric_frequency_radius(shape: tuple[int, ...]) -> tuple[np.ndarray, float]:
+    """Return cached frequency radius grid and max radius for a sampled shape."""
+    cached = _METRIC_RADIUS_CACHE.get(shape)
+    if cached is not None:
+        return cached
+    freq_axes = np.meshgrid(
+        *[np.fft.fftfreq(n) for n in shape],
+        indexing="ij",
+    )
+    radius = np.sqrt(sum(axis ** 2 for axis in freq_axes))
+    max_radius = float(np.max(radius)) or 1.0
+    cached = (radius, max_radius)
+    _METRIC_RADIUS_CACHE[shape] = cached
+    return cached
 
 
 def _mean_or_zero(values: list[float]) -> float:
@@ -132,60 +189,267 @@ def _mean_or_zero(values: list[float]) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
-def _no_reference_metrics(arr: np.ndarray) -> dict[str, float]:
-    """Compute no-reference quality metrics for a single channel.
-    
-    Returns:
-        dict with 'sharpness', 'contrast', 'noise_proxy' keys.
-    """
-    img = _normalise_image(arr)
-    p1 = float(np.percentile(img, 1))
-    p99 = float(np.percentile(img, 99))
-    q1 = float(np.percentile(img, 25))
-    q3 = float(np.percentile(img, 75))
+def _deconvolution_effect_metrics(arr: np.ndarray) -> dict[str, float]:
+    """Compute no-reference metrics that better describe deconvolution effects."""
+    img = _normalise_image(_metric_sample(arr))
+    centered = img - float(np.mean(img))
+    fft_power = np.abs(np.fft.fftn(centered)) ** 2
+    total_power = float(np.sum(fft_power)) + 1e-12
+    radius, max_radius = _metric_frequency_radius(img.shape)
+    detail_energy = float(np.sum(fft_power[radius > 0.25 * max_radius]) / total_power)
 
-    try:
-        from scipy import ndimage
+    gradient_axes = tuple(i for i, size in enumerate(img.shape) if size > 1)
+    if gradient_axes:
+        grads = np.gradient(img, axis=gradient_axes)
+        if isinstance(grads, np.ndarray):
+            grads = [grads]
+        edge_strength = float(np.mean(np.sqrt(sum(g ** 2 for g in grads))))
+    else:
+        edge_strength = 0.0
 
-        if img.ndim == 3:
-            lap_vars = [float(np.var(ndimage.laplace(z))) for z in img]
-            sharpness = float(np.mean(lap_vars)) if lap_vars else 0.0
-        else:
-            sharpness = float(np.var(ndimage.laplace(img)))
-    except ImportError:
-        grads = np.gradient(img.astype(np.float64))
-        sharpness = float(np.mean([np.var(g) for g in grads])) if grads else 0.0
+    p005 = float(np.percentile(img, 0.5))
+    p95 = float(np.percentile(img, 95))
+    p995 = float(np.percentile(img, 99.5))
+    bright = img >= p95
+    if np.any(bright):
+        bright_power = np.abs(np.fft.fftn(centered * bright.astype(np.float32))) ** 2
+        bright_total = float(np.sum(bright_power)) + 1e-12
+        bright_detail_energy = float(np.sum(bright_power[radius > 0.25 * max_radius]) / bright_total)
+    else:
+        bright_detail_energy = 0.0
+    flat = np.sort(img.ravel())
+    total_intensity = float(np.sum(flat))
+    if flat.size and total_intensity > 1e-12:
+        index = np.arange(1, flat.size + 1, dtype=np.float64)
+        signal_sparsity = float((2.0 * np.sum(index * flat)) / (flat.size * total_intensity) - (flat.size + 1.0) / flat.size)
+    else:
+        signal_sparsity = 0.0
 
     return {
-        "sharpness": sharpness,
-        "contrast": p99 - p1,
-        "noise_proxy": q3 - q1,
+        "detail_energy": detail_energy,
+        "bright_detail_energy": bright_detail_energy,
+        "edge_strength": edge_strength,
+        "signal_sparsity": signal_sparsity,
+        "robust_range": p995 - p005,
     }
 
 
 def _quality_metrics(
     result_channels: list[np.ndarray],
 ) -> dict[str, float | int]:
-    """Compute aggregate quality metrics from deconvolved channels.
-    
-    Returns:
-        dict with 'channels_compared', 'sharpness_mean', 'contrast_mean', 'noise_proxy_mean'.
-    """
-    sharpness_vals: list[float] = []
-    contrast_vals: list[float] = []
-    noise_vals: list[float] = []
+    """Compute aggregate deconvolution-effect metrics from channels."""
+    metric_values: dict[str, list[float]] = {
+        "detail_energy": [],
+        "bright_detail_energy": [],
+        "edge_strength": [],
+        "signal_sparsity": [],
+        "robust_range": [],
+    }
 
     for result in result_channels:
-        nr = _no_reference_metrics(result)
-        sharpness_vals.append(nr["sharpness"])
-        contrast_vals.append(nr["contrast"])
-        noise_vals.append(nr["noise_proxy"])
+        metrics = _deconvolution_effect_metrics(result)
+        for key in metric_values:
+            metric_values[key].append(metrics[key])
+    out: dict[str, float | int] = {"channels_compared": len(result_channels)}
+    for key, values in metric_values.items():
+        out[f"{key}_mean"] = _mean_or_zero(values)
+    return out
+
+
+def _format_duration(seconds: float) -> str:
+    """Format elapsed seconds for console output."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {sec:.1f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {sec:.1f}s"
+
+
+def _format_value(value, unit: str = "", digits: int = 4) -> str:
+    """Format optional metadata values compactly."""
+    if value is None:
+        return "?"
+    if isinstance(value, float):
+        text = f"{value:.{digits}g}"
+    else:
+        text = str(value)
+    return f"{text} {unit}".rstrip()
+
+
+def _array_stats(arr: np.ndarray) -> dict[str, float | int | str | tuple[int, ...]]:
+    """Return robust descriptive statistics for one image channel."""
+    data = np.asarray(arr)
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return {
+            "shape": data.shape,
+            "dtype": str(data.dtype),
+            "bytes_mb": data.nbytes / (1024 * 1024),
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "p1": 0.0,
+            "p50": 0.0,
+            "p99": 0.0,
+            "nonzero_percent": 0.0,
+        }
     return {
-        "channels_compared": len(result_channels),
-        "sharpness_mean": _mean_or_zero(sharpness_vals),
-        "contrast_mean": _mean_or_zero(contrast_vals),
-        "noise_proxy_mean": _mean_or_zero(noise_vals),
+        "shape": data.shape,
+        "dtype": str(data.dtype),
+        "bytes_mb": data.nbytes / (1024 * 1024),
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+        "p1": float(np.percentile(finite, 1)),
+        "p50": float(np.percentile(finite, 50)),
+        "p99": float(np.percentile(finite, 99)),
+        "nonzero_percent": float(np.count_nonzero(data) / data.size * 100) if data.size else 0.0,
     }
+
+
+def _print_runtime_environment() -> None:
+    """Print platform and dependency details relevant to performance."""
+    print("\nRuntime environment")
+    print(f"  Timestamp    : {time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"  Platform     : {platform.platform()}")
+    print(f"  Python       : {platform.python_version()} ({sys.executable})")
+    print(f"  NumPy        : {np.__version__}")
+    try:
+        import torch
+        print(f"  PyTorch      : {torch.__version__}")
+        print(f"  CUDA avail.  : {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"  CUDA version : {torch.version.cuda or '?'}")
+            for idx in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(idx)
+                print(
+                    f"  GPU {idx}       : {props.name} "
+                    f"({_format_bytes(props.total_memory / (1024 * 1024))})"
+                )
+    except Exception as exc:
+        print(f"  PyTorch      : unavailable ({exc})")
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        print(f"  CPU cores    : {psutil.cpu_count(logical=False) or '?'} physical, "
+              f"{psutil.cpu_count(logical=True) or '?'} logical")
+        print(f"  System RAM   : {_format_bytes(vm.total / (1024 * 1024))}")
+    except Exception:
+        pass
+
+
+def _print_image_details(filename: str, img_path: Path, meta: dict, images: list[np.ndarray]) -> None:
+    """Print detailed source image metadata and channel statistics."""
+    print("\n  Loaded image")
+    print(f"    File       : {filename}")
+    print(f"    Path       : {img_path}")
+    if img_path.exists() and img_path.is_file():
+        print(f"    File size  : {_format_bytes(img_path.stat().st_size / (1024 * 1024))}")
+    print(f"    Channels   : {len(images)}")
+    print(f"    Dimensions : X={meta.get('size_x', '?')}  Y={meta.get('size_y', '?')}  "
+          f"Z={meta.get('size_z', '?')}  C={meta.get('size_c', len(images))}  "
+          f"T={meta.get('size_t', '?')}")
+    print(f"    Pixel size : XY={_format_value(meta.get('pixel_size_x'), 'um')}  "
+          f"Z={_format_value(meta.get('pixel_size_z'), 'um')}")
+    print(f"    Microscope : {meta.get('microscope_type', '?')}")
+    print(f"    Objective  : NA={_format_value(meta.get('na'))}  "
+          f"Mag={_format_value(meta.get('magnification'), 'x')}  "
+          f"Immersion={meta.get('immersion', '?')}")
+    print(f"    RI         : immersion={_format_value(meta.get('refractive_index'))}  "
+          f"sample={_format_value(meta.get('sample_refractive_index'))}")
+
+    channels = meta.get("channels", [])
+    names = meta.get("channel_names") or []
+    for i, img in enumerate(images):
+        stats = _array_stats(img)
+        ch_meta = channels[i] if i < len(channels) else {}
+        name = names[i] if i < len(names) else f"Ch{i}"
+        print(f"    Ch{i} {name}: shape={stats['shape']} dtype={stats['dtype']} "
+              f"data={_format_bytes(stats['bytes_mb'])}")
+        print(f"      wavelengths: em={_format_value(ch_meta.get('emission_wavelength'), 'nm')}  "
+              f"ex={_format_value(ch_meta.get('excitation_wavelength'), 'nm')}  "
+              f"mode={ch_meta.get('acquisition_mode', '?')}")
+        print(f"      intensity  : min={stats['min']:.4g} p1={stats['p1']:.4g} "
+              f"median={stats['p50']:.4g} mean={stats['mean']:.4g} "
+              f"p99={stats['p99']:.4g} max={stats['max']:.4g} "
+              f"nonzero={stats['nonzero_percent']:.1f}%")
+
+
+def _print_psf_details(psfs: list[np.ndarray]) -> None:
+    """Print PSF shape and normalization details."""
+    if not psfs:
+        return
+    print("\n  Generated PSFs")
+    for i, psf in enumerate(psfs):
+        arr = np.asarray(psf)
+        print(f"    Ch{i}: shape={arr.shape} dtype={arr.dtype} "
+              f"sum={float(arr.sum()):.6g} peak={float(arr.max()):.6g}")
+
+
+def _print_quality_comparison(source_channels: list[np.ndarray], result_channels: list[np.ndarray]) -> None:
+    """Print source/result metrics that describe deconvolution effects."""
+    def _change(src: float, res: float) -> str:
+        if abs(src) > 1e-12:
+            return f"{res / src:.2f}x"
+        return f"{res - src:.4g}"
+
+    metric_order = (
+        ("detail_energy", "Detail energy"),
+        ("bright_detail_energy", "Bright detail energy"),
+        ("edge_strength", "Edge strength"),
+        ("signal_sparsity", "Signal sparsity"),
+        ("robust_range", "Robust range"),
+    )
+    print("\n  Image metrics")
+    n_channels = min(len(source_channels), len(result_channels))
+    if n_channels:
+        print(f"    Metrics sample: {_metric_sample_summary(source_channels[0])} "
+              f"(caps: Z<=32, Y/X<=512)")
+    for ch_idx in range(n_channels):
+        source_q = _deconvolution_effect_metrics(source_channels[ch_idx])
+        result_q = _deconvolution_effect_metrics(result_channels[ch_idx])
+        print(f"    Channel {ch_idx}")
+        print("      Metric                 Source        Result      Change")
+        print("      -------------------------------------------------------")
+        for key, label in metric_order:
+            src = float(source_q.get(key, 0.0))
+            res = float(result_q.get(key, 0.0))
+            print(f"      {label:<18} {src:>11.4g} {res:>13.4g} { _change(src, res):>10}")
+    if n_channels > 1:
+        source_mean = _quality_metrics(source_channels[:n_channels])
+        result_mean = _quality_metrics(result_channels[:n_channels])
+        print("    Mean across channels")
+        print("      Metric                 Source        Result      Change")
+        print("      -------------------------------------------------------")
+        for key, label in metric_order:
+            mean_key = f"{key}_mean"
+            src = float(source_mean.get(mean_key, 0.0))
+            res = float(result_mean.get(mean_key, 0.0))
+            print(f"      {label:<18} {src:>11.4g} {res:>13.4g} { _change(src, res):>10}")
+
+
+def _print_resource_metrics(metrics: dict[str, float]) -> None:
+    """Print resource metrics gathered by _MetricsMonitor."""
+    gpu_delta = (
+        metrics.get("torch_gpu_delta_mb", 0.0)
+        if metrics.get("torch_gpu_delta_mb", 0.0) > 0
+        else metrics.get("gpu_mem_delta_peak_mb", 0.0)
+    )
+    print("\n  Resource metrics")
+    print(f"    Deconv time : {_format_duration(metrics.get('time_s', 0.0))}")
+    print(f"    CPU         : avg={metrics.get('cpu_percent_avg', 0.0):.0f}%  "
+          f"peak={metrics.get('cpu_percent_peak', 0.0):.0f}%")
+    print(f"    RAM         : peak={_format_bytes(metrics.get('ram_peak_mb', 0.0))}  "
+          f"delta={_format_bytes(metrics.get('ram_delta_peak_mb', 0.0))}  "
+          f"avg={_format_bytes(metrics.get('ram_avg_mb', 0.0))}")
+    if metrics.get("gpu_total_mb", 0.0) > 0 or metrics.get("gpu_mem_peak_mb", 0.0) > 0:
+        print(f"    GPU         : util avg={metrics.get('gpu_util_avg', 0.0):.0f}%  "
+              f"peak={metrics.get('gpu_util_peak', 0.0):.0f}%")
+        print(f"    VRAM        : peak={_format_bytes(metrics.get('gpu_mem_peak_mb', 0.0))}  "
+              f"delta={_format_bytes(gpu_delta)}  "
+              f"torch peak={_format_bytes(metrics.get('torch_gpu_peak_mb', 0.0))}")
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +1049,7 @@ def main(argv):
         projection = str(getattr(parameters, "projection", "none")).lower()
         benchmark = _to_bool(getattr(parameters, "benchmark", False))
         bench_crop = _to_bool(getattr(parameters, "bench_crop", False))
+        compute_metrics = _to_bool(getattr(parameters, "compute_metrics", False))
 
         # 2D widefield parameters
         two_d_mode = str(getattr(parameters, "two_d_mode", "auto")).strip().lower()
@@ -795,6 +1060,8 @@ def main(argv):
         print("=" * 70)
         print("CIDeconvolve - BIAFLOWS Workflow")
         print("=" * 70)
+        _print_runtime_environment()
+        print("\nRun configuration")
         print(f"  Input dir    : {bj.input_dir}")
         print(f"  Output dir   : {bj.output_dir}")
         print(f"  Method       : {method}")
@@ -830,6 +1097,7 @@ def main(argv):
             print(f"  Excitation WL: {ex_override}")
         if benchmark:
             print(f"  Benchmark    : ON (crop={bench_crop})")
+        print(f"  Image metrics: {'ON' if compute_metrics else 'OFF'}")
 
         # Prepare data directories and collect input images
         in_imgs, _, in_path, _, out_path, tmp_path = prepare_data(
@@ -850,6 +1118,7 @@ def main(argv):
                 niter_list=niter_list,
                 device=device,
                 bench_crop=bench_crop,
+                compute_metrics=compute_metrics,
                 na=na_override,
                 refractive_index=ri_override,
                 sample_ri=sample_ri,
@@ -946,27 +1215,16 @@ def main(argv):
             print(f"{'=' * 60}")
 
             t0 = time.time()
+            load_time = 0.0
+            deconv_metrics: dict[str, float] = {}
+            save_time = 0.0
+            monitor: _MetricsMonitor | None = None
 
             try:
                 # Load image and extract metadata
-                data = load_image(img_path)
-                meta = data["metadata"]
-                images = data["images"]
-
-                print(f"  Channels: {len(images)}")
-                for i, img in enumerate(images):
-                    print(f"    Ch{i}: shape={img.shape}, dtype={img.dtype}")
-
-                # Create a temp dir alongside outfolder for intermediate files
-                tmp_work = Path(out_path) / "tmp"
-                tmp_work.mkdir(parents=True, exist_ok=True)
-
-                # ----- Deconvolve -----
-                result = deconvolve_image(
+                t_load = time.time()
+                data = load_image(
                     img_path,
-                    method=method,
-                    niter=niter_list,
-                    device=device,
                     na=na_override,
                     refractive_index=ri_override,
                     sample_refractive_index=sample_ri,
@@ -975,38 +1233,132 @@ def main(argv):
                     excitation_wavelengths=ex_override,
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
-                    tv_lambda=tv_lambda,
-                    damping=damping,
-                    sparse_hessian_weight=sparse_hessian_weight,
-                    sparse_hessian_reg=sparse_hessian_reg,
-                    background=background,
-                    offset=offset,
-                    prefilter_sigma=prefilter_sigma,
-                    start=start,
-                    convergence=convergence,
-                    rel_threshold=rel_threshold,
-                    check_every=check_every,
-                    ri_coverslip=ri_override,
-                    ri_coverslip_design=ri_override,
-                    ri_immersion_design=ri_override,
-                    t_g=t_g,
-                    t_g0=t_g0,
-                    t_i0=t_i0,
-                    z_p=z_p,
-                    two_d_mode=two_d_mode,
-                    two_d_wf_aggressiveness=two_d_wf_aggressiveness,
-                    two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
-                    two_d_wf_bg_scale=two_d_wf_bg_scale,
                 )
+                meta = data["metadata"]
+                images = data["images"]
+                load_time = time.time() - t_load
+                _print_image_details(img_resource.filename, img_path, meta, images)
+                print(f"    Load time  : {_format_duration(load_time)}")
+
+                # Create a temp dir alongside outfolder for intermediate files
+                tmp_work = Path(out_path) / "tmp"
+                tmp_work.mkdir(parents=True, exist_ok=True)
+
+                # ----- Deconvolve -----
+                print("\n  Deconvolution")
+                print(f"    Method     : {method}")
+                print(f"    Iterations : {', '.join(str(n) for n in niter_list)}")
+                print(f"    Device     : {device_param}")
+                print(f"    Background : {background}")
+                print(f"    Offset     : {offset}")
+                print(f"    Start      : {start}")
+                print(f"    Convergence: {convergence} "
+                      f"(threshold={rel_threshold}, every={check_every})")
+                if method == "ci_rl_tv":
+                    print(f"    TV lambda  : {tv_lambda}")
+                if method in ("ci_rl", "ci_rl_tv"):
+                    print(f"    Damping    : {damping}")
+                    print(f"    2D WF mode : {two_d_mode} "
+                          f"(aggr={two_d_wf_aggressiveness}, "
+                          f"bg radius={two_d_wf_bg_radius_um} um, "
+                          f"bg scale={two_d_wf_bg_scale})")
+                if method == "ci_sparse_hessian":
+                    print(f"    Sparse     : weight={sparse_hessian_weight}, "
+                          f"reg={sparse_hessian_reg}")
+                if prefilter_sigma > 0.0:
+                    print(f"    Prefilter  : sigma={prefilter_sigma}")
+
+                monitor = _MetricsMonitor()
+                monitor.start()
+                result_channels = []
+                psfs = []
+                for ch_idx, img in enumerate(images):
+                    ch_niter = niter_list[ch_idx] if ch_idx < len(niter_list) else niter_list[-1]
+                    t_ch = time.time()
+                    print(f"    Channel {ch_idx}: PSF generation...")
+                    psf = generate_psf(
+                        meta,
+                        channel_idx=ch_idx,
+                        ri_coverslip=ri_override,
+                        ri_coverslip_design=ri_override,
+                        ri_immersion_design=ri_override,
+                        t_g=t_g,
+                        t_g0=t_g0,
+                        t_i0=t_i0,
+                        z_p=z_p,
+                        two_d_mode=two_d_mode if method in ("ci_rl", "ci_rl_tv") else "legacy_2d",
+                    )
+                    psfs.append(psf)
+
+                    keep_hidden_2d_psf = (
+                        img.ndim == 2
+                        and psf.ndim == 3
+                        and meta.get("microscope_type", "widefield") == "widefield"
+                        and method in ("ci_rl", "ci_rl_tv")
+                        and str(two_d_mode).strip().lower() == "auto"
+                    )
+                    effective_psf = psf
+                    if img.ndim == 2 and effective_psf.ndim == 3 and not keep_hidden_2d_psf:
+                        effective_psf = effective_psf[effective_psf.shape[0] // 2]
+                    elif img.ndim == 3 and effective_psf.ndim == 2:
+                        effective_psf = effective_psf[np.newaxis, :, :]
+
+                    print(f"    Channel {ch_idx}: deconvolving shape={img.shape} "
+                          f"psf={effective_psf.shape} iterations={ch_niter}")
+                    result_channels.append(
+                        deconvolve(
+                            img,
+                            effective_psf,
+                            method=method,
+                            niter=ch_niter,
+                            background=background,
+                            damping=damping,
+                            offset=offset,
+                            prefilter_sigma=prefilter_sigma,
+                            start=start,
+                            convergence=convergence,
+                            rel_threshold=rel_threshold,
+                            check_every=check_every,
+                            device=device,
+                            tv_lambda=tv_lambda,
+                            sparse_hessian_weight=sparse_hessian_weight,
+                            sparse_hessian_reg=sparse_hessian_reg,
+                            pixel_size_xy=meta.get("pixel_size_x"),
+                            pixel_size_z=meta.get("pixel_size_z"),
+                            microscope_type=meta.get("microscope_type", "widefield"),
+                            two_d_mode=two_d_mode,
+                            two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+                            two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+                            two_d_wf_bg_scale=two_d_wf_bg_scale,
+                        )
+                    )
+                    print(f"    Channel {ch_idx}: done in {_format_duration(time.time() - t_ch)}")
+                result = {
+                    "channels": result_channels,
+                    "psfs": psfs,
+                    "metadata": meta,
+                    "source_channels": images,
+                }
+                deconv_metrics = monitor.stop()
 
                 if result is None:
                     print(f"  WARNING: deconvolve_image returned None for {img_resource.filename}")
                     shutil.rmtree(tmp_work, ignore_errors=True)
                     continue
 
+                _print_psf_details(result.get("psfs", []))
+                _print_resource_metrics(deconv_metrics)
+                if compute_metrics and result.get("source_channels"):
+                    t_metrics = time.time()
+                    _print_quality_comparison(result["source_channels"], result["channels"])
+                    print(f"  Image metrics computed in {_format_duration(time.time() - t_metrics)}")
+                else:
+                    print("\n  Image metrics skipped (disabled).")
+
                 stem = _stem(img_resource.filename)
                 is_3d = result["channels"][0].ndim == 3
 
+                t_save = time.time()
                 if projection in ("mip", "sum") and is_3d:
                     out_name = f"{stem}_decon_{projection}.ome.tiff"
                     tmp_file = tmp_work / out_name
@@ -1034,15 +1386,24 @@ def main(argv):
                     tmp_file = tmp_work / out_name
                     save_result(result, str(tmp_file))
                     print(f"  Saved: {out_name}")
+                save_time = time.time() - t_save
 
                 # Move only the deconvolved TIFF to the output folder
                 dest = Path(out_path) / out_name
                 shutil.move(str(tmp_file), str(dest))
+                if dest.exists():
+                    print(f"  Output file : {dest}")
+                    print(f"  Output size : {_format_bytes(dest.stat().st_size / (1024 * 1024))}")
 
                 # Clean up the temp working directory
                 shutil.rmtree(tmp_work, ignore_errors=True)
 
             except Exception as exc:
+                if monitor is not None and not deconv_metrics:
+                    try:
+                        deconv_metrics = monitor.stop()
+                    except Exception:
+                        pass
                 print(f"  ERROR processing {img_resource.filename}: {exc}")
                 import traceback
                 traceback.print_exc()
@@ -1052,7 +1413,11 @@ def main(argv):
                 continue
 
             elapsed = time.time() - t0
-            print(f"  Time: {elapsed:.1f}s")
+            print("\n  Timing summary")
+            print(f"    Load       : {_format_duration(load_time)}")
+            print(f"    Deconvolve : {_format_duration(deconv_metrics.get('time_s', 0.0))}")
+            print(f"    Save       : {_format_duration(save_time)}")
+            print(f"    Total      : {_format_duration(elapsed)}")
 
         print(f"\n{'=' * 70}")
         print("CIDeconvolve workflow complete.")
@@ -1279,8 +1644,17 @@ def _write_metrics_csv(csv_path: Path, all_metrics: dict[str, dict]):
         "gpu_mem_delta_peak_mb",
         "torch_gpu_peak_mb", "torch_gpu_delta_mb",
         "gpu_spill_mb",
-        "channels_compared", "sharpness_mean", "contrast_mean", "noise_proxy_mean",
     ]
+    quality_fieldnames = [
+        "channels_compared", "detail_energy_mean", "bright_detail_energy_mean",
+        "edge_strength_mean", "signal_sparsity_mean", "robust_range_mean",
+    ]
+    include_quality = any(
+        any(key in metrics for key in quality_fieldnames)
+        for metrics in all_metrics.values()
+    )
+    if include_quality:
+        fieldnames += quality_fieldnames
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -1593,6 +1967,7 @@ def _run_benchmark(
     niter_list,
     device,
     bench_crop,
+    compute_metrics,
     na,
     refractive_index,
     sample_ri,
@@ -1645,6 +2020,7 @@ def _run_benchmark(
     print(f"  Methods   : {', '.join(_BENCH_METHODS)}")
     print(f"  Iterations: {nit_label}")
     print(f"  Crop      : {bench_crop}")
+    print(f"  Metrics   : {compute_metrics}")
     print(f"{'=' * 70}")
 
     # Load image once — for HCS plates, use only the first well/field
@@ -1766,9 +2142,10 @@ def _run_benchmark(
             metrics = monitor.stop()
             metrics["device"] = _method_device(m)
             
-            # Compute image quality metrics
-            quality = _quality_metrics(result["channels"])
-            metrics.update(quality)
+            if compute_metrics:
+                # Compute image metrics only when explicitly requested; this can be slow.
+                quality = _quality_metrics(result["channels"])
+                metrics.update(quality)
             
             all_metrics[label] = metrics
             print(f"    {metrics['time_s']:.1f}s"

@@ -5,24 +5,13 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --iterations @iterations --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --tv_lambda @tv_lambda --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --damping @damping --offset @offset --prefilter_sigma @prefilter_sigma --start @start --convergence @convergence --rel_threshold @rel_threshold --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --projection @projection --benchmark @benchmark --bench_crop @bench_crop --two_d_mode @two_d_mode --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
+  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
   "inputs": [
-    {
-      "id": "iterations",
-      "value-key": "@iterations",
-      "command-line-flag": "--iterations",
-      "name": "RL iterations",
-      "description": "Number of RL iterations per channel, comma-separated. A single value applies to all channels. Example: '150' or '150, 100, 200'.",
-      "default-value": "40",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
     {
       "id": "method",
       "value-key": "@method",
       "command-line-flag": "--method",
-      "name": "Deconvolution method",
+      "name": "(ess) Deconvolution method",
       "description": "Which deconvolution algorithm to use. ci_rl: SHB-accelerated Richardson-Lucy. ci_rl_tv: same with Total Variation regularisation. ci_sparse_hessian: sparse-Hessian / SPITFIRE-style variational deconvolution.",
       "default-value": "ci_rl",
       "set-by-server": false,
@@ -35,23 +24,110 @@
       ]
     },
     {
-      "id": "device",
-      "value-key": "@device",
-      "command-line-flag": "--device",
-      "name": "Compute device",
-      "description": "Force compute device. 'auto' uses CUDA if available, otherwise CPU.",
+      "id": "iterations",
+      "value-key": "@iterations",
+      "command-line-flag": "--iterations",
+      "name": "(ess) RL iterations",
+      "description": "Number of RL iterations per channel, comma-separated. A single value applies to all channels. Example: '150' or '150, 100, 200'.",
+      "default-value": "40",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "convergence",
+      "value-key": "@convergence",
+      "command-line-flag": "--convergence",
+      "name": "(ess) Convergence mode",
+      "description": "Early-stopping convergence check. 'auto' stops when relative change falls below the threshold. 'none' disables convergence checking and runs all iterations.",
       "default-value": "auto",
       "set-by-server": false,
       "optional": true,
       "type": "String",
-      "value-choices": ["auto", "cpu", "cuda"]
+      "value-choices": [
+        "auto",
+        "none"
+      ]
+    },
+    {
+      "id": "rel_threshold",
+      "value-key": "@rel_threshold",
+      "command-line-flag": "--rel_threshold",
+      "name": "(ess) Convergence threshold",
+      "description": "Relative change threshold for early stopping when convergence is 'auto'. Smaller values allow more iterations before stopping.",
+      "default-value": 0.005,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 1e-08,
+      "maximum": 1
     },
     {
       "id": "na",
       "value-key": "@na",
       "command-line-flag": "--na",
-      "name": "Numerical aperture",
+      "name": "(ess) Numerical aperture",
       "description": "Override objective numerical aperture. 'auto' uses value from image metadata (default 1.4 if missing).",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "emission_wl",
+      "value-key": "@emission_wl",
+      "command-line-flag": "--emission_wl",
+      "name": "(ess) Emission wavelengths",
+      "description": "Override emission wavelengths in nm, comma-separated (one per channel). 'auto' uses values from image metadata (default 520 nm if missing). Example: '520, 600'.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "pixel_size_xy",
+      "value-key": "@pixel_size_xy",
+      "command-line-flag": "--pixel_size_xy",
+      "name": "(ess) Pixel size XY (nm)",
+      "description": "Override lateral pixel size in nanometers. 'auto' uses value from image metadata.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "pixel_size_z",
+      "value-key": "@pixel_size_z",
+      "command-line-flag": "--pixel_size_z",
+      "name": "(ess) Pixel size Z (nm)",
+      "description": "Override axial pixel size (Z step) in nanometers. 'auto' uses value from image metadata.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "microscope_type",
+      "value-key": "@microscope_type",
+      "command-line-flag": "--microscope_type",
+      "name": "(ess) Microscope type",
+      "description": "Override microscope type for PSF model. 'auto' uses value from image metadata (default 'widefield' if missing). Confocal uses emission × excitation PSF when excitation wavelengths are provided.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": [
+        "auto",
+        "widefield",
+        "confocal"
+      ]
+    },
+    {
+      "id": "excitation_wl",
+      "value-key": "@excitation_wl",
+      "command-line-flag": "--excitation_wl",
+      "name": "(ess) Excitation wavelengths",
+      "description": "Excitation wavelengths in nm, comma-separated (one per channel). Used for confocal PSF generation (emission × excitation model). 'auto' uses values from image metadata; falls back to squared emission PSF if unavailable. Example: '405, 488'.",
       "default-value": "auto",
       "set-by-server": false,
       "optional": true,
@@ -61,19 +137,24 @@
       "id": "refractive_index",
       "value-key": "@refractive_index",
       "command-line-flag": "--refractive_index",
-      "name": "Immersion medium",
+      "name": "(ess) Immersion medium",
       "description": "Immersion medium refractive index for PSF generation. 'auto' uses value from image metadata (default: oil 1.515).",
       "default-value": "auto",
       "set-by-server": false,
       "optional": true,
       "type": "String",
-      "value-choices": ["auto", "air (1.0003)", "water (1.333)", "oil (1.515)"]
+      "value-choices": [
+        "auto",
+        "air (1.0003)",
+        "water (1.333)",
+        "oil (1.515)"
+      ]
     },
     {
       "id": "sample_ri",
       "value-key": "@sample_ri",
       "command-line-flag": "--sample_ri",
-      "name": "Sample / mounting medium",
+      "name": "(ess) Sample / mounting medium",
       "description": "Refractive index of the sample or mounting medium for PSF generation. 'auto' uses image metadata if available, otherwise defaults to Vectashield (1.45).",
       "default-value": "auto",
       "set-by-server": false,
@@ -92,194 +173,20 @@
       ]
     },
     {
-      "id": "microscope_type",
-      "value-key": "@microscope_type",
-      "command-line-flag": "--microscope_type",
-      "name": "Microscope type",
-      "description": "Override microscope type for PSF model. 'auto' uses value from image metadata (default 'widefield' if missing). Confocal uses emission × excitation PSF when excitation wavelengths are provided.",
-      "default-value": "auto",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String",
-      "value-choices": ["auto", "widefield", "confocal"]
-    },
-    {
-      "id": "emission_wl",
-      "value-key": "@emission_wl",
-      "command-line-flag": "--emission_wl",
-      "name": "Emission wavelengths",
-      "description": "Override emission wavelengths in nm, comma-separated (one per channel). 'auto' uses values from image metadata (default 520 nm if missing). Example: '520, 600'.",
-      "default-value": "auto",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
-      "id": "excitation_wl",
-      "value-key": "@excitation_wl",
-      "command-line-flag": "--excitation_wl",
-      "name": "Excitation wavelengths",
-      "description": "Excitation wavelengths in nm, comma-separated (one per channel). Used for confocal PSF generation (emission × excitation model). 'auto' uses values from image metadata; falls back to squared emission PSF if unavailable. Example: '405, 488'.",
-      "default-value": "auto",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
-      "id": "tv_lambda",
-      "value-key": "@tv_lambda",
-      "command-line-flag": "--tv_lambda",
-      "name": "TV lambda",
-      "description": "Total Variation regularization strength for ci_rl_tv. Ignored by ci_rl and ci_sparse_hessian. Range 0–1, typical values 0.00005–0.001.",
-      "default-value": 0.0001,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 1
-    },
-    {
-      "id": "sparse_hessian_weight",
-      "value-key": "@sparse_hessian_weight",
-      "command-line-flag": "--sparse_hessian_weight",
-      "name": "Sparse Hessian weight",
-      "description": "Hessian-vs-sparsity balance for ci_sparse_hessian. Ignored by RL-family methods. Typical values are 0.4–0.8.",
-      "default-value": 0.6,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 1
-    },
-    {
-      "id": "sparse_hessian_reg",
-      "value-key": "@sparse_hessian_reg",
-      "command-line-flag": "--sparse_hessian_reg",
-      "name": "Sparse Hessian reg",
-      "description": "Data-vs-regularizer balance for ci_sparse_hessian. Ignored by RL-family methods. Higher values stay closer to the observed data.",
-      "default-value": 0.98,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 1
-    },
-    {
-      "id": "background",
-      "value-key": "@background",
-      "command-line-flag": "--background",
-      "name": "Background subtraction",
-      "description": "Background subtraction mode. 'auto' estimates background automatically. A numeric value (e.g. 100) subtracts that constant. '0' disables background subtraction.",
-      "default-value": "auto",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
-      "id": "offset",
-      "value-key": "@offset",
-      "command-line-flag": "--offset",
-      "name": "Offset",
-      "description": "Positive offset added during processing and removed afterwards. 'auto' uses the deconwolf-style default of 5. 'none' or '0' disables it.",
-      "default-value": "auto",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
-      "id": "prefilter_sigma",
-      "value-key": "@prefilter_sigma",
-      "command-line-flag": "--prefilter_sigma",
-      "name": "Prefilter sigma",
-      "description": "Sigma in pixels for Anscombe-domain Gaussian prefiltering. '0' disables the prefilter.",
-      "default-value": 0.0,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0,
-      "maximum": 10
-    },
-    {
-      "id": "start",
-      "value-key": "@start",
-      "command-line-flag": "--start",
-      "name": "Initial estimate",
-      "description": "Initial estimate for iterative solvers. 'flat' uses a uniform mean image, 'observed' uses the raw observation, and 'lowpass' uses a strongly smoothed observation.",
-      "default-value": "flat",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String",
-      "value-choices": ["flat", "observed", "lowpass"]
-    },
-    {
-      "id": "damping",
-      "value-key": "@damping",
-      "command-line-flag": "--damping",
-      "name": "Damping",
-      "description": "Noise-gated damping for ci_rl and ci_rl_tv. 'none' or '0' disables damping. 'auto' selects the recommended automatic value. Ignored by ci_sparse_hessian.",
-      "default-value": "none",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
-      "id": "convergence",
-      "value-key": "@convergence",
-      "command-line-flag": "--convergence",
-      "name": "Convergence mode",
-      "description": "Early-stopping convergence check. 'auto' stops when relative change falls below the threshold. 'none' disables convergence checking and runs all iterations.",
-      "default-value": "auto",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String",
-      "value-choices": ["auto", "none"]
-    },
-    {
-      "id": "rel_threshold",
-      "value-key": "@rel_threshold",
-      "command-line-flag": "--rel_threshold",
-      "name": "Convergence threshold",
-      "description": "Relative change threshold for early stopping when convergence is 'auto'. Smaller values allow more iterations before stopping.",
-      "default-value": 0.005,
-      "set-by-server": false,
-      "optional": true,
-      "type": "Number",
-      "minimum": 0.00000001,
-      "maximum": 1
-    },
-    {
-      "id": "pixel_size_xy",
-      "value-key": "@pixel_size_xy",
-      "command-line-flag": "--pixel_size_xy",
-      "name": "Pixel size XY (nm)",
-      "description": "Override lateral pixel size in nanometers. 'auto' uses value from image metadata.",
-      "default-value": "auto",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
-      "id": "pixel_size_z",
-      "value-key": "@pixel_size_z",
-      "command-line-flag": "--pixel_size_z",
-      "name": "Pixel size Z (nm)",
-      "description": "Override axial pixel size (Z step) in nanometers. 'auto' uses value from image metadata.",
-      "default-value": "auto",
-      "set-by-server": false,
-      "optional": true,
-      "type": "String"
-    },
-    {
       "id": "projection",
       "value-key": "@projection",
       "command-line-flag": "--projection",
-      "name": "Z-projection",
+      "name": "(ess) Z-projection",
       "description": "Output a 2D Z-projection instead of the full 3D stack. 'mip': maximum intensity projection, 'sum': sum projection, 'none': keep full 3D stack. Ignored for 2D input images.",
       "default-value": "none",
       "set-by-server": false,
       "optional": true,
       "type": "String",
-      "value-choices": ["none", "mip", "sum"]
+      "value-choices": [
+        "none",
+        "mip",
+        "sum"
+      ]
     },
     {
       "id": "benchmark",
@@ -304,34 +211,169 @@
       "type": "Boolean"
     },
     {
+      "id": "compute_metrics",
+      "value-key": "@compute_metrics",
+      "command-line-flag": "--compute_metrics",
+      "name": "(adv) Compute image metrics",
+      "description": "Compute optional deconvolution-effect image metrics. Disabled by default because FFT/gradient metrics can be slow on large images.",
+      "default-value": false,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
+      "id": "tv_lambda",
+      "value-key": "@tv_lambda",
+      "command-line-flag": "--tv_lambda",
+      "name": "(adv) TV lambda",
+      "description": "Total Variation regularization strength for ci_rl_tv. Ignored by ci_rl and ci_sparse_hessian. Range 0–1, typical values 0.00005–0.001.",
+      "default-value": 0.0001,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    {
+      "id": "damping",
+      "value-key": "@damping",
+      "command-line-flag": "--damping",
+      "name": "(adv) Damping",
+      "description": "Noise-gated damping for ci_rl and ci_rl_tv. 'none' or '0' disables damping. 'auto' selects the recommended automatic value. Ignored by ci_sparse_hessian.",
+      "default-value": "none",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
       "id": "two_d_mode",
       "value-key": "@two_d_mode",
       "command-line-flag": "--two_d_mode",
-      "name": "2D widefield mode",
+      "name": "(adv) 2D widefield mode",
       "description": "2D widefield deconvolution mode. 'auto' uses the enhanced collapsed-PSF model for single-plane widefield images. 'legacy_2d' uses plain 2D RL.",
       "default-value": "auto",
       "set-by-server": false,
       "optional": true,
       "type": "String",
-      "value-choices": ["auto", "legacy_2d"]
+      "value-choices": [
+        "auto",
+        "legacy_2d"
+      ]
+    },
+    {
+      "id": "sparse_hessian_weight",
+      "value-key": "@sparse_hessian_weight",
+      "command-line-flag": "--sparse_hessian_weight",
+      "name": "(adv) Sparse Hessian weight",
+      "description": "Hessian-vs-sparsity balance for ci_sparse_hessian. Ignored by RL-family methods. Typical values are 0.4–0.8.",
+      "default-value": 0.6,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    {
+      "id": "sparse_hessian_reg",
+      "value-key": "@sparse_hessian_reg",
+      "command-line-flag": "--sparse_hessian_reg",
+      "name": "(adv) Sparse Hessian reg",
+      "description": "Data-vs-regularizer balance for ci_sparse_hessian. Ignored by RL-family methods. Higher values stay closer to the observed data.",
+      "default-value": 0.98,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    {
+      "id": "background",
+      "value-key": "@background",
+      "command-line-flag": "--background",
+      "name": "(adv) Background subtraction",
+      "description": "Background subtraction mode. 'auto' estimates background automatically. A numeric value (e.g. 100) subtracts that constant. '0' disables background subtraction.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "offset",
+      "value-key": "@offset",
+      "command-line-flag": "--offset",
+      "name": "(adv) Offset",
+      "description": "Positive offset added during processing and removed afterwards. 'auto' uses the deconwolf-style default of 5. 'none' or '0' disables it.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "prefilter_sigma",
+      "value-key": "@prefilter_sigma",
+      "command-line-flag": "--prefilter_sigma",
+      "name": "(adv) Prefilter sigma",
+      "description": "Sigma in pixels for Anscombe-domain Gaussian prefiltering. '0' disables the prefilter.",
+      "default-value": 0.0,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0,
+      "maximum": 10
+    },
+    {
+      "id": "start",
+      "value-key": "@start",
+      "command-line-flag": "--start",
+      "name": "(adv) Initial estimate",
+      "description": "Initial estimate for iterative solvers. 'flat' uses a uniform mean image, 'observed' uses the raw observation, and 'lowpass' uses a strongly smoothed observation.",
+      "default-value": "flat",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": [
+        "flat",
+        "observed",
+        "lowpass"
+      ]
+    },
+    {
+      "id": "device",
+      "value-key": "@device",
+      "command-line-flag": "--device",
+      "name": "(adv) Compute device",
+      "description": "Force compute device. 'auto' uses CUDA if available, otherwise CPU.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": [
+        "auto",
+        "cpu",
+        "cuda"
+      ]
     },
     {
       "id": "two_d_wf_aggressiveness",
       "value-key": "@two_d_wf_aggressiveness",
       "command-line-flag": "--two_d_wf_aggressiveness",
-      "name": "2D WF aggressiveness",
+      "name": "(adv) 2D WF aggressiveness",
       "description": "Aggressiveness of the 2D widefield auto deconvolution. Only used when two_d_mode is 'auto' and the image is a single-plane widefield.",
       "default-value": "Balanced",
       "set-by-server": false,
       "optional": true,
       "type": "String",
-      "value-choices": ["Conservative", "Balanced", "Strong"]
+      "value-choices": [
+        "Conservative",
+        "Balanced",
+        "Strong"
+      ]
     },
     {
       "id": "two_d_wf_bg_radius_um",
       "value-key": "@two_d_wf_bg_radius_um",
       "command-line-flag": "--two_d_wf_bg_radius_um",
-      "name": "2D WF background radius (µm)",
+      "name": "(adv) 2D WF background radius (µm)",
       "description": "Background estimator neighborhood radius in micrometers for 2D widefield auto mode.",
       "default-value": 0.5,
       "set-by-server": false,
@@ -344,7 +386,7 @@
       "id": "two_d_wf_bg_scale",
       "value-key": "@two_d_wf_bg_scale",
       "command-line-flag": "--two_d_wf_bg_scale",
-      "name": "2D WF background scale",
+      "name": "(adv) 2D WF background scale",
       "description": "Multiplier applied to the auto-estimated background in 2D widefield auto mode.",
       "default-value": 1.0,
       "set-by-server": false,

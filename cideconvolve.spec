@@ -4,11 +4,7 @@
 #
 # Produces:  dist/cideconvolve.exe  (single-file executable)
 #
-# NOTE: The .exe icon requires a Windows .ico file.
-#       Convert icon.svg to icon.ico first, e.g. with Inkscape:
-#           inkscape icon.svg --export-type=png --export-filename=icon.png
-#           python -c "from PIL import Image; Image.open('icon.png').save('icon.ico')"
-#       Or use an online SVG→ICO converter and place icon.ico in this folder.
+# NOTE: icon.ico is used for the Windows executable icon.
 
 import os
 import pkgutil
@@ -67,7 +63,9 @@ bioio_cz_datas, bioio_cz_binaries, bioio_cz_hiddenimports = collect_all('bioio_c
 bioio_nd_datas, bioio_nd_binaries, bioio_nd_hiddenimports = collect_all('bioio_nd2')
 
 # ── Resolve exe icon (needs .ico on Windows) ─────────────────────────────────
-_icon = 'icon.ico' if os.path.exists('icon.ico') else None
+_icon = os.path.abspath('icon.ico')
+if not os.path.exists(_icon):
+    raise FileNotFoundError('icon.ico is required for the Windows executable icon')
 
 a = Analysis(
     ['gui_deconvolve_ci.py'],
@@ -85,6 +83,7 @@ a = Analysis(
     ),
     datas=[
         ('icon.svg', '.'),          # runtime window icon (loaded by the app)
+        ('icon.ico', '.'),          # Windows executable icon
     ] + pyqt6_datas + vispy_datas + ogl_datas + torch_datas
       + zarr_datas + numcodecs_datas
       + ome_datas + omero_datas + obqt_datas

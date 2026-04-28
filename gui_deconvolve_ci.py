@@ -17,6 +17,7 @@ import gc
 import json
 import logging
 import os
+import platform
 import sys
 import tempfile
 import threading
@@ -34,12 +35,13 @@ if sys.platform == "win32":
         "ci.gui_deconvolve_ci"
     )
 
-from PyQt6.QtCore import Qt, QRectF, QSize, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QIcon, QImage, QPainter, QPixmap, QWheelEvent
+from PyQt6.QtCore import QObject, QEvent, Qt, QRectF, QSize, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QIcon, QImage, QPainter, QPixmap, QTextCursor, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -53,6 +55,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -79,6 +82,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ICON_PATH = SCRIPT_DIR / "icon.svg"
 LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
 OMERO_SESSION_REUSE_S = 10 * 60
+
+
+class _GuiLogEmitter(QObject):
+    line = pyqtSignal(str)
+
+
+class _QtLogHandler(logging.Handler):
+    """Forward Python logging records into the GUI log dialog."""
+
+    def __init__(self, emitter: _GuiLogEmitter):
+        super().__init__(level=logging.INFO)
+        self._emitter = emitter
+        self.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._emitter.line.emit(self.format(record))
+        except Exception:
+            pass
 
 
 def _load_app_icon() -> QIcon:
@@ -558,6 +580,265 @@ def _parse_float_list(text: str) -> list[float]:
     return values
 
 
+def _format_bytes(mb: float) -> str:
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb:.0f} MB"
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {sec:.1f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {sec:.1f}s"
+
+
+def _format_value(value, unit: str = "", digits: int = 4) -> str:
+    if value is None:
+        return "?"
+    if isinstance(value, float):
+        text = f"{value:.{digits}g}"
+    else:
+        text = str(value)
+    return f"{text} {unit}".rstrip()
+
+
+def _array_stats(arr: np.ndarray) -> dict:
+    data = np.asarray(arr)
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return {
+            "shape": data.shape,
+            "dtype": str(data.dtype),
+            "bytes_mb": data.nbytes / (1024 * 1024),
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "p1": 0.0,
+            "p50": 0.0,
+            "p99": 0.0,
+            "nonzero_percent": 0.0,
+        }
+    return {
+        "shape": data.shape,
+        "dtype": str(data.dtype),
+        "bytes_mb": data.nbytes / (1024 * 1024),
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+        "p1": float(np.percentile(finite, 1)),
+        "p50": float(np.percentile(finite, 50)),
+        "p99": float(np.percentile(finite, 99)),
+        "nonzero_percent": float(np.count_nonzero(data) / data.size * 100) if data.size else 0.0,
+    }
+
+
+def _normalise_image(arr: np.ndarray) -> np.ndarray:
+    img = np.asarray(arr, dtype=np.float32)
+    lo = float(np.min(img))
+    hi = float(np.max(img))
+    if hi <= lo:
+        return np.zeros_like(img, dtype=np.float32)
+    return (img - lo) / (hi - lo)
+
+
+_METRIC_MAX_Z = 32
+_METRIC_MAX_YX = 512
+_METRIC_RADIUS_CACHE: dict[tuple[int, ...], tuple[np.ndarray, float]] = {}
+
+
+def _metric_stride_slice(size: int, limit: int) -> slice:
+    if size <= limit:
+        return slice(None)
+    return slice(0, size, int(np.ceil(size / limit)))
+
+
+def _metric_sample(arr: np.ndarray) -> np.ndarray:
+    data = np.asarray(arr)
+    if data.ndim == 3:
+        slices = (
+            _metric_stride_slice(data.shape[0], _METRIC_MAX_Z),
+            _metric_stride_slice(data.shape[1], _METRIC_MAX_YX),
+            _metric_stride_slice(data.shape[2], _METRIC_MAX_YX),
+        )
+    elif data.ndim == 2:
+        slices = (
+            _metric_stride_slice(data.shape[0], _METRIC_MAX_YX),
+            _metric_stride_slice(data.shape[1], _METRIC_MAX_YX),
+        )
+    else:
+        slices = tuple(_metric_stride_slice(size, _METRIC_MAX_YX) for size in data.shape)
+    return np.asarray(data[slices])
+
+
+def _metric_sample_summary(arr: np.ndarray) -> str:
+    data = np.asarray(arr)
+    sampled = _metric_sample(data)
+    if data.shape == sampled.shape:
+        return f"full shape {data.shape}"
+    return f"full shape {data.shape} -> sampled {sampled.shape}"
+
+
+def _metric_frequency_radius(shape: tuple[int, ...]) -> tuple[np.ndarray, float]:
+    cached = _METRIC_RADIUS_CACHE.get(shape)
+    if cached is not None:
+        return cached
+    freq_axes = np.meshgrid(
+        *[np.fft.fftfreq(n) for n in shape],
+        indexing="ij",
+    )
+    radius = np.sqrt(sum(axis ** 2 for axis in freq_axes))
+    max_radius = float(np.max(radius)) or 1.0
+    cached = (radius, max_radius)
+    _METRIC_RADIUS_CACHE[shape] = cached
+    return cached
+
+
+def _deconvolution_effect_metrics(arr: np.ndarray) -> dict[str, float]:
+    img = _normalise_image(_metric_sample(arr))
+    centered = img - float(np.mean(img))
+    fft_power = np.abs(np.fft.fftn(centered)) ** 2
+    total_power = float(np.sum(fft_power)) + 1e-12
+    radius, max_radius = _metric_frequency_radius(img.shape)
+    detail_energy = float(np.sum(fft_power[radius > 0.25 * max_radius]) / total_power)
+
+    gradient_axes = tuple(i for i, size in enumerate(img.shape) if size > 1)
+    if gradient_axes:
+        grads = np.gradient(img, axis=gradient_axes)
+        if isinstance(grads, np.ndarray):
+            grads = [grads]
+        edge_strength = float(np.mean(np.sqrt(sum(g ** 2 for g in grads))))
+    else:
+        edge_strength = 0.0
+
+    p005 = float(np.percentile(img, 0.5))
+    p95 = float(np.percentile(img, 95))
+    p995 = float(np.percentile(img, 99.5))
+    bright = img >= p95
+    if np.any(bright):
+        bright_power = np.abs(np.fft.fftn(centered * bright.astype(np.float32))) ** 2
+        bright_total = float(np.sum(bright_power)) + 1e-12
+        bright_detail_energy = float(np.sum(bright_power[radius > 0.25 * max_radius]) / bright_total)
+    else:
+        bright_detail_energy = 0.0
+    flat = np.sort(img.ravel())
+    total_intensity = float(np.sum(flat))
+    if flat.size and total_intensity > 1e-12:
+        index = np.arange(1, flat.size + 1, dtype=np.float64)
+        signal_sparsity = float((2.0 * np.sum(index * flat)) / (flat.size * total_intensity) - (flat.size + 1.0) / flat.size)
+    else:
+        signal_sparsity = 0.0
+    return {
+        "detail_energy": detail_energy,
+        "bright_detail_energy": bright_detail_energy,
+        "edge_strength": edge_strength,
+        "signal_sparsity": signal_sparsity,
+        "robust_range": p995 - p005,
+    }
+
+
+def _quality_metrics(channels: list[np.ndarray]) -> dict[str, float | int]:
+    metric_values: dict[str, list[float]] = {
+        "detail_energy": [],
+        "bright_detail_energy": [],
+        "edge_strength": [],
+        "signal_sparsity": [],
+        "robust_range": [],
+    }
+    for channel in channels:
+        metrics = _deconvolution_effect_metrics(channel)
+        for key in metric_values:
+            metric_values[key].append(metrics[key])
+    out: dict[str, float | int] = {"channels_compared": len(channels)}
+    for key, values in metric_values.items():
+        out[f"{key}_mean"] = float(np.mean(values)) if values else 0.0
+    return out
+
+
+def _runtime_environment_lines() -> list[str]:
+    lines = [
+        "Runtime environment",
+        f"  Timestamp    : {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"  Platform     : {platform.platform()}",
+        f"  Python       : {platform.python_version()} ({sys.executable})",
+        f"  NumPy        : {np.__version__}",
+    ]
+    try:
+        import torch
+        lines.append(f"  PyTorch      : {torch.__version__}")
+        lines.append(f"  CUDA avail.  : {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            lines.append(f"  CUDA version : {torch.version.cuda or '?'}")
+            for idx in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(idx)
+                lines.append(
+                    f"  GPU {idx}       : {props.name} "
+                    f"({_format_bytes(props.total_memory / (1024 * 1024))})"
+                )
+    except Exception as exc:
+        lines.append(f"  PyTorch      : unavailable ({exc})")
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        lines.append(
+            f"  CPU cores    : {psutil.cpu_count(logical=False) or '?'} physical, "
+            f"{psutil.cpu_count(logical=True) or '?'} logical"
+        )
+        lines.append(f"  System RAM   : {_format_bytes(vm.total / (1024 * 1024))}")
+    except Exception:
+        pass
+    return lines
+
+
+def _image_detail_lines(display_name: str, source_path: Optional[Path], meta: dict, images: list[np.ndarray]) -> list[str]:
+    lines = [
+        "",
+        "Loaded image",
+        f"  File       : {display_name}",
+    ]
+    if source_path is not None:
+        lines.append(f"  Path       : {source_path}")
+        if source_path.exists() and source_path.is_file():
+            lines.append(f"  File size  : {_format_bytes(source_path.stat().st_size / (1024 * 1024))}")
+    lines.extend([
+        f"  Channels   : {len(images)}",
+        f"  Dimensions : X={meta.get('size_x', '?')}  Y={meta.get('size_y', '?')}  "
+        f"Z={meta.get('size_z', '?')}  C={meta.get('size_c', len(images))}  T={meta.get('size_t', '?')}",
+        f"  Pixel size : XY={_format_value(meta.get('pixel_size_x'), 'um')}  "
+        f"Z={_format_value(meta.get('pixel_size_z'), 'um')}",
+        f"  Microscope : {meta.get('microscope_type', '?')}",
+        f"  Objective  : NA={_format_value(meta.get('na'))}  "
+        f"Mag={_format_value(meta.get('magnification'), 'x')}  Immersion={meta.get('immersion', '?')}",
+        f"  RI         : immersion={_format_value(meta.get('refractive_index'))}  "
+        f"sample={_format_value(meta.get('sample_refractive_index'))}",
+    ])
+    channels = meta.get("channels", [])
+    names = meta.get("channel_names") or []
+    for i, img in enumerate(images):
+        stats = _array_stats(img)
+        ch_meta = channels[i] if i < len(channels) else {}
+        name = names[i] if i < len(names) else f"Ch{i}"
+        lines.append(
+            f"  Ch{i} {name}: shape={stats['shape']} dtype={stats['dtype']} "
+            f"data={_format_bytes(stats['bytes_mb'])}"
+        )
+        lines.append(
+            f"    wavelengths: em={_format_value(ch_meta.get('emission_wavelength'), 'nm')}  "
+            f"ex={_format_value(ch_meta.get('excitation_wavelength'), 'nm')}  "
+            f"mode={ch_meta.get('acquisition_mode', '?')}"
+        )
+        lines.append(
+            f"    intensity  : min={stats['min']:.4g} p1={stats['p1']:.4g} "
+            f"median={stats['p50']:.4g} mean={stats['mean']:.4g} "
+            f"p99={stats['p99']:.4g} max={stats['max']:.4g} "
+            f"nonzero={stats['nonzero_percent']:.1f}%"
+        )
+    return lines
+
+
 def _estimate_two_d_wf_psf_z_nm(
     wavelength_nm: float,
     na: float,
@@ -862,6 +1143,233 @@ class _ResourceMonitor(QThread):
         self.wait(2000)
 
 
+class _RunMetricsMonitor:
+    """Process/GPU resource sampler used for one deconvolution run."""
+
+    def __init__(self, interval: float = 0.1):
+        self._interval = float(interval)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._cpu_percent: list[float] = []
+        self._ram_bytes: list[int] = []
+        self._gpu_util: list[float] = []
+        self._gpu_mem_bytes: list[int] = []
+        self._ram_baseline = 0
+        self._gpu_mem_baseline = 0
+        self._torch_baseline = 0
+        self._t0 = 0.0
+        self._t1 = 0.0
+
+        self._proc = None
+        try:
+            import psutil
+            self._proc = psutil.Process(os.getpid())
+        except Exception:
+            pass
+
+        self._nvml_handle = None
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            pass
+
+    def start(self) -> None:
+        self._cpu_percent.clear()
+        self._ram_bytes.clear()
+        self._gpu_util.clear()
+        self._gpu_mem_bytes.clear()
+        self._stop_event.clear()
+
+        if self._proc:
+            try:
+                self._proc.cpu_percent()
+                self._ram_baseline = self._proc.memory_info().rss
+            except Exception:
+                self._ram_baseline = 0
+        if self._nvml_handle:
+            try:
+                import pynvml
+                self._gpu_mem_baseline = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle).used
+            except Exception:
+                self._gpu_mem_baseline = 0
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+                self._torch_baseline = torch.cuda.memory_allocated()
+        except Exception:
+            self._torch_baseline = 0
+
+        self._t0 = time.perf_counter()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _poll(self) -> None:
+        while not self._stop_event.is_set():
+            if self._proc:
+                try:
+                    self._cpu_percent.append(float(self._proc.cpu_percent()))
+                    self._ram_bytes.append(int(self._proc.memory_info().rss))
+                except Exception:
+                    pass
+            if self._nvml_handle:
+                try:
+                    import pynvml
+                    util = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+                    self._gpu_util.append(float(util.gpu))
+                    self._gpu_mem_bytes.append(int(pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle).used))
+                except Exception:
+                    pass
+            self._stop_event.wait(self._interval)
+
+    def stop(self) -> dict[str, float]:
+        self._t1 = time.perf_counter()
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+        MB = 1024 * 1024
+        m = {
+            "time_s": self._t1 - self._t0,
+            "cpu_percent_avg": 0.0,
+            "cpu_percent_peak": 0.0,
+            "ram_total_mb": 0.0,
+            "ram_peak_mb": 0.0,
+            "ram_avg_mb": 0.0,
+            "ram_delta_peak_mb": 0.0,
+            "ram_percent": 0.0,
+            "gpu_util_avg": 0.0,
+            "gpu_util_peak": 0.0,
+            "gpu_total_mb": 0.0,
+            "gpu_mem_peak_mb": 0.0,
+            "gpu_mem_avg_mb": 0.0,
+            "gpu_mem_delta_peak_mb": 0.0,
+            "gpu_mem_percent": 0.0,
+            "torch_gpu_peak_mb": 0.0,
+            "torch_gpu_delta_mb": 0.0,
+        }
+        if self._cpu_percent:
+            m["cpu_percent_avg"] = sum(self._cpu_percent) / len(self._cpu_percent)
+            m["cpu_percent_peak"] = max(self._cpu_percent)
+        try:
+            import psutil
+            m["ram_total_mb"] = psutil.virtual_memory().total / MB
+        except Exception:
+            pass
+        if self._ram_bytes:
+            peak = max(self._ram_bytes)
+            m["ram_peak_mb"] = peak / MB
+            m["ram_avg_mb"] = sum(self._ram_bytes) / len(self._ram_bytes) / MB
+            m["ram_delta_peak_mb"] = (peak - self._ram_baseline) / MB
+            if m["ram_total_mb"] > 0:
+                m["ram_percent"] = m["ram_peak_mb"] / m["ram_total_mb"] * 100
+        if self._gpu_util:
+            m["gpu_util_avg"] = sum(self._gpu_util) / len(self._gpu_util)
+            m["gpu_util_peak"] = max(self._gpu_util)
+        if self._gpu_mem_bytes:
+            peak = max(self._gpu_mem_bytes)
+            m["gpu_mem_peak_mb"] = peak / MB
+            m["gpu_mem_avg_mb"] = sum(self._gpu_mem_bytes) / len(self._gpu_mem_bytes) / MB
+            m["gpu_mem_delta_peak_mb"] = (peak - self._gpu_mem_baseline) / MB
+        if self._nvml_handle:
+            try:
+                import pynvml
+                m["gpu_total_mb"] = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle).total / MB
+            except Exception:
+                pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                peak = torch.cuda.max_memory_allocated()
+                m["torch_gpu_peak_mb"] = peak / MB
+                m["torch_gpu_delta_mb"] = (peak - self._torch_baseline) / MB
+        except Exception:
+            pass
+        if m["gpu_total_mb"] > 0 and m["gpu_mem_peak_mb"] > 0:
+            m["gpu_mem_percent"] = m["gpu_mem_peak_mb"] / m["gpu_total_mb"] * 100
+        return m
+
+
+def _resource_metric_lines(metrics: dict[str, float]) -> list[str]:
+    gpu_delta = (
+        metrics.get("torch_gpu_delta_mb", 0.0)
+        if metrics.get("torch_gpu_delta_mb", 0.0) > 0
+        else metrics.get("gpu_mem_delta_peak_mb", 0.0)
+    )
+    lines = [
+        "",
+        "Resource metrics",
+        f"  Deconv time : {_format_duration(metrics.get('time_s', 0.0))}",
+        f"  CPU         : avg={metrics.get('cpu_percent_avg', 0.0):.0f}%  "
+        f"peak={metrics.get('cpu_percent_peak', 0.0):.0f}%",
+        f"  RAM         : peak={_format_bytes(metrics.get('ram_peak_mb', 0.0))}  "
+        f"delta={_format_bytes(metrics.get('ram_delta_peak_mb', 0.0))}  "
+        f"avg={_format_bytes(metrics.get('ram_avg_mb', 0.0))}",
+    ]
+    if metrics.get("gpu_total_mb", 0.0) > 0 or metrics.get("gpu_mem_peak_mb", 0.0) > 0:
+        lines.extend([
+            f"  GPU         : util avg={metrics.get('gpu_util_avg', 0.0):.0f}%  "
+            f"peak={metrics.get('gpu_util_peak', 0.0):.0f}%",
+            f"  VRAM        : peak={_format_bytes(metrics.get('gpu_mem_peak_mb', 0.0))}  "
+            f"delta={_format_bytes(gpu_delta)}  "
+            f"torch peak={_format_bytes(metrics.get('torch_gpu_peak_mb', 0.0))}",
+        ])
+    return lines
+
+
+def _quality_comparison_lines(source_channels: list[np.ndarray], result_channels: list[np.ndarray]) -> list[str]:
+    def _change(src: float, res: float) -> str:
+        if abs(src) > 1e-12:
+            return f"{res / src:.2f}x"
+        return f"{res - src:.4g}"
+
+    metric_order = (
+        ("detail_energy", "Detail energy"),
+        ("bright_detail_energy", "Bright detail energy"),
+        ("edge_strength", "Edge strength"),
+        ("signal_sparsity", "Signal sparsity"),
+        ("robust_range", "Robust range"),
+    )
+    lines = [
+        "",
+        "Image metrics",
+    ]
+    n_channels = min(len(source_channels), len(result_channels))
+    if n_channels:
+        lines.append(
+            f"  Metrics sample: {_metric_sample_summary(source_channels[0])} "
+            f"(caps: Z<=32, Y/X<=512)"
+        )
+    for ch_idx in range(n_channels):
+        source_q = _deconvolution_effect_metrics(source_channels[ch_idx])
+        result_q = _deconvolution_effect_metrics(result_channels[ch_idx])
+        lines.extend([
+            f"  Channel {ch_idx}",
+            "    Metric                 Source        Result      Change",
+            "    -------------------------------------------------------",
+        ])
+        for key, label in metric_order:
+            src = float(source_q.get(key, 0.0))
+            res = float(result_q.get(key, 0.0))
+            lines.append(f"    {label:<18} {src:>11.4g} {res:>13.4g} {_change(src, res):>10}")
+    if n_channels > 1:
+        source_mean = _quality_metrics(source_channels[:n_channels])
+        result_mean = _quality_metrics(result_channels[:n_channels])
+        lines.extend([
+            "  Mean across channels",
+            "    Metric                 Source        Result      Change",
+            "    -------------------------------------------------------",
+        ])
+        for key, label in metric_order:
+            mean_key = f"{key}_mean"
+            src = float(source_mean.get(mean_key, 0.0))
+            res = float(result_mean.get(mean_key, 0.0))
+            lines.append(f"    {label:<18} {src:>11.4g} {res:>13.4g} {_change(src, res):>10}")
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Single-metric horizontal bar widget (label | progress | value text)
 # ---------------------------------------------------------------------------
@@ -918,6 +1426,91 @@ class _MetricWidget(QWidget):
             else self._COLORS["ok"]
         )
         self._bar.setStyleSheet(self._style(color))
+
+
+class _LogDialog(QDialog):
+    """Detached live log window."""
+
+    metricsToggled = pyqtSignal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = False
+        self.setWindowTitle("CIDeconvolve Log")
+        self.resize(900, 560)
+        layout = QVBoxLayout(self)
+
+        self._text = QPlainTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        font = QFont("Consolas")
+        if not font.exactMatch():
+            font = QFont("Courier New")
+        font.setPointSize(9)
+        self._text.setFont(font)
+        self._text.installEventFilter(self)
+        self._text.viewport().installEventFilter(self)
+        layout.addWidget(self._text, stretch=1)
+
+        buttons = QHBoxLayout()
+        self._metrics_check = QCheckBox("Compute image metrics")
+        self._metrics_check.setToolTip(
+            "Compute FFT/gradient image metrics after deconvolution. "
+            "This can take noticeable time on large images."
+        )
+        self._metrics_check.toggled.connect(self.metricsToggled.emit)
+        buttons.addWidget(self._metrics_check)
+        buttons.addStretch()
+        self._save_button = QPushButton("Save…")
+        self._save_button.clicked.connect(self._save_log)
+        buttons.addWidget(self._save_button)
+        self._close_button = QPushButton("Close")
+        self._close_button.clicked.connect(self.close)
+        buttons.addWidget(self._close_button)
+        layout.addLayout(buttons)
+
+    def set_text(self, text: str) -> None:
+        self._text.setPlainText(text)
+        self._scroll_to_bottom()
+
+    def append_line(self, line: str) -> None:
+        self._text.appendPlainText(line)
+        if self._running:
+            self._scroll_to_bottom()
+
+    def set_running(self, running: bool) -> None:
+        self._running = bool(running)
+        self._metrics_check.setEnabled(not self._running)
+        if self._running:
+            self._text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self._text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self._scroll_to_bottom()
+        else:
+            self._text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self._text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+    def _scroll_to_bottom(self) -> None:
+        self._text.moveCursor(QTextCursor.MoveOperation.End)
+
+    def set_compute_metrics(self, enabled: bool) -> None:
+        self._metrics_check.setChecked(bool(enabled))
+
+    def eventFilter(self, obj, event) -> bool:
+        if self._running and obj in (self._text, self._text.viewport()):
+            if event.type() in (QEvent.Type.Wheel, QEvent.Type.KeyPress):
+                self._scroll_to_bottom()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _save_log(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Log",
+            str(Path.home() / "cideconvolve_log.txt"),
+            "Text files (*.txt);;All files (*)",
+        )
+        if path:
+            Path(path).write_text(self._text.toPlainText(), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -1168,6 +1761,7 @@ def _deconvolve_channel_stacks(
         _progress(
             f"T {t_index + 1} — generating PSF for channel {ci + 1}/{n_channels} (λ={em_wl:.0f} nm)…"
         )
+        t_psf = time.time()
         psf = ci_generate_psf(
             na=params["na"],
             wavelength_nm=em_wl,
@@ -1190,6 +1784,10 @@ def _deconvolve_channel_stacks(
             n_subpixels=params["n_subpixels"],
             n_pupil=params["n_pupil"],
             device=params["device"],
+        )
+        _progress(
+            f"  Ch{ci}: PSF shape={psf.shape} sum={float(psf.sum()):.6g} "
+            f"peak={float(psf.max()):.6g} generated in {_format_duration(time.time() - t_psf)}"
         )
 
         if ch_data.ndim == 2 and psf.ndim == 3 and not use_2d_wf_auto:
@@ -1216,7 +1814,11 @@ def _deconvolve_channel_stacks(
         if _stopped():
             raise RuntimeError("Stopped by user")
 
-        _progress(f"T {t_index + 1} — deconvolving channel {ci + 1}/{n_channels} ({niter} iter)…")
+        _progress(
+            f"T {t_index + 1} — deconvolving channel {ci + 1}/{n_channels} "
+            f"(image={ch_data.shape}, psf={psf.shape}, {niter} iter)…"
+        )
+        t_deconv = time.time()
         common = dict(
             niter=niter,
             offset=params["offset"],
@@ -1251,6 +1853,13 @@ def _deconvolve_channel_stacks(
                 two_d_wf_bg_scale=params["two_d_wf_bg_scale"],
                 **common,
             )
+        iterations_used = out.get("iterations_used", niter)
+        convergence_history = out.get("convergence") or []
+        conv_text = f", last objective={convergence_history[-1]:.6g}" if convergence_history else ""
+        _progress(
+            f"  Ch{ci}: done in {_format_duration(time.time() - t_deconv)} "
+            f"(iterations used={iterations_used}{conv_text})"
+        )
         results.append(_solver_output_to_zyx(out["result"].copy()))
 
         del psf
@@ -1309,7 +1918,42 @@ class _DeconvolveWorker(QThread):
         self.t_index = int(t_index)
 
     def run(self):
+        monitor = None
         try:
+            self.progress.emit("")
+            self.progress.emit("Deconvolution")
+            self.progress.emit(f"  Timepoint   : {self.t_index + 1}")
+            self.progress.emit(f"  Method      : {self.params['method']}")
+            self.progress.emit(f"  Iterations  : {', '.join(str(n) for n in self.params['niter_list'])}")
+            self.progress.emit(f"  Device      : {self.params['device'] or 'auto'}")
+            self.progress.emit(f"  Background  : {self.params['background']}")
+            self.progress.emit(f"  Offset      : {self.params['offset']}")
+            self.progress.emit(f"  Start       : {self.params['start']}")
+            self.progress.emit(
+                f"  Convergence : {self.params['convergence']} "
+                f"(threshold={self.params['rel_threshold']}, every={self.params['check_every']})"
+            )
+            if self.params["method"] == "ci_rl_tv":
+                self.progress.emit(f"  TV lambda   : {self.params['tv_lambda']}")
+            if self.params["method"] in ("ci_rl", "ci_rl_tv"):
+                self.progress.emit(f"  Damping     : {self.params['damping']}")
+                self.progress.emit(
+                    f"  2D WF mode  : {self.params['two_d_mode']} "
+                    f"(aggr={self.params['two_d_wf_aggressiveness']}, "
+                    f"bg radius={self.params['two_d_wf_bg_radius_um']} um, "
+                    f"bg scale={self.params['two_d_wf_bg_scale']})"
+                )
+            if self.params["method"] == "ci_sparse_hessian":
+                self.progress.emit(
+                    f"  Sparse      : weight={self.params['sparse_hessian_weight']}, "
+                    f"reg={self.params['sparse_hessian_reg']}"
+                )
+            if self.params["prefilter_sigma"] > 0.0:
+                self.progress.emit(f"  Prefilter   : sigma={self.params['prefilter_sigma']}")
+            self.progress.emit(f"  Image metrics: {'enabled' if self.params.get('compute_metrics') else 'disabled'}")
+
+            monitor = _RunMetricsMonitor()
+            monitor.start()
             results = _deconvolve_channel_stacks(
                 self.channels,
                 self.metadata,
@@ -1318,8 +1962,32 @@ class _DeconvolveWorker(QThread):
                 progress_cb=self.progress.emit,
                 should_stop=self.isInterruptionRequested,
             )
-            self.finished.emit({"timepoint": self.t_index, "channels": results})
+            metrics = monitor.stop()
+            for line in _resource_metric_lines(metrics):
+                self.progress.emit(line)
+            if self.params.get("compute_metrics"):
+                t_metrics = time.time()
+                self.progress.emit("")
+                self.progress.emit("Computing image metrics...")
+                for line in _quality_comparison_lines(self.channels, results):
+                    self.progress.emit(line)
+                self.progress.emit(f"Image metrics computed in {_format_duration(time.time() - t_metrics)}")
+            else:
+                self.progress.emit("")
+                self.progress.emit("Image metrics skipped (disabled).")
+            self.finished.emit({
+                "timepoint": self.t_index,
+                "channels": results,
+                "metrics": metrics,
+            })
         except Exception as exc:
+            if monitor is not None:
+                try:
+                    metrics = monitor.stop()
+                    for line in _resource_metric_lines(metrics):
+                        self.progress.emit(line)
+                except Exception:
+                    pass
             traceback.print_exc()
             self.finished.emit(exc)
 
@@ -1439,6 +2107,14 @@ class DeconvolveCIWindow(QMainWindow):
         self._worker: Optional[_DeconvolveWorker] = None
         self._save_worker: Optional[_SaveTSeriesWorker] = None
         self._monitor: Optional[_ResourceMonitor] = None
+        self._log_dialog: Optional[_LogDialog] = None
+        self._log_lines: list[str] = []
+        self._log_running = False
+        self._compute_image_metrics = False
+        self._log_emitter = _GuiLogEmitter(self)
+        self._log_handler = _QtLogHandler(self._log_emitter)
+        self._log_emitter.line.connect(self._log_from_logging)
+        logging.getLogger().addHandler(self._log_handler)
         self._input_path: Optional[Path] = None
         self._last_open_dir: str = _default_settings_dir()
         self._last_zarr_dir: str = _default_settings_dir()
@@ -2037,6 +2713,7 @@ class DeconvolveCIWindow(QMainWindow):
         vl.setContentsMargins(0, 0, 0, 0)
         self._viewer = DualViewerWidget()
         self._viewer.timepointChanged.connect(self._on_viewer_time_changed)
+        self._viewer.logRequested.connect(self._open_log_dialog)
         vl.addWidget(self._viewer, stretch=1)
         splitter.addWidget(viewer)
 
@@ -2149,6 +2826,64 @@ class DeconvolveCIWindow(QMainWindow):
 
         # Initial method state
         self._on_method_changed(self._method_combo.currentText())
+
+    # -----------------------------------------------------------------------
+    # Log window
+    # -----------------------------------------------------------------------
+
+    def _open_log_dialog(self) -> None:
+        if self._log_dialog is None:
+            self._log_dialog = _LogDialog(self)
+            self._log_dialog.finished.connect(lambda _code: setattr(self, "_log_dialog", None))
+            self._log_dialog.metricsToggled.connect(self._set_compute_image_metrics)
+            self._log_dialog.set_text("\n".join(self._log_lines))
+            self._log_dialog.set_compute_metrics(self._compute_image_metrics)
+            self._log_dialog.set_running(self._log_running)
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
+    def _reset_log(self, title: str) -> None:
+        self._log_lines = []
+        self._log_running = False
+        if self._log_dialog is not None:
+            self._log_dialog.set_running(False)
+            self._log_dialog.set_text("")
+        self._log("=" * 70)
+        self._log(title)
+        self._log("=" * 70)
+        for line in _runtime_environment_lines():
+            self._log(line)
+
+    def _log(self, text: str) -> None:
+        line = str(text)
+        self._log_lines.append(line)
+        print(line, flush=True)
+        if self._log_dialog is not None:
+            self._log_dialog.append_line(line)
+
+    def _log_from_logging(self, text: str) -> None:
+        line = str(text)
+        self._log_lines.append(line)
+        if self._log_dialog is not None:
+            self._log_dialog.append_line(line)
+
+    def _log_many(self, lines: list[str]) -> None:
+        for line in lines:
+            self._log(line)
+
+    def _set_log_running(self, running: bool) -> None:
+        self._log_running = bool(running)
+        if self._log_dialog is not None:
+            self._log_dialog.set_running(self._log_running)
+
+    def _set_compute_image_metrics(self, enabled: bool) -> None:
+        self._compute_image_metrics = bool(enabled)
+        self._log(f"Image metrics: {'enabled' if self._compute_image_metrics else 'disabled'}")
+
+    def _on_worker_progress(self, msg: str) -> None:
+        self._status.showMessage(msg)
+        self._log(msg)
 
     # -----------------------------------------------------------------------
     # Slots — control panel
@@ -2294,6 +3029,9 @@ class DeconvolveCIWindow(QMainWindow):
             self._do_load(path)
 
     def _do_load(self, path: str):
+        self._reset_log(f"CIDeconvolve GUI log — opening {Path(path).name}")
+        self._log(f"Opening source: {path}")
+        t_open = time.time()
         try:
             self._begin_busy_progress(f"Opening {Path(path).name} …")
             source = _build_file_source(path)
@@ -2303,7 +3041,9 @@ class DeconvolveCIWindow(QMainWindow):
                 source_path=Path(path),
                 source_factory=lambda _path=str(path): _build_file_source(_path),
             )
+            self._log(f"Open complete in {_format_duration(time.time() - t_open)}")
         except Exception as exc:
+            self._log(f"Load failed: {exc}")
             QMessageBox.critical(self, "Load Error", str(exc))
             self._status.showMessage("Load failed", 5000)
         finally:
@@ -2385,6 +3125,7 @@ class DeconvolveCIWindow(QMainWindow):
 
         self._viewer.set_input_data([], self._metadata)
         self._load_timepoint_into_viewer(int(self._metadata.get("default_t", 0)), force=True)
+        self._log_many(_image_detail_lines(display_name, source_path, self._metadata, self._input_channels))
 
         size_t = self._metadata.get("size_t", 1)
         size_z = self._metadata.get("size_z", 1)
@@ -2462,6 +3203,9 @@ class DeconvolveCIWindow(QMainWindow):
 
         image = images[0]
         name = image.getName()
+        self._reset_log(f"CIDeconvolve GUI log — opening OMERO image {name}")
+        self._log(f"Opening OMERO source: {name}")
+        t_open = time.time()
         try:
             self._begin_busy_progress(f"Opening {name} from OMERO …")
             source = _build_omero_source(image)
@@ -2470,7 +3214,9 @@ class DeconvolveCIWindow(QMainWindow):
                 f"OMERO: {name}",
                 source_factory=lambda _image=image: _build_omero_source(_image),
             )
+            self._log(f"Open complete in {_format_duration(time.time() - t_open)}")
         except Exception as exc:
+            self._log(f"OMERO load failed: {exc}")
             QMessageBox.critical(self, "OMERO Error", str(exc))
             self._status.showMessage("OMERO load failed", 5000)
         finally:
@@ -2519,6 +3265,7 @@ class DeconvolveCIWindow(QMainWindow):
 
         return {
             "method": self._method_combo.currentText(),
+            "compute_metrics": self._compute_image_metrics,
             "niter_list": niter_list,
             "tv_lambda": self._sp_tv_lambda.value(),
             "damping": damping,
@@ -2558,6 +3305,7 @@ class DeconvolveCIWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             self._worker.requestInterruption()
             self._btn_run.setEnabled(False)
+            self._log("Stop requested by user.")
             self._status.showMessage("Stopping …")
             return
 
@@ -2589,16 +3337,22 @@ class DeconvolveCIWindow(QMainWindow):
 
         current_t = self._viewer.current_timepoint()
         params = self._collect_params()
+        self._set_log_running(True)
+        self._log("")
+        self._log("=" * 70)
+        self._log(f"Starting deconvolution preview for T={current_t + 1}")
+        self._log("=" * 70)
         self._worker = _DeconvolveWorker(
             self._input_channels, self._metadata, params, current_t, parent=self
         )
-        self._worker.progress.connect(lambda msg: self._status.showMessage(msg))
+        self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished.connect(self._on_deconv_done)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
     def _on_deconv_done(self, result):
         self._monitor_bar.set_active(False)
+        self._set_log_running(False)
 
         self._end_progress()
         self._btn_run.setText("Run Deconvolution")
@@ -2613,8 +3367,10 @@ class DeconvolveCIWindow(QMainWindow):
             self._worker = None
             msg = str(result)
             if "Stopped by user" in msg:
+                self._log("Deconvolution stopped by user.")
                 self._status.showMessage("Deconvolution stopped", 5000)
             else:
+                self._log(f"Deconvolution failed: {msg}")
                 QMessageBox.critical(self, "Deconvolution Error", msg)
                 self._status.showMessage("Deconvolution failed", 5000)
             return
@@ -2624,6 +3380,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._preview_outputs_by_t[timepoint] = result["channels"]
             self._viewer.set_preview_result(timepoint, result["channels"])
             self._sync_preview_buttons()
+            self._log("Deconvolution complete.")
             self._status.showMessage(f"Deconvolution complete for T={timepoint + 1}", 5000)
         except Exception as exc:
             traceback.print_exc()
@@ -2657,11 +3414,16 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_save_dir = str(Path(path).parent)
 
         try:
+            t_save = time.time()
+            self._log(f"Saving preview to {path}")
             stack = np.stack(preview_channels, axis=0)
             data = stack[np.newaxis, ...].astype(np.float32)
             _write_ome_tiff(data, path, self._metadata)
+            size = Path(path).stat().st_size / (1024 * 1024) if Path(path).exists() else 0.0
+            self._log(f"Saved preview in {_format_duration(time.time() - t_save)} ({_format_bytes(size)})")
             self._status.showMessage(f"Saved → {Path(path).name}", 5000)
         except Exception as exc:
+            self._log(f"Save failed: {exc}")
             QMessageBox.critical(self, "Save Error", str(exc))
 
     def _on_save_t_series(self):
@@ -2697,10 +3459,16 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._monitor_bar.set_active(True)
+        self._set_log_running(True)
+        self._log("")
+        self._log("=" * 70)
+        self._log(f"Starting full T-series export to {path}")
+        self._log("=" * 70)
 
         if self._input_source_factory is None:
             QMessageBox.warning(self, "Save Error", "No image source is available for T-series export.")
             self._monitor_bar.set_active(False)
+            self._set_log_running(False)
             self._end_progress()
             self._btn_run.setEnabled(bool(self._input_channels))
             self._sync_preview_buttons()
@@ -2712,6 +3480,7 @@ class DeconvolveCIWindow(QMainWindow):
             save_source = self._input_source_factory()
         except Exception as exc:
             self._monitor_bar.set_active(False)
+            self._set_log_running(False)
             self._end_progress()
             self._btn_run.setEnabled(bool(self._input_channels))
             self._sync_preview_buttons()
@@ -2726,13 +3495,14 @@ class DeconvolveCIWindow(QMainWindow):
             path,
             parent=self,
         )
-        self._save_worker.progress.connect(lambda msg: self._status.showMessage(msg))
+        self._save_worker.progress.connect(self._on_worker_progress)
         self._save_worker.finished.connect(self._on_save_t_series_done)
         self._save_worker.finished.connect(self._save_worker.deleteLater)
         self._save_worker.start()
 
     def _on_save_t_series_done(self, result):
         self._monitor_bar.set_active(False)
+        self._set_log_running(False)
         self._end_progress()
         self._btn_run.setEnabled(bool(self._input_channels))
         self._sync_preview_buttons()
@@ -2742,12 +3512,17 @@ class DeconvolveCIWindow(QMainWindow):
         if isinstance(result, Exception):
             msg = str(result)
             if "Stopped by user" in msg:
+                self._log("T-series export stopped by user.")
                 self._status.showMessage("T-series export stopped", 5000)
             else:
+                self._log(f"T-series export failed: {msg}")
                 QMessageBox.critical(self, "Save Error", msg)
                 self._status.showMessage("T-series export failed", 5000)
             return
 
+        path = Path(result["path"])
+        size = path.stat().st_size / (1024 * 1024) if path.exists() else 0.0
+        self._log(f"T-series export saved: {path} ({_format_bytes(size)})")
         self._status.showMessage(f"Saved → {Path(result['path']).name}", 5000)
 
     # -----------------------------------------------------------------------
@@ -2997,13 +3772,18 @@ class DeconvolveCIWindow(QMainWindow):
             self._begin_busy_progress(f"Loading T={target_t + 1}…")
 
         try:
+            t_load = time.time()
             channels = self._input_source.load_timepoint(
                 target_t,
-                progress_cb=lambda done, total_steps, text: self._advance_progress(done, text),
+                progress_cb=lambda done, total_steps, text: (
+                    self._advance_progress(done, text),
+                    self._log(text),
+                ),
             )
             self._input_channels = channels
             self._loaded_timepoint = target_t
             self._viewer.set_input_timepoint_data(target_t, channels)
+            self._log(f"Loaded timepoint T={target_t + 1} in {_format_duration(time.time() - t_load)}")
         finally:
             self._end_progress()
 
@@ -3038,6 +3818,10 @@ class DeconvolveCIWindow(QMainWindow):
         if self._monitor is not None:
             self._monitor.request_stop()
             self._monitor = None
+        try:
+            logging.getLogger().removeHandler(self._log_handler)
+        except Exception:
+            pass
         if self._omero_gw is not None:
             try:
                 self._omero_gw.disconnect()

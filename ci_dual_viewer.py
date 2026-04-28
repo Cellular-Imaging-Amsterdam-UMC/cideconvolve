@@ -1355,6 +1355,7 @@ class _AdvancedScalingWindow(QWidget):
 
 class DualViewerWidget(QWidget):
     timepointChanged = pyqtSignal(int)
+    logRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1478,6 +1479,9 @@ class DualViewerWidget(QWidget):
         self._advanced_scaling_button = QPushButton("Advanced Scaling")
         self._advanced_scaling_button.clicked.connect(self._open_advanced_scaling)
         top.addWidget(self._advanced_scaling_button)
+        self._log_button = QPushButton("Log")
+        self._log_button.clicked.connect(self.logRequested.emit)
+        top.addWidget(self._log_button)
         top.addStretch()
 
         root.addLayout(top)

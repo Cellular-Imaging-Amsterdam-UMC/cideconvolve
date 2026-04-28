@@ -164,8 +164,9 @@ docker run --rm --gpus all \
 
 Benchmark mode deconvolves the first input image with `ci_rl`,
 `ci_rl_tv`, and `ci_sparse_hessian` at the requested iteration counts, writes a CSV with
-timing and image-quality metrics (sharpness, contrast, noise proxy), and
-generates MIP montage images.
+timing metrics, and generates MIP montage images. Optional deconvolution-effect
+image metrics can be enabled with `--compute_metrics True`.
+See [metrics.md](metrics.md) for the metric formulas and interpretation.
 
 ---
 
@@ -243,6 +244,7 @@ command line via `wrapper.py`:
 | `--projection` | none | Z-projection: `none`, `mip`, `sum` |
 | `--benchmark` | false | Run benchmark mode |
 | `--bench_crop` | false | Centre-crop image to tile-size limits before benchmarking |
+| `--compute_metrics` | false | Compute optional deconvolution-effect image metrics |
 
 ---
 
@@ -281,5 +283,4 @@ version.txt             Project version marker
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
 

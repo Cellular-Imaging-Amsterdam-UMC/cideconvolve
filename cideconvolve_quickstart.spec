@@ -13,11 +13,7 @@
 #   • Ideal for quick iteration / testing during development.
 #   • Ship the whole dist/cideconvolve/ folder (e.g. zip it) for distribution.
 #
-# NOTE: The .exe icon requires a Windows .ico file.
-#       Convert icon.svg to icon.ico first, e.g. with Inkscape:
-#           inkscape icon.svg --export-type=png --export-filename=icon.png
-#           python -c "from PIL import Image; Image.open('icon.png').save('icon.ico')"
-#       Or use an online SVG→ICO converter and place icon.ico in this folder.
+# NOTE: icon.ico is used for the Windows executable icon.
 
 import os
 import pkgutil
@@ -76,7 +72,9 @@ imc_datas, imc_binaries, imc_hiddenimports = collect_all('imagecodecs')
 obqt_datas, obqt_binaries, obqt_hiddenimports = collect_all('omero_browser_qt')
 
 # ── Resolve exe icon (needs .ico on Windows) ─────────────────────────────────
-_icon = 'icon.ico' if os.path.exists('icon.ico') else None
+_icon = os.path.abspath('icon.ico')
+if not os.path.exists(_icon):
+    raise FileNotFoundError('icon.ico is required for the Windows executable icon')
 
 a = Analysis(
     ['gui_deconvolve_ci.py'],
@@ -94,6 +92,7 @@ a = Analysis(
     ),
     datas=[
         ('icon.svg', '.'),          # runtime window icon (loaded by the app)
+        ('icon.ico', '.'),          # Windows executable icon
     ] + pyqt6_datas + vispy_datas + ogl_datas + torch_datas
       + zarr_datas + numcodecs_datas
       + ome_datas + omero_datas + obqt_datas
