@@ -879,6 +879,16 @@ def _write_zarr_field(
         field_group.attrs["omero"] = omero
 
 
+def _projection_output_suffix(projection: str) -> str:
+    """Return the filename suffix for an actual Z-projected output."""
+    projection = str(projection).strip().lower()
+    if projection == "mip":
+        return "_mip-proj"
+    if projection == "sum":
+        return "_sum-proj"
+    return ""
+
+
 def _run_plate_zarr(
     zarr_path: Path,
     out_path: str,
@@ -1444,7 +1454,7 @@ def main(argv):
 
                 t_save = time.time()
                 if projection in ("mip", "sum") and is_3d:
-                    out_name = f"{stem}_decon_{projection}.ome.tiff"
+                    out_name = f"{stem}_decon{_projection_output_suffix(projection)}.ome.tiff"
                     tmp_file = tmp_work / out_name
                     proj_result = dict(result)
                     if projection == "mip":

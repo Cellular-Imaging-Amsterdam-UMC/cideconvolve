@@ -1,8 +1,8 @@
 # ===========================================================================
 # CIDeconvolve — BIAFLOWS-compatible GPU-enabled Docker image
 # ===========================================================================
-# Base: Python slim. GPU support comes from the CUDA-enabled PyTorch wheel
-# plus the host NVIDIA driver mounted by NVIDIA Container Toolkit.
+# Base: NVIDIA CUDA 12.6 runtime (PyTorch GPU support).
+# Includes: Python 3.11 and all Python dependencies.
 #
 # BIAFLOWS convention: images in /data/in, results in /data/out,
 # ground truth in /data/gt.  The entrypoint is wrapper.py which
@@ -10,27 +10,30 @@
 # parameters, then delegates to deconvolve.py.
 # ===========================================================================
 
-FROM python:3.11-slim-bookworm
+FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
-
 # --- System packages ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-distutils \
         ca-certificates \
         fonts-dejavu-core \
-        libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+# Install pip for Python 3.11
+RUN python -m ensurepip --upgrade \
+    && python -m pip install --no-cache-dir --upgrade pip
 
 WORKDIR /app
 
 # --- Python dependencies ---
 COPY requirements_docker.txt /app/requirements_docker.txt
-RUN python -m pip install --upgrade pip \
-    && python -m pip install --no-compile -r requirements_docker.txt
+RUN pip install --no-cache-dir -r requirements_docker.txt
 
 # --- Application code ---
 COPY deconvolve.py /app/deconvolve.py

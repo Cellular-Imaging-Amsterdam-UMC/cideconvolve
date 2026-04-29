@@ -113,15 +113,26 @@ def load_descriptor() -> dict:
         return json.load(f)
 
 
-def build_docker_command(descriptor: dict, values: dict, folders: dict) -> list[str]:
+def build_docker_command(
+    descriptor: dict,
+    values: dict,
+    folders: dict,
+    docker_options: dict | None = None,
+) -> list[str]:
     """Build the docker run command from descriptor and current widget values."""
     # Derive from descriptor, strip namespace (e.g. "cellularimagingcf/") for local run
     full_image = descriptor.get("container-image", {}).get("image", "w_cideconvolve")
     image = full_image.rsplit("/", 1)[-1]
     name = descriptor.get("name", image)
+    docker_options = docker_options or {}
+    use_gpus = bool(docker_options.get("use_gpus", True))
 
     cmd = [
-        "docker", "run", "--rm", "--gpus", "all",
+        "docker", "run", "--rm",
+    ]
+    if use_gpus:
+        cmd.extend(["--gpus", "all"])
+    cmd.extend([
         "-v", f"{folders['infolder']}:/data/in",
         "-v", f"{folders['outfolder']}:/data/out",
         "-v", f"{folders['gtfolder']}:/data/gt",
@@ -130,7 +141,7 @@ def build_docker_command(descriptor: dict, values: dict, folders: dict) -> list[
         "--outfolder", "/data/out",
         "--gtfolder", "/data/gt",
         "--local",
-    ]
+    ])
 
     for inp in descriptor.get("inputs", []):
         param_id = inp["id"]
@@ -222,6 +233,23 @@ class LauncherWindow(QMainWindow):
             self.folder_widgets[key] = line
 
         layout.addWidget(folder_group)
+
+        # -- Docker runtime options --
+        docker_group = QGroupBox("Docker Runtime")
+        docker_layout = QFormLayout()
+        docker_group.setLayout(docker_layout)
+
+        self.use_gpus_checkbox = QCheckBox("Expose NVIDIA GPU to container")
+        self.use_gpus_checkbox.setChecked(True)
+        self.use_gpus_checkbox.setToolTip(
+            "When enabled, Docker is run with '--gpus all'. "
+            "Turn this off to test the container as if no GPU is available; "
+            "with device=auto the workflow should fall back to CPU."
+        )
+        self.use_gpus_checkbox.stateChanged.connect(self._update_preview)
+        docker_layout.addRow("GPU:", self.use_gpus_checkbox)
+
+        layout.addWidget(docker_group)
 
         # -- Parameters from descriptor --
         param_group = QGroupBox("Parameters")
@@ -399,6 +427,11 @@ class LauncherWindow(QMainWindow):
             "gtfolder": str(SCRIPT_DIR / "gtfolder"),
         }
 
+    def _get_docker_options(self) -> dict:
+        return {
+            "use_gpus": self.use_gpus_checkbox.isChecked(),
+        }
+
     def _browse_folder(self, line_edit: QLineEdit):
         """Open a folder picker and update the given QLineEdit."""
         current = line_edit.text()
@@ -409,13 +442,20 @@ class LauncherWindow(QMainWindow):
 
     def _update_preview(self):
         cmd = build_docker_command(
-            self.descriptor, self._get_values(), self._get_folders()
+            self.descriptor,
+            self._get_values(),
+            self._get_folders(),
+            self._get_docker_options(),
         )
         self.cmd_preview.setPlainText(" ".join(cmd))
 
     def _save_settings(self):
         """Persist current widget values and folders to .last_settings.json."""
-        data = {"values": self._get_values(), "folders": self._get_folders()}
+        data = {
+            "values": self._get_values(),
+            "folders": self._get_folders(),
+            "docker_options": self._get_docker_options(),
+        }
         try:
             with open(LAST_SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -429,6 +469,14 @@ class LauncherWindow(QMainWindow):
             saved = data.get("folders", {}).get(key)
             if saved is not None:
                 line.setText(str(saved))
+
+        # Restore Docker runtime options. Missing value defaults to GPU enabled
+        # so older settings files keep the previous launcher behavior.
+        docker_options = data.get("docker_options", {})
+        if "use_gpus" in docker_options:
+            self.use_gpus_checkbox.setChecked(bool(docker_options["use_gpus"]))
+        else:
+            self.use_gpus_checkbox.setChecked(True)
 
         # Restore parameter values
         saved_vals = data.get("values", {})
@@ -467,7 +515,11 @@ class LauncherWindow(QMainWindow):
         )
         if not path:
             return
-        data = {"values": self._get_values(), "folders": self._get_folders()}
+        data = {
+            "values": self._get_values(),
+            "folders": self._get_folders(),
+            "docker_options": self._get_docker_options(),
+        }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
@@ -489,7 +541,10 @@ class LauncherWindow(QMainWindow):
     def _on_run(self):
         self._save_settings()
         cmd = build_docker_command(
-            self.descriptor, self._get_values(), self._get_folders()
+            self.descriptor,
+            self._get_values(),
+            self._get_folders(),
+            self._get_docker_options(),
         )
         print("\n" + "=" * 70)
         print("Running:")
