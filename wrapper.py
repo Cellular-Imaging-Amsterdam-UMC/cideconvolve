@@ -71,13 +71,22 @@ _SAMPLE_RI = {
     "pbs":            1.334,
     "culture medium": 1.337,
     "vectashield":    1.45,
+    "prolong gold":   1.47,
     "glycerol":       1.474,
     "oil":            1.515,
     "prolong glass":  1.52,
 }
 
-# Default sample RI when "auto" is chosen and metadata has no value
-_SAMPLE_RI_DEFAULT = 1.45  # Vectashield
+# GUI-matched metadata fallback defaults.
+_DEFAULT_NA = 1.4
+_DEFAULT_EMISSION_WL = "520"
+_DEFAULT_PIXEL_SIZE_XY_NM = 65.0
+_DEFAULT_PIXEL_SIZE_Z_NM = 200.0
+_DEFAULT_MICROSCOPE_TYPE = "confocal"
+_DEFAULT_EXCITATION_WL = "488"
+_DEFAULT_IMMERSION_RI_CHOICE = "oil (1.515)"
+_DEFAULT_SAMPLE_RI_CHOICE = "prolong gold (1.47)"
+_SAMPLE_RI_DEFAULT = 1.47
 
 
 def _to_bool(value) -> bool:
@@ -92,10 +101,10 @@ def _to_bool(value) -> bool:
 def _parse_ri_choice(raw: str, lookup: dict[str, float]) -> float | None:
     """Parse a RI choice string like 'oil (1.515)' or a bare float.
 
-    Returns None for 'auto' (meaning: use image metadata / fallback).
+    Returns None when the value cannot be parsed.
     """
     s = str(raw).strip().lower()
-    if s == "auto":
+    if not s:
         return None
     # Try "name (1.234)" format - extract the name part
     name = s.split("(")[0].strip()
@@ -106,6 +115,23 @@ def _parse_ri_choice(raw: str, lookup: dict[str, float]) -> float | None:
         return float(s)
     except ValueError:
         return None
+
+
+def _parse_float_or_default(raw, default: float) -> float:
+    """Parse a float, accepting legacy 'auto' as the supplied default."""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _parse_float_list_or_default(raw, default: str) -> list[float]:
+    """Parse comma-separated floats, accepting legacy 'auto' as default."""
+    text = str(raw if raw is not None else default).strip()
+    if not text or text.lower() == "auto":
+        text = default
+    values = [float(x.strip()) for x in text.split(",") if x.strip()]
+    return values or [float(default)]
 
 
 # ---------------------------------------------------------------------------
@@ -445,8 +471,11 @@ def _print_resource_metrics(metrics: dict[str, float]) -> None:
           f"delta={_format_bytes(metrics.get('ram_delta_peak_mb', 0.0))}  "
           f"avg={_format_bytes(metrics.get('ram_avg_mb', 0.0))}")
     if metrics.get("gpu_total_mb", 0.0) > 0 or metrics.get("gpu_mem_peak_mb", 0.0) > 0:
-        print(f"    GPU         : util avg={metrics.get('gpu_util_avg', 0.0):.0f}%  "
-              f"peak={metrics.get('gpu_util_peak', 0.0):.0f}%")
+        if metrics.get("gpu_util_available", 0.0) > 0:
+            print(f"    GPU         : util avg={metrics.get('gpu_util_avg', 0.0):.0f}%  "
+                  f"peak={metrics.get('gpu_util_peak', 0.0):.0f}%")
+        else:
+            print("    GPU         : util n/a (NVML unavailable)")
         print(f"    VRAM        : peak={_format_bytes(metrics.get('gpu_mem_peak_mb', 0.0))}  "
               f"delta={_format_bytes(gpu_delta)}  "
               f"torch peak={_format_bytes(metrics.get('torch_gpu_peak_mb', 0.0))}")
@@ -505,12 +534,13 @@ def _load_zarr_field(
     *,
     na=None,
     refractive_index=None,
-    sample_refractive_index=1.45,
+    sample_refractive_index=None,
     microscope_type=None,
     pixel_size_xy=None,
     pixel_size_z=None,
     emission_wavelengths=None,
     excitation_wavelengths=None,
+    overrule_metadata: bool = True,
 ) -> dict:
     """Load a single field from an HCS plate zarr.
 
@@ -600,49 +630,50 @@ def _load_zarr_field(
     meta["channels"] = ch_info
     meta["channel_names"] = channel_names
 
-    # Defaults for missing critical metadata
-    meta.setdefault("microscope_type", "widefield")
-    meta.setdefault("na", 1.4)
-    meta.setdefault("refractive_index", 1.515)
-    meta.setdefault("pixel_size_x", 0.1)
-    meta.setdefault("pixel_size_y", 0.1)
-    meta.setdefault("pixel_size_z", 0.3)
+    def _use_value(current, value) -> bool:
+        return value is not None and (overrule_metadata or current is None)
+
+    # Apply user metadata values. With overrule_metadata=False, these are
+    # fallbacks only; existing image metadata is preserved.
+    if _use_value(meta.get("na"), na):
+        meta["na"] = na
+    if _use_value(meta.get("refractive_index"), refractive_index):
+        meta["refractive_index"] = refractive_index
+    if _use_value(meta.get("microscope_type"), microscope_type):
+        meta["microscope_type"] = microscope_type
+    if _use_value(meta.get("pixel_size_x"), pixel_size_xy):
+        meta["pixel_size_x"] = pixel_size_xy
+    if _use_value(meta.get("pixel_size_y"), pixel_size_xy):
+        meta["pixel_size_y"] = pixel_size_xy
+    if _use_value(meta.get("pixel_size_z"), pixel_size_z):
+        meta["pixel_size_z"] = pixel_size_z
+    if emission_wavelengths is not None:
+        for i, wl in enumerate(emission_wavelengths):
+            if i < len(meta["channels"]):
+                ch = meta["channels"][i]
+                if _use_value(ch.get("emission_wavelength"), wl):
+                    ch["emission_wavelength"] = wl
+    if excitation_wavelengths is not None:
+        for i, wl in enumerate(excitation_wavelengths):
+            if i < len(meta["channels"]):
+                ch = meta["channels"][i]
+                if _use_value(ch.get("excitation_wavelength"), wl):
+                    ch["excitation_wavelength"] = wl
 
     _defaulted = set()
     _defaults = {
-        "na": 1.4,
+        "na": _DEFAULT_NA,
         "refractive_index": 1.515,
         "microscope_type": "widefield",
-        "pixel_size_x": 0.1,
-        "pixel_size_y": 0.1,
-        "pixel_size_z": 0.3,
+        "pixel_size_x": _DEFAULT_PIXEL_SIZE_XY_NM / 1000.0,
+        "pixel_size_y": _DEFAULT_PIXEL_SIZE_XY_NM / 1000.0,
+        "pixel_size_z": _DEFAULT_PIXEL_SIZE_Z_NM / 1000.0,
     }
     for k, v in _defaults.items():
         if meta.get(k) is None:
             meta[k] = v
             _defaulted.add(k)
     meta["_defaulted_keys"] = _defaulted
-
-    # Apply user overrides
-    if na is not None:
-        meta["na"] = na
-    if refractive_index is not None:
-        meta["refractive_index"] = refractive_index
-    if microscope_type is not None:
-        meta["microscope_type"] = microscope_type
-    if pixel_size_xy is not None:
-        meta["pixel_size_x"] = pixel_size_xy
-        meta["pixel_size_y"] = pixel_size_xy
-    if pixel_size_z is not None:
-        meta["pixel_size_z"] = pixel_size_z
-    if emission_wavelengths is not None:
-        for i, wl in enumerate(emission_wavelengths):
-            if i < len(meta["channels"]):
-                meta["channels"][i]["emission_wavelength"] = wl
-    if excitation_wavelengths is not None:
-        for i, wl in enumerate(excitation_wavelengths):
-            if i < len(meta["channels"]):
-                meta["channels"][i]["excitation_wavelength"] = wl
 
     # Ensure emission wavelengths have a default
     _em_defaulted = False
@@ -653,7 +684,14 @@ def _load_zarr_field(
     if _em_defaulted:
         _defaulted.add("emission_wavelength")
 
-    meta["sample_refractive_index"] = sample_refractive_index
+    if overrule_metadata and sample_refractive_index is not None:
+        meta["sample_refractive_index"] = sample_refractive_index
+    elif meta.get("sample_refractive_index") is None:
+        meta["sample_refractive_index"] = (
+            sample_refractive_index
+            if sample_refractive_index is not None
+            else _SAMPLE_RI_DEFAULT
+        )
 
     return {"images": images, "metadata": meta}
 
@@ -837,6 +875,7 @@ def _run_plate_zarr(
     excitation_wavelengths,
     pixel_size_xy,
     pixel_size_z,
+    overrule_metadata: bool,
     tv_lambda: float,
     damping,
     sparse_hessian_weight: float,
@@ -903,6 +942,7 @@ def _run_plate_zarr(
             pixel_size_z=pixel_size_z,
             emission_wavelengths=emission_wavelengths,
             excitation_wavelengths=excitation_wavelengths,
+            overrule_metadata=overrule_metadata,
         )
         images = data["images"]
         meta = data["metadata"]
@@ -985,26 +1025,22 @@ def main(argv):
         device_param = getattr(parameters, "device", "auto")
         device = None if device_param in (None, "auto") else device_param
 
-        # PSF metadata overrides
-        na_raw = getattr(parameters, "na", "auto")
-        na_override = None if str(na_raw).strip().lower() == "auto" else float(na_raw)
-        ri_raw = str(getattr(parameters, "refractive_index", "auto"))
-        ri_override = _parse_ri_choice(ri_raw, _IMMERSION_RI)
-        sample_ri_raw = str(getattr(parameters, "sample_ri", "auto"))
-        sample_ri_parsed = _parse_ri_choice(sample_ri_raw, _SAMPLE_RI)
-        sample_ri = sample_ri_parsed if sample_ri_parsed is not None else _SAMPLE_RI_DEFAULT
-        micro_raw = getattr(parameters, "microscope_type", "auto")
-        micro_override = None if str(micro_raw).strip().lower() == "auto" else str(micro_raw)
-        em_raw = str(getattr(parameters, "emission_wl", "auto")).strip()
-        em_override = (
-            None if em_raw.lower() == "auto"
-            else [float(x.strip()) for x in em_raw.split(",") if x.strip()]
-        )
-        ex_raw = str(getattr(parameters, "excitation_wl", "auto")).strip()
-        ex_override = (
-            None if ex_raw.lower() == "auto" or not ex_raw
-            else [float(x.strip()) for x in ex_raw.split(",") if x.strip()]
-        ) or None
+        # PSF metadata parameters. By default image metadata wins; these values
+        # are fallbacks for missing metadata. With overrule enabled they replace
+        # any image metadata.
+        overrule_metadata = _to_bool(getattr(parameters, "overrule_image_metadata", False))
+        na_value = _parse_float_or_default(getattr(parameters, "na", _DEFAULT_NA), _DEFAULT_NA)
+        ri_raw = str(getattr(parameters, "refractive_index", _DEFAULT_IMMERSION_RI_CHOICE))
+        ri_value = _parse_ri_choice(ri_raw, _IMMERSION_RI) or 1.515
+        sample_ri_raw = str(getattr(parameters, "sample_ri", _DEFAULT_SAMPLE_RI_CHOICE))
+        sample_ri_value = _parse_ri_choice(sample_ri_raw, _SAMPLE_RI) or _SAMPLE_RI_DEFAULT
+        micro_value = str(getattr(parameters, "microscope_type", _DEFAULT_MICROSCOPE_TYPE)).strip().lower()
+        if micro_value == "auto":
+            micro_value = _DEFAULT_MICROSCOPE_TYPE
+        em_raw = str(getattr(parameters, "emission_wl", _DEFAULT_EMISSION_WL)).strip()
+        em_value = _parse_float_list_or_default(em_raw, _DEFAULT_EMISSION_WL)
+        ex_raw = str(getattr(parameters, "excitation_wl", _DEFAULT_EXCITATION_WL)).strip()
+        ex_value = _parse_float_list_or_default(ex_raw, _DEFAULT_EXCITATION_WL)
 
         # Deconvolution parameters
         tv_lambda = float(getattr(parameters, "tv_lambda", 0.0001))
@@ -1040,11 +1076,22 @@ def main(argv):
         t_i0 = 100000.0          # design immersion thickness (nm)
         z_p = 0.0                # particle depth (nm)
 
-        # Pixel size overrides
-        px_xy_raw = str(getattr(parameters, "pixel_size_xy", "auto")).strip()
-        px_xy_override = None if px_xy_raw.lower() == "auto" else float(px_xy_raw) / 1000.0  # nm → µm
-        px_z_raw = str(getattr(parameters, "pixel_size_z", "auto")).strip()
-        px_z_override = None if px_z_raw.lower() == "auto" else float(px_z_raw) / 1000.0  # nm → µm
+        # Pixel size parameters from descriptor are in nm; loader metadata uses um.
+        px_xy_raw = str(getattr(parameters, "pixel_size_xy", _DEFAULT_PIXEL_SIZE_XY_NM)).strip()
+        px_xy_nm = _parse_float_or_default(px_xy_raw, _DEFAULT_PIXEL_SIZE_XY_NM)
+        px_xy_value = px_xy_nm / 1000.0
+        px_z_raw = str(getattr(parameters, "pixel_size_z", _DEFAULT_PIXEL_SIZE_Z_NM)).strip()
+        px_z_nm = _parse_float_or_default(px_z_raw, _DEFAULT_PIXEL_SIZE_Z_NM)
+        px_z_value = px_z_nm / 1000.0
+
+        na_override = na_value
+        ri_override = ri_value
+        sample_ri = sample_ri_value
+        micro_override = micro_value
+        em_override = em_value
+        ex_override = ex_value
+        px_xy_override = px_xy_value
+        px_z_override = px_z_value
 
         projection = str(getattr(parameters, "projection", "none")).lower()
         benchmark = _to_bool(getattr(parameters, "benchmark", False))
@@ -1068,6 +1115,7 @@ def main(argv):
         print(f"  Iterations   : {', '.join(str(n) for n in niter_list)}")
         print(f"  Device       : {device_param}")
         print(f"  Projection   : {projection}")
+        print(f"  Metadata     : {'overrule image metadata' if overrule_metadata else 'use image metadata'}")
         if method == "ci_rl_tv":
             print(f"  TV lambda    : {tv_lambda}")
         if method in ("ci_rl", "ci_rl_tv"):
@@ -1081,20 +1129,16 @@ def main(argv):
             print(f"  Prefilter    : sigma={prefilter_sigma}")
         print(f"  Start        : {start}")
         print(f"  Convergence  : {convergence} (threshold={rel_threshold}, every={check_every})")
-        if na_override is not None:
-            print(f"  NA           : {na_override}")
-        if ri_override is not None:
-            print(f"  Immersion    : {ri_raw} -> RI {ri_override}")
-        if sample_ri_parsed is not None:
-            print(f"  Sample medium: {sample_ri_raw} -> RI {sample_ri}")
+        if overrule_metadata:
+            print(f"  NA           : {na_value}")
+            print(f"  Immersion    : {ri_raw} -> RI {ri_value}")
+            print(f"  Sample medium: {sample_ri_raw} -> RI {sample_ri_value}")
+            print(f"  Microscope   : {micro_value}")
+            print(f"  Emission WL  : {em_value}")
+            print(f"  Excitation WL: {ex_value or 'none'}")
+            print(f"  Pixel size   : XY={px_xy_nm:g} nm  Z={px_z_nm:g} nm")
         else:
-            print(f"  Sample medium: auto -> vectashield (RI {sample_ri})")
-        if micro_override is not None:
-            print(f"  Microscope   : {micro_override}")
-        if em_override is not None:
-            print(f"  Emission WL  : {em_override}")
-        if ex_override is not None:
-            print(f"  Excitation WL: {ex_override}")
+            print("  Metadata params: descriptor values used only where image metadata is missing")
         if benchmark:
             print(f"  Benchmark    : ON (crop={bench_crop})")
         print(f"  Image metrics: {'ON' if compute_metrics else 'OFF'}")
@@ -1105,54 +1149,64 @@ def main(argv):
         )
 
         if not in_imgs:
-            print("No input images found. Exiting.")
-            return
+            print("CIDeconvolve workflow failed: no input images found.")
+            return 1
 
         print(f"\nFound {len(in_imgs)} input image(s).")
 
         # ---- Benchmark mode ----
         if benchmark:
-            # Always use only the first image/plate field for benchmark
-            _run_benchmark(
-                in_imgs[0], in_path, out_path,
-                niter_list=niter_list,
-                device=device,
-                bench_crop=bench_crop,
-                compute_metrics=compute_metrics,
-                na=na_override,
-                refractive_index=ri_override,
-                sample_ri=sample_ri,
-                microscope_type=micro_override,
-                emission_wavelengths=em_override,
-                excitation_wavelengths=ex_override,
-                pixel_size_xy=px_xy_override,
-                pixel_size_z=px_z_override,
-                tv_lambda=tv_lambda,
-                damping=damping,
-                sparse_hessian_weight=sparse_hessian_weight,
-                sparse_hessian_reg=sparse_hessian_reg,
-                background=background,
-                offset=offset,
-                prefilter_sigma=prefilter_sigma,
-                start=start,
-                convergence=convergence,
-                rel_threshold=rel_threshold,
-                check_every=check_every,
-                ri_coverslip=ri_override,
-                ri_coverslip_design=ri_override,
-                ri_immersion_design=ri_override,
-                t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
-            )
-            print(f"\n{'=' * 70}")
-            print("Benchmark complete.")
-            print(f"{'=' * 70}")
+            try:
+                # Always use only the first image/plate field for benchmark
+                ok = _run_benchmark(
+                    in_imgs[0], in_path, out_path,
+                    niter_list=niter_list,
+                    device=device,
+                    bench_crop=bench_crop,
+                    compute_metrics=compute_metrics,
+                    na=na_override,
+                    refractive_index=ri_override,
+                    sample_ri=sample_ri,
+                    microscope_type=micro_override,
+                    emission_wavelengths=em_override,
+                    excitation_wavelengths=ex_override,
+                    overrule_metadata=overrule_metadata,
+                    pixel_size_xy=px_xy_override,
+                    pixel_size_z=px_z_override,
+                    tv_lambda=tv_lambda,
+                    damping=damping,
+                    sparse_hessian_weight=sparse_hessian_weight,
+                    sparse_hessian_reg=sparse_hessian_reg,
+                    background=background,
+                    offset=offset,
+                    prefilter_sigma=prefilter_sigma,
+                    start=start,
+                    convergence=convergence,
+                    rel_threshold=rel_threshold,
+                    check_every=check_every,
+                    ri_coverslip=ri_override if overrule_metadata else None,
+                    ri_coverslip_design=ri_override if overrule_metadata else None,
+                    ri_immersion_design=ri_override if overrule_metadata else None,
+                    t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
+                )
+            except Exception as exc:
+                print(f"Benchmark failed: {exc}")
+                import traceback
+                traceback.print_exc()
+                ok = False
             if tmp_path and Path(tmp_path).exists():
                 shutil.rmtree(tmp_path, ignore_errors=True)
-            return
+            print(f"\n{'=' * 70}")
+            if ok:
+                print("CIDeconvolve benchmark complete.")
+            else:
+                print("CIDeconvolve benchmark failed.")
+            return 0 if ok else 1
 
         # ---- Separate plate zarrs from regular images ----
         plate_imgs = []
         regular_imgs = []
+        failed_items: list[str] = []
         for img_resource in in_imgs:
             img_path = Path(in_path) / img_resource.filename
             if img_path.is_dir() and img_path.suffix.lower() == ".zarr" and _is_hcs_plate(img_path):
@@ -1179,6 +1233,7 @@ def main(argv):
                     microscope_type=micro_override,
                     emission_wavelengths=em_override,
                     excitation_wavelengths=ex_override,
+                    overrule_metadata=overrule_metadata,
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
                     tv_lambda=tv_lambda,
@@ -1192,9 +1247,9 @@ def main(argv):
                     convergence=convergence,
                     rel_threshold=rel_threshold,
                     check_every=check_every,
-                    ri_coverslip=ri_override,
-                    ri_coverslip_design=ri_override,
-                    ri_immersion_design=ri_override,
+                    ri_coverslip=ri_override if overrule_metadata else None,
+                    ri_coverslip_design=ri_override if overrule_metadata else None,
+                    ri_immersion_design=ri_override if overrule_metadata else None,
                     t_g=t_g, t_g0=t_g0, t_i0=t_i0, z_p=z_p,
                     two_d_mode=two_d_mode,
                     two_d_wf_aggressiveness=two_d_wf_aggressiveness,
@@ -1203,6 +1258,7 @@ def main(argv):
                     projection=projection,
                 )
             except Exception as exc:
+                failed_items.append(img_resource.filename)
                 print(f"  ERROR processing plate {img_resource.filename}: {exc}")
                 import traceback
                 traceback.print_exc()
@@ -1231,6 +1287,7 @@ def main(argv):
                     microscope_type=micro_override,
                     emission_wavelengths=em_override,
                     excitation_wavelengths=ex_override,
+                    overrule_metadata=overrule_metadata,
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
                 )
@@ -1279,9 +1336,9 @@ def main(argv):
                     psf = generate_psf(
                         meta,
                         channel_idx=ch_idx,
-                        ri_coverslip=ri_override,
-                        ri_coverslip_design=ri_override,
-                        ri_immersion_design=ri_override,
+                        ri_coverslip=ri_override if overrule_metadata else None,
+                        ri_coverslip_design=ri_override if overrule_metadata else None,
+                        ri_immersion_design=ri_override if overrule_metadata else None,
                         t_g=t_g,
                         t_g0=t_g0,
                         t_i0=t_i0,
@@ -1342,7 +1399,8 @@ def main(argv):
                 deconv_metrics = monitor.stop()
 
                 if result is None:
-                    print(f"  WARNING: deconvolve_image returned None for {img_resource.filename}")
+                    failed_items.append(img_resource.filename)
+                    print(f"  ERROR: deconvolution returned no result for {img_resource.filename}")
                     shutil.rmtree(tmp_work, ignore_errors=True)
                     continue
 
@@ -1399,6 +1457,7 @@ def main(argv):
                 shutil.rmtree(tmp_work, ignore_errors=True)
 
             except Exception as exc:
+                failed_items.append(img_resource.filename)
                 if monitor is not None and not deconv_metrics:
                     try:
                         deconv_metrics = monitor.stop()
@@ -1419,14 +1478,18 @@ def main(argv):
             print(f"    Save       : {_format_duration(save_time)}")
             print(f"    Total      : {_format_duration(elapsed)}")
 
-        print(f"\n{'=' * 70}")
-        print("CIDeconvolve workflow complete.")
-        print(f"{'=' * 70}")
-
-        # Clean up tmp folder
+        # Clean up tmp folder before the final status so the last log line is the outcome.
         if tmp_path and Path(tmp_path).exists():
             shutil.rmtree(tmp_path, ignore_errors=True)
-            print(f"Cleaned up tmp folder: {tmp_path}")
+
+        print(f"\n{'=' * 70}")
+        if failed_items:
+            print(f"CIDeconvolve workflow completed with errors: {len(failed_items)} failed item(s).")
+            print(f"Failed items: {', '.join(failed_items)}")
+            print("CIDeconvolve workflow failed.")
+        else:
+            print("CIDeconvolve workflow complete.")
+        return 1 if failed_items else 0
 
 
 
@@ -1569,6 +1632,7 @@ class _MetricsMonitor:
             "ram_total_mb": 0.0,
             "ram_percent": 0.0,
             "gpu_mem_percent": 0.0,
+            "gpu_util_available": 0.0,
         }
 
         if self._cpu_percent:
@@ -1589,6 +1653,7 @@ class _MetricsMonitor:
         if self._gpu_util:
             m["gpu_util_avg"] = sum(self._gpu_util) / len(self._gpu_util)
             m["gpu_util_peak"] = max(self._gpu_util)
+            m["gpu_util_available"] = 1.0
 
         if self._gpu_mem_bytes:
             m["gpu_mem_peak_mb"] = max(self._gpu_mem_bytes) / MB
@@ -1614,8 +1679,20 @@ class _MetricsMonitor:
                 m["torch_gpu_delta_mb"] = (
                     torch.cuda.max_memory_allocated() - self._torch_baseline
                 ) / MB
+                if m["gpu_total_mb"] <= 0:
+                    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                    m["gpu_total_mb"] = props.total_memory / MB
         except Exception:
             pass
+
+        # NVML is not always available in Docker/Singularity even when CUDA works.
+        # In that case, expose the PyTorch allocator peak in the generic VRAM
+        # fields so CSV summaries do not look like GPU usage was zero.
+        if m["gpu_mem_peak_mb"] <= 0 and m["torch_gpu_peak_mb"] > 0:
+            m["gpu_mem_peak_mb"] = m["torch_gpu_peak_mb"]
+            m["gpu_mem_avg_mb"] = m["torch_gpu_peak_mb"]
+        if m["gpu_mem_delta_peak_mb"] <= 0 and m["torch_gpu_delta_mb"] > 0:
+            m["gpu_mem_delta_peak_mb"] = m["torch_gpu_delta_mb"]
 
         if m["gpu_total_mb"] > 0 and m["gpu_mem_peak_mb"] > 0:
             m["gpu_mem_percent"] = (
@@ -1640,6 +1717,7 @@ def _write_metrics_csv(csv_path: Path, all_metrics: dict[str, dict]):
         "ram_total_mb", "ram_peak_mb", "ram_percent", "ram_avg_mb",
         "ram_delta_peak_mb",
         "gpu_util_avg", "gpu_util_peak",
+        "gpu_util_available",
         "gpu_total_mb", "gpu_mem_peak_mb", "gpu_mem_percent", "gpu_mem_avg_mb",
         "gpu_mem_delta_peak_mb",
         "torch_gpu_peak_mb", "torch_gpu_delta_mb",
@@ -1959,6 +2037,26 @@ def _make_per_channel_montages(
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
+def _write_benchmark_ome_tiff(path: Path, images):
+    """Write channel-first benchmark data with explicit OME axes."""
+    import tifffile
+
+    stack = np.stack(images, axis=0)
+    if stack.ndim == 4:
+        axes = "CZYX"
+    elif stack.ndim == 3:
+        axes = "CYX"
+    else:
+        raise ValueError(f"Unsupported benchmark stack shape: {stack.shape}")
+    tifffile.imwrite(
+        str(path),
+        stack,
+        ome=True,
+        photometric="minisblack",
+        metadata={"axes": axes},
+    )
+
+
 def _run_benchmark(
     img_resource,
     in_path,
@@ -1976,6 +2074,7 @@ def _run_benchmark(
     excitation_wavelengths,
     pixel_size_xy,
     pixel_size_z,
+    overrule_metadata,
     tv_lambda,
     damping,
     sparse_hessian_weight,
@@ -2030,7 +2129,7 @@ def _run_benchmark(
         wf = plate_info["wells_and_fields"]
         if not wf:
             print("  No fields found in plate. Exiting benchmark.")
-            return
+            return False
         row, col, field = wf[0]
         print(f"  Plate detected — using first field: {row}/{col}/{field}")
         data = _load_zarr_field(
@@ -2043,25 +2142,34 @@ def _run_benchmark(
             pixel_size_z=pixel_size_z,
             emission_wavelengths=emission_wavelengths,
             excitation_wavelengths=excitation_wavelengths,
+            overrule_metadata=overrule_metadata,
         )
         meta = data["metadata"]
         images = data["images"]
         # Save as temp OME-TIFF so benchmark methods can reload via img_path
-        import tifffile
         tmp_tiff = tmp_dir / f"{stem}_plate_field0.ome.tiff"
-        stack = np.stack(images, axis=0)
-        tifffile.imwrite(str(tmp_tiff), stack, ome=True, photometric="minisblack")
+        _write_benchmark_ome_tiff(tmp_tiff, images)
         img_path = tmp_tiff
         stem = _stem(tmp_tiff.name)
     else:
-        data = load_image(img_path)
+        data = load_image(
+            img_path,
+            na=na,
+            refractive_index=refractive_index,
+            sample_refractive_index=sample_ri,
+            microscope_type=microscope_type,
+            emission_wavelengths=emission_wavelengths,
+            excitation_wavelengths=excitation_wavelengths,
+            pixel_size_xy=pixel_size_xy,
+            pixel_size_z=pixel_size_z,
+            overrule_metadata=overrule_metadata,
+        )
         meta = data["metadata"]
         images = data["images"]
 
     # If bench_crop, centre-crop each channel to a default tile size
     _DEFAULT_CROP = 512
     if bench_crop:
-        import tifffile
         cropped = []
         for ch in images:
             if ch.ndim == 3:
@@ -2086,8 +2194,7 @@ def _run_benchmark(
         else:
             meta["size_y"], meta["size_x"] = images[0].shape
         crop_path = tmp_dir / f"{stem}_bench_crop.ome.tiff"
-        stack = np.stack(images, axis=0)
-        tifffile.imwrite(str(crop_path), stack)
+        _write_benchmark_ome_tiff(crop_path, images)
         img_path = crop_path
         print(f"  Cropped to: {images[0].shape}")
 
@@ -2106,8 +2213,8 @@ def _run_benchmark(
         excitation_wavelengths=excitation_wavelengths,
         pixel_size_xy=pixel_size_xy,
         pixel_size_z=pixel_size_z,
+        overrule_metadata=overrule_metadata,
         background=background,
-        damping=damping,
         offset=offset,
         prefilter_sigma=prefilter_sigma,
         start=start,
@@ -2132,8 +2239,8 @@ def _run_benchmark(
                 niter=niter_list,
                 tv_lambda=tv_lambda if m == "ci_rl_tv" else 0.0,
                 damping=damping if m in ("ci_rl", "ci_rl_tv") else 0.0,
-                sparse_hessian_weight=sparse_hessian_weight,
-                sparse_hessian_reg=sparse_hessian_reg,
+                sparse_hessian_weight=sparse_hessian_weight if m == "ci_sparse_hessian" else 0.6,
+                sparse_hessian_reg=sparse_hessian_reg if m == "ci_sparse_hessian" else 0.98,
                 **common_kw,
             )
             out_name = f"{stem}_{m}_{nit_tag}i.ome.tiff"
@@ -2206,6 +2313,7 @@ def _run_benchmark(
     # Clean up tmp folder
     shutil.rmtree(tmp_dir, ignore_errors=True)
     print(f"  Cleaned up benchmark tmp folder: {tmp_dir}")
+    return bool(all_metrics)
 
 
 def _print_metrics_summary(all_metrics):
@@ -2223,12 +2331,17 @@ def _print_metrics_summary(all_metrics):
         gpu_delta = (m['torch_gpu_delta_mb']
                      if m.get('torch_gpu_delta_mb', 0) > 0
                      else m['gpu_mem_delta_peak_mb'])
+        gpu_util = (
+            f"{m['gpu_util_avg']:>5.0f}%"
+            if m.get("gpu_util_available", 0.0) > 0
+            else f"{'n/a':>6}"
+        )
         print(f"  {lbl:<25} {m.get('device', '?'):>6}"
               f" {m['time_s']:>6.1f}s"
               f" {m['cpu_percent_avg']:>5.0f}%"
               f" {_format_bytes(m['ram_peak_mb']):>8}"
               f" {_format_bytes(m['ram_delta_peak_mb']):>8}"
-              f" {m['gpu_util_avg']:>5.0f}%"
+              f" {gpu_util}"
               f" {_format_bytes(m['gpu_mem_peak_mb']):>8}"
               f" {_format_bytes(gpu_delta):>8}")
     print(f"{sep}")
@@ -2244,4 +2357,10 @@ def _stem(filename: str) -> str:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("CIDeconvolve workflow failed.")
+        sys.exit(1)

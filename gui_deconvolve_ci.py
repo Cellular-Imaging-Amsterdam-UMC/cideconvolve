@@ -449,11 +449,17 @@ def _extract_bioio_metadata(img, path_str: str) -> dict:
     meta: dict = {}
 
     # Physical pixel sizes (µm)
-    pps = img.physical_pixel_sizes
-    if pps.X:
-        meta["pixel_size_x"] = pps.X
-    if pps.Z:
-        meta["pixel_size_z"] = pps.Z
+    try:
+        pps = img.physical_pixel_sizes
+    except Exception:
+        pps = None
+    if pps is not None:
+        px_x = getattr(pps, "X", None)
+        px_z = getattr(pps, "Z", None)
+        if px_x:
+            meta["pixel_size_x"] = px_x
+        if px_z:
+            meta["pixel_size_z"] = px_z
 
     # OME metadata (unified across formats via ome-types)
     try:
@@ -554,6 +560,96 @@ def _bioio_dim_size(img, dim_name: str, default: int = 1) -> int:
     except Exception:
         pass
     return max(int(default), 1)
+
+
+def _is_hcs_zarr_plate(path: Path) -> bool:
+    try:
+        import zarr
+        store = zarr.open(str(path), mode="r")
+        return "plate" in store.attrs
+    except Exception:
+        return False
+
+
+def _first_hcs_zarr_field(path: Path) -> tuple[str, str, str]:
+    import zarr
+
+    store = zarr.open(str(path), mode="r")
+    plate = dict(store.attrs).get("plate", {})
+    for well_entry in plate.get("wells", []):
+        well_path = str(well_entry.get("path", ""))
+        parts = well_path.split("/")
+        if len(parts) < 2:
+            continue
+        well = store[well_path]
+        well_attrs = dict(well.attrs)
+        for image in well_attrs.get("well", {}).get("images", []):
+            field = str(image.get("path", ""))
+            if field:
+                return parts[0], parts[1], field
+        for key in sorted(well.keys()):
+            if str(key).isdigit():
+                return parts[0], parts[1], str(key)
+    raise ValueError(f"No image fields found in HCS plate {path}")
+
+
+def _hcs_zarr_metadata(field_group, row: str, col: str, field: str) -> dict:
+    field_attrs = dict(field_group.attrs)
+    shape = tuple(int(v) for v in field_group["0"].shape)
+    while len(shape) > 5 and shape[0] == 1:
+        shape = shape[1:]
+    if len(shape) == 5:
+        size_t, size_c, size_z, size_y, size_x = shape
+    elif len(shape) == 4:
+        size_t = 1
+        size_c, size_z, size_y, size_x = shape
+    elif len(shape) == 3:
+        size_t = 1
+        size_c, size_y, size_x = shape
+        size_z = 1
+    else:
+        raise ValueError(f"Unexpected HCS field data shape: {shape}")
+
+    meta: dict = {
+        "size_t": size_t,
+        "size_c": size_c,
+        "size_z": size_z,
+        "size_y": size_y,
+        "size_x": size_x,
+        "n_channels": size_c,
+        "default_t": 0,
+        "default_z": size_z // 2 if size_z > 1 else 0,
+        "hcs_plate_field": f"{row}/{col}/{field}",
+    }
+
+    multiscales = field_attrs.get("multiscales", [])
+    if multiscales:
+        datasets = multiscales[0].get("datasets", [])
+        if datasets:
+            for transform in datasets[0].get("coordinateTransformations", []):
+                if transform.get("type") != "scale":
+                    continue
+                scale = transform.get("scale", [])
+                if len(scale) == 5:
+                    meta["pixel_size_z"] = scale[2]
+                    meta["pixel_size_y"] = scale[3]
+                    meta["pixel_size_x"] = scale[4]
+                elif len(scale) == 4:
+                    meta["pixel_size_z"] = scale[1]
+                    meta["pixel_size_y"] = scale[2]
+                    meta["pixel_size_x"] = scale[3]
+                elif len(scale) == 3:
+                    meta["pixel_size_y"] = scale[1]
+                    meta["pixel_size_x"] = scale[2]
+                break
+
+    omero_channels = field_attrs.get("omero", {}).get("channels", [])
+    if omero_channels:
+        meta["channel_names"] = [
+            str(ch.get("label") or f"Ch{i}") for i, ch in enumerate(omero_channels)
+        ]
+        meta["channels"] = [{} for _ in omero_channels]
+    return meta
 
 
 def _normalize_stack_to_zyx(arr: np.ndarray) -> np.ndarray:
@@ -926,6 +1022,56 @@ class _BioImageTimepointSource(_BaseTimepointSource):
         return channels
 
 
+class _HcsZarrTimepointSource(_BaseTimepointSource):
+    def __init__(self, path_str: str):
+        import zarr
+
+        self._path = Path(path_str)
+        self._store = zarr.open(str(self._path), mode="r")
+        self._row, self._col, self._field = _first_hcs_zarr_field(self._path)
+        self._field_group = self._store[f"{self._row}/{self._col}/{self._field}"]
+
+        meta = _hcs_zarr_metadata(self._field_group, self._row, self._col, self._field)
+        size_c = max(int(meta.get("size_c", 1)), 1)
+        meta = _apply_metadata_defaults([None] * size_c, meta)
+        super().__init__(meta)
+
+    def load_timepoint(
+        self,
+        t_index: int,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> list[np.ndarray]:
+        dataset = self._field_group["0"]
+        shape = tuple(int(v) for v in dataset.shape)
+        size_c = max(int(self.metadata.get("size_c", 1)), 1)
+        size_t = max(int(self.metadata.get("size_t", 1)), 1)
+        target_t = max(0, min(int(t_index), size_t - 1))
+
+        if len(shape) == 5:
+            data = np.asarray(dataset[target_t])
+        elif len(shape) == 4:
+            data = np.asarray(dataset[:])
+        elif len(shape) == 3:
+            data = np.asarray(dataset[:])
+        else:
+            data = np.asarray(dataset[:])
+            while data.ndim > 5 and data.shape[0] == 1:
+                data = data[0]
+            if data.ndim == 5:
+                data = data[target_t]
+
+        channels: list[np.ndarray] = []
+        total = size_c
+        for c_index in range(size_c):
+            if progress_cb is not None:
+                progress_cb(c_index, total, f"Loading HCS field {self._row}/{self._col}/{self._field} channel {c_index + 1}/{total}")
+            channel = data[c_index]
+            channels.append(_normalize_stack_to_zyx(channel))
+            if progress_cb is not None:
+                progress_cb(c_index + 1, total, f"Loading HCS field {self._row}/{self._col}/{self._field} channel {c_index + 1}/{total}")
+        return channels
+
+
 class _OmeroTimepointSource(_BaseTimepointSource):
     def __init__(self, image):
         from omero_browser_qt import RegularImagePlaneProvider, get_image_metadata
@@ -971,6 +1117,9 @@ class _OmeroTimepointSource(_BaseTimepointSource):
 
 
 def _build_file_source(path_str: str) -> _BaseTimepointSource:
+    path = Path(path_str)
+    if path.is_dir() and path.suffix.lower() == ".zarr" and _is_hcs_zarr_plate(path):
+        return _HcsZarrTimepointSource(path_str)
     return _BioImageTimepointSource(path_str)
 
 
@@ -3035,6 +3184,11 @@ class DeconvolveCIWindow(QMainWindow):
         try:
             self._begin_busy_progress(f"Opening {Path(path).name} …")
             source = _build_file_source(path)
+            if source.metadata.get("hcs_plate_field"):
+                self._log(
+                    "HCS plate detected; using first field "
+                    f"{source.metadata['hcs_plate_field']}"
+                )
             self._apply_image_source(
                 source,
                 Path(path).name,

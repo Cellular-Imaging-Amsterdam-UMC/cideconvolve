@@ -132,10 +132,14 @@ def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
 def _extract_bioio_metadata(img) -> dict[str, Any]:
     """Extract metadata from a bioio BioImage object."""
     meta: dict[str, Any] = {}
-    pps = img.physical_pixel_sizes
-    meta["pixel_size_x"] = pps.X
-    meta["pixel_size_y"] = pps.Y
-    meta["pixel_size_z"] = pps.Z
+    try:
+        pps = img.physical_pixel_sizes
+    except Exception as exc:
+        logger.warning("Could not read physical pixel sizes: %s", exc)
+        pps = None
+    meta["pixel_size_x"] = getattr(pps, "X", None) if pps is not None else None
+    meta["pixel_size_y"] = getattr(pps, "Y", None) if pps is not None else None
+    meta["pixel_size_z"] = getattr(pps, "Z", None) if pps is not None else None
     meta["size_x"] = img.dims.X
     meta["size_y"] = img.dims.Y
     meta["size_z"] = img.dims.Z
@@ -197,6 +201,112 @@ def _extract_bioio_metadata(img) -> dict[str, Any]:
     return meta
 
 
+def _is_hcs_zarr_plate(path: Path) -> bool:
+    """Return True if *path* is an OME-Zarr HCS plate root."""
+    try:
+        import zarr
+        store = zarr.open(str(path), mode="r")
+        return "plate" in store.attrs
+    except Exception:
+        return False
+
+
+def _first_hcs_zarr_field(path: Path) -> tuple[str, str, str]:
+    """Return the first (row, column, field) entry from an HCS plate."""
+    import zarr
+    store = zarr.open(str(path), mode="r")
+    plate = dict(store.attrs).get("plate", {})
+    for well_entry in plate.get("wells", []):
+        well_path = str(well_entry.get("path", ""))
+        parts = well_path.split("/")
+        if len(parts) < 2:
+            continue
+        well = store[well_path]
+        well_attrs = dict(well.attrs)
+        for image in well_attrs.get("well", {}).get("images", []):
+            field = str(image.get("path", ""))
+            if field:
+                return parts[0], parts[1], field
+        for key in sorted(well.keys()):
+            if str(key).isdigit():
+                return parts[0], parts[1], str(key)
+    raise ValueError(f"No image fields found in HCS plate {path}")
+
+
+def _load_first_hcs_zarr_field(path: Path) -> dict[str, Any]:
+    """Load the first field from an OME-Zarr HCS plate root."""
+    import zarr
+
+    row, col, field = _first_hcs_zarr_field(path)
+    store = zarr.open(str(path), mode="r")
+    field_group = store[f"{row}/{col}/{field}"]
+    field_attrs = dict(field_group.attrs)
+    data = np.asarray(field_group["0"][:])
+
+    while data.ndim > 5 and data.shape[0] == 1:
+        data = data[0]
+    if data.ndim == 5:
+        n_t, n_c, n_z, n_y, n_x = data.shape
+        data = data[0]
+    elif data.ndim == 4:
+        n_t = 1
+        n_c, n_z, n_y, n_x = data.shape
+    elif data.ndim == 3:
+        n_t = 1
+        n_c, n_y, n_x = data.shape
+        n_z = 1
+    else:
+        raise ValueError(f"Unexpected HCS field data shape: {data.shape}")
+
+    images = []
+    for c in range(n_c):
+        channel = data[c]
+        if channel.ndim == 3 and channel.shape[0] == 1:
+            channel = channel[0]
+        images.append(np.asarray(channel, dtype=np.float32))
+
+    meta: dict[str, Any] = {
+        "size_x": n_x,
+        "size_y": n_y,
+        "size_z": n_z,
+        "size_c": n_c,
+        "size_t": n_t,
+        "n_channels": n_c,
+        "hcs_plate_field": f"{row}/{col}/{field}",
+    }
+
+    multiscales = field_attrs.get("multiscales", [])
+    if multiscales:
+        datasets = multiscales[0].get("datasets", [])
+        if datasets:
+            for transform in datasets[0].get("coordinateTransformations", []):
+                if transform.get("type") != "scale":
+                    continue
+                scale = transform.get("scale", [])
+                if len(scale) == 5:
+                    meta["pixel_size_z"] = scale[2]
+                    meta["pixel_size_y"] = scale[3]
+                    meta["pixel_size_x"] = scale[4]
+                elif len(scale) == 4:
+                    meta["pixel_size_z"] = scale[1]
+                    meta["pixel_size_y"] = scale[2]
+                    meta["pixel_size_x"] = scale[3]
+                elif len(scale) == 3:
+                    meta["pixel_size_y"] = scale[1]
+                    meta["pixel_size_x"] = scale[2]
+                break
+
+    omero_channels = field_attrs.get("omero", {}).get("channels", [])
+    if omero_channels:
+        meta["channel_names"] = [
+            str(ch.get("label") or f"Ch{i}") for i, ch in enumerate(omero_channels)
+        ]
+        meta["channels"] = [{} for _ in omero_channels]
+
+    logger.info("HCS plate detected; loaded first field %s/%s/%s", row, col, field)
+    return {"images": images, "metadata": meta}
+
+
 def load_image(
     path: Union[str, Path],
     *,
@@ -208,7 +318,8 @@ def load_image(
     pixel_size_z: Optional[float] = None,
     emission_wavelengths: Optional[list[float]] = None,
     excitation_wavelengths: Optional[list[float]] = None,
-    sample_refractive_index: float = 1.33,
+    sample_refractive_index: Optional[float] = 1.47,
+    overrule_metadata: bool = True,
 ) -> dict[str, Any]:
     """Load an OME-TIFF image and extract microscopy metadata.
 
@@ -232,8 +343,8 @@ def load_image(
         Override emission wavelengths in nm, one per channel.
     excitation_wavelengths : list[float], optional
         Override excitation wavelengths in nm, one per channel.
-    sample_refractive_index : float
-        Refractive index of the sample medium (default 1.33 for aqueous).
+    sample_refractive_index : float, optional
+        Fallback refractive index of the sample medium (default 1.47).
 
     Returns
     -------
@@ -273,25 +384,30 @@ def load_image(
         from bioio import BioImage
 
         if _is_zarr:
-            import bioio_ome_zarr
-            img = BioImage(path, reader=bioio_ome_zarr.Reader)
-            # If there are multiple images (scenes) take only the first
-            if len(img.scenes) > 1:
-                logger.info(
-                    "OME-Zarr contains %d images (scenes); using first: %s",
-                    len(img.scenes), img.scenes[0],
-                )
-                img.set_scene(img.scenes[0])
-            bioio_meta = _extract_bioio_metadata(img)
-            for k, v in bioio_meta.items():
-                if k not in meta or meta[k] is None:
-                    meta[k] = v
-            for c in range(img.dims.C):
-                if img.dims.Z > 1:
-                    channel_data = img.get_image_data("ZYX", T=0, C=c)
-                else:
-                    channel_data = img.get_image_data("YX", T=0, C=c)
-                images.append(np.asarray(channel_data, dtype=np.float32))
+            if _is_hcs_zarr_plate(path):
+                data = _load_first_hcs_zarr_field(path)
+                meta.update(data["metadata"])
+                images.extend(data["images"])
+            else:
+                import bioio_ome_zarr
+                img = BioImage(path, reader=bioio_ome_zarr.Reader)
+                # If there are multiple images (scenes) take only the first
+                if len(img.scenes) > 1:
+                    logger.info(
+                        "OME-Zarr contains %d images (scenes); using first: %s",
+                        len(img.scenes), img.scenes[0],
+                    )
+                    img.set_scene(img.scenes[0])
+                bioio_meta = _extract_bioio_metadata(img)
+                for k, v in bioio_meta.items():
+                    if k not in meta or meta[k] is None:
+                        meta[k] = v
+                for c in range(img.dims.C):
+                    if img.dims.Z > 1:
+                        channel_data = img.get_image_data("ZYX", T=0, C=c)
+                    else:
+                        channel_data = img.get_image_data("YX", T=0, C=c)
+                    images.append(np.asarray(channel_data, dtype=np.float32))
 
         elif companion_path is not None and path.suffix == ".ome":
             # Find the associated TIFF files from the companion
@@ -369,30 +485,39 @@ def load_image(
             elif data.ndim == 2:  # Single 2D image
                 images.append(np.asarray(data, dtype=np.float32))
 
-    # Apply user overrides (Consideration 1: incomplete metadata)
-    if na is not None:
+    def _use_value(current, value) -> bool:
+        return value is not None and (overrule_metadata or current is None)
+
+    # Apply user metadata values. With overrule_metadata=False, these are
+    # fallbacks only; existing image metadata is preserved.
+    if _use_value(meta.get("na"), na):
         meta["na"] = na
-    if refractive_index is not None:
+    if _use_value(meta.get("refractive_index"), refractive_index):
         meta["refractive_index"] = refractive_index
-    if microscope_type is not None:
+    if _use_value(meta.get("microscope_type"), microscope_type):
         meta["microscope_type"] = microscope_type
-    if pixel_size_xy is not None:
+    if _use_value(meta.get("pixel_size_x"), pixel_size_xy):
         meta["pixel_size_x"] = pixel_size_xy
+    if _use_value(meta.get("pixel_size_y"), pixel_size_xy):
         meta["pixel_size_y"] = pixel_size_xy
-    if pixel_size_z is not None:
+    if _use_value(meta.get("pixel_size_z"), pixel_size_z):
         meta["pixel_size_z"] = pixel_size_z
     if emission_wavelengths is not None:
         if "channels" not in meta:
             meta["channels"] = [{} for _ in emission_wavelengths]
         for i, wl in enumerate(emission_wavelengths):
             if i < len(meta["channels"]):
-                meta["channels"][i]["emission_wavelength"] = wl
+                ch = meta["channels"][i]
+                if _use_value(ch.get("emission_wavelength"), wl):
+                    ch["emission_wavelength"] = wl
     if excitation_wavelengths is not None:
         if "channels" not in meta:
             meta["channels"] = [{} for _ in excitation_wavelengths]
         for i, wl in enumerate(excitation_wavelengths):
             if i < len(meta["channels"]):
-                meta["channels"][i]["excitation_wavelength"] = wl
+                ch = meta["channels"][i]
+                if _use_value(ch.get("excitation_wavelength"), wl):
+                    ch["excitation_wavelength"] = wl
 
     # Apply defaults for critical missing values (setdefault won't
     # replace an existing key whose value is None, so fix those too).
@@ -402,9 +527,9 @@ def load_image(
         "na": 1.4,
         "refractive_index": 1.515,
         "microscope_type": "widefield",
-        "pixel_size_x": 0.1,
-        "pixel_size_y": 0.1,
-        "pixel_size_z": 0.3,
+        "pixel_size_x": 0.065,
+        "pixel_size_y": 0.065,
+        "pixel_size_z": 0.2,
     }
     _defaulted = set()
     for _k, _v in _defaults.items():
@@ -412,7 +537,12 @@ def load_image(
             meta[_k] = _v
             _defaulted.add(_k)
     meta["_defaulted_keys"] = _defaulted
-    meta["sample_refractive_index"] = sample_refractive_index
+    if overrule_metadata and sample_refractive_index is not None:
+        meta["sample_refractive_index"] = sample_refractive_index
+    elif meta.get("sample_refractive_index") is None:
+        meta["sample_refractive_index"] = (
+            sample_refractive_index if sample_refractive_index is not None else 1.47
+        )
     meta["n_channels"] = len(images)
 
     # Ensure channels list
@@ -794,7 +924,8 @@ def deconvolve_image(
     pixel_size_z: Optional[float] = None,
     emission_wavelengths: Optional[list[float]] = None,
     excitation_wavelengths: Optional[list[float]] = None,
-    sample_refractive_index: float = 1.33,
+    sample_refractive_index: Optional[float] = 1.47,
+    overrule_metadata: bool = True,
     # PSF options
     psf_size_xy: Optional[int] = None,
     n_pix_pupil: int = 129,
@@ -862,6 +993,7 @@ def deconvolve_image(
         emission_wavelengths=emission_wavelengths,
         excitation_wavelengths=excitation_wavelengths,
         sample_refractive_index=sample_refractive_index,
+        overrule_metadata=overrule_metadata,
     )
 
     images = data["images"]

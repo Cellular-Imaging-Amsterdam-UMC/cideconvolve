@@ -142,13 +142,17 @@ docker run --rm --gpus all \
     -v /tmp/gt:/data/gt \
     cellularimagingcf/w_cideconvolve \
     --infolder /data/in --outfolder /data/out --gtfolder /data/gt \
-    --method ci_rl --iterations 40 \
-    --na auto --refractive_index auto --sample_ri auto \
-    --microscope_type auto --emission_wl auto --excitation_wl auto
+    --method ci_rl --iterations 40
 ```
 
 Replace paths as needed.  The `--gpus all` flag enables NVIDIA GPU
 pass-through.  Omit it to force CPU-only execution.
+
+By default, image metadata is used for NA, wavelengths, pixel sizes,
+microscope type, and refractive indices where present; descriptor/CLI values
+are used as fallbacks when image metadata is missing. Add
+`--overrule_image_metadata True` to force the descriptor/CLI values for those
+fields.
 
 ### Benchmark mode
 
@@ -188,8 +192,7 @@ pip install -r requirements.txt
 ```bash
 python wrapper.py \
     --infolder ./infolder --outfolder ./outfolder --gtfolder ./gtfolder \
-    --method ci_rl --iterations 40 \
-    --na auto --refractive_index auto --sample_ri auto
+    --method ci_rl --iterations 40
 ```
 
 ### Launcher (GUI)
@@ -225,13 +228,14 @@ command line via `wrapper.py`:
 | `--sparse_hessian_weight` | 0.6 | Hessian-vs-sparsity balance (only for `ci_sparse_hessian`) |
 | `--sparse_hessian_reg` | 0.98 | Data-vs-regulariser balance (only for `ci_sparse_hessian`) |
 | `--device` | auto | Compute device: `auto`, `cpu`, `cuda` |
-| `--na` | auto | Numerical aperture override |
-| `--refractive_index` | auto | Immersion medium RI (`air`, `water`, `oil`) |
-| `--sample_ri` | auto | Sample/mounting medium RI (named presets available) |
-| `--microscope_type` | auto | `widefield` or `confocal` |
+| `--overrule_image_metadata` | false | Replace image metadata with descriptor/CLI metadata values |
+| `--na` | 1.4 | Numerical aperture fallback, or override when metadata is overruled |
+| `--refractive_index` | oil (1.515) | Immersion medium RI fallback, or override when metadata is overruled |
+| `--sample_ri` | prolong gold (1.47) | Sample/mounting medium RI fallback, or override when metadata is overruled |
+| `--microscope_type` | confocal | `widefield` or `confocal` fallback, or override when metadata is overruled |
 | `--two_d_mode` | auto | RL-family 2D widefield mode: `auto` (widefield-aware 2D PSF) or `legacy_2d` |
-| `--emission_wl` | auto | Emission wavelengths in nm (comma-separated) |
-| `--excitation_wl` | auto | Excitation wavelengths in nm (for confocal PSF) |
+| `--emission_wl` | 520 | Emission wavelength fallback, or override when metadata is overruled |
+| `--excitation_wl` | 488 | Excitation wavelength fallback, or override when metadata is overruled |
 | `--background` | auto | Background subtraction: `auto`, numeric value, or `0` to disable |
 | `--damping` | none | Noise-gated damping for `ci_rl` / `ci_rl_tv`: `none`, `auto`, or numeric |
 | `--offset` | auto | Positive processing offset: `auto`, `none`, or numeric |
@@ -239,8 +243,8 @@ command line via `wrapper.py`:
 | `--start` | flat | Initial estimate: `flat`, `observed`, or `lowpass` |
 | `--convergence` | auto | Early-stopping convergence: `auto` or `none` |
 | `--rel_threshold` | 0.005 | Relative change threshold for early stopping |
-| `--pixel_size_xy` | auto | Lateral pixel size in nm |
-| `--pixel_size_z` | auto | Axial pixel size (Z step) in nm |
+| `--pixel_size_xy` | 65 | Lateral pixel size fallback in nm, or override when metadata is overruled |
+| `--pixel_size_z` | 200 | Axial pixel size fallback in nm, or override when metadata is overruled |
 | `--projection` | none | Z-projection: `none`, `mip`, `sum` |
 | `--benchmark` | false | Run benchmark mode |
 | `--bench_crop` | false | Centre-crop image to tile-size limits before benchmarking |
@@ -283,4 +287,3 @@ version.txt             Project version marker
 ## License
 
 MIT — see [LICENSE](LICENSE).
-

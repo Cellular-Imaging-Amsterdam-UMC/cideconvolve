@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -37,6 +38,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QLineEdit,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -72,6 +74,38 @@ class ToggleSwitch(QCheckBox):
             }
             """
         )
+
+
+class CollapsiblePanel(QWidget):
+    """Simple collapsible panel with a checkable header button."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._toggle = QToolButton()
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(False)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self._toggle.clicked.connect(self._on_toggled)
+
+        self.content = QWidget()
+        self.content.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self._toggle)
+        layout.addWidget(self.content)
+
+    def _on_toggled(self, checked: bool):
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+        self.content.setVisible(checked)
+        window = self.window()
+        if window is not None:
+            window.adjustSize()
 
 
 def load_descriptor() -> dict:
@@ -130,11 +164,23 @@ class LauncherWindow(QMainWindow):
         self.widgets: dict[str, QWidget] = {}
         self._build_ui()
 
+    @staticmethod
+    def _is_advanced_input(inp: dict) -> bool:
+        name = str(inp.get("name", "")).strip().lower()
+        return name.startswith("(adv)")
+
+    @staticmethod
+    def _add_two_column_row(grid: QGridLayout, row_index: int, label: QLabel, widget: QWidget):
+        col = 0 if row_index % 2 == 0 else 2
+        row = row_index // 2
+        grid.addWidget(label, row, col)
+        grid.addWidget(widget, row, col + 1)
+
     def _build_ui(self):
         name = self.descriptor.get("name", "W_CIDeconvolve")
         self.setWindowTitle(f"{name} — Launcher")
         self.setWindowIcon(QIcon(str(ICON_PATH)))
-        self.setMinimumWidth(676)
+        self.setMinimumWidth(920)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -179,8 +225,28 @@ class LauncherWindow(QMainWindow):
 
         # -- Parameters from descriptor --
         param_group = QGroupBox("Parameters")
-        param_layout = QFormLayout()
+        param_layout = QVBoxLayout()
+        param_layout.setSpacing(8)
         param_group.setLayout(param_layout)
+
+        main_params = QWidget()
+        main_grid = QGridLayout(main_params)
+        main_grid.setContentsMargins(0, 0, 0, 0)
+        main_grid.setHorizontalSpacing(18)
+        main_grid.setVerticalSpacing(6)
+        main_grid.setColumnStretch(1, 1)
+        main_grid.setColumnStretch(3, 1)
+
+        advanced_panel = CollapsiblePanel("Advanced parameters")
+        advanced_grid = QGridLayout(advanced_panel.content)
+        advanced_grid.setContentsMargins(18, 0, 0, 0)
+        advanced_grid.setHorizontalSpacing(18)
+        advanced_grid.setVerticalSpacing(6)
+        advanced_grid.setColumnStretch(1, 1)
+        advanced_grid.setColumnStretch(3, 1)
+
+        main_count = 0
+        advanced_count = 0
 
         for inp in self.descriptor.get("inputs", []):
             if inp.get("set-by-server", False):
@@ -191,9 +257,18 @@ class LauncherWindow(QMainWindow):
                 widget.setToolTip(tooltip)
                 label = QLabel(inp.get("name", inp["id"]))
                 label.setToolTip(tooltip)
-                param_layout.addRow(label, widget)
+                label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if self._is_advanced_input(inp):
+                    self._add_two_column_row(advanced_grid, advanced_count, label, widget)
+                    advanced_count += 1
+                else:
+                    self._add_two_column_row(main_grid, main_count, label, widget)
+                    main_count += 1
                 self.widgets[inp["id"]] = widget
 
+        param_layout.addWidget(main_params)
+        if advanced_count:
+            param_layout.addWidget(advanced_panel)
         layout.addWidget(param_group)
 
         # -- Command preview --
@@ -253,7 +328,7 @@ class LauncherWindow(QMainWindow):
             w = self.widgets.get(inp["id"])
             if w is None:
                 continue
-            if isinstance(w, QSpinBox):
+            if isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 w.valueChanged.connect(self._update_preview)
             elif isinstance(w, QComboBox):
                 w.currentTextChanged.connect(self._update_preview)
@@ -309,7 +384,7 @@ class LauncherWindow(QMainWindow):
                 continue
             if isinstance(w, QCheckBox):
                 values[inp["id"]] = w.isChecked()
-            elif isinstance(w, QSpinBox):
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 values[inp["id"]] = w.value()
             elif isinstance(w, QComboBox):
                 values[inp["id"]] = w.currentText()
@@ -364,6 +439,8 @@ class LauncherWindow(QMainWindow):
                 continue
             if isinstance(w, QCheckBox):
                 w.setChecked(bool(val))
+            elif isinstance(w, QDoubleSpinBox):
+                w.setValue(float(val))
             elif isinstance(w, QSpinBox):
                 w.setValue(int(val))
             elif isinstance(w, QComboBox):

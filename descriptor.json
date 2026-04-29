@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
+  "command-line": "python wrapper.py --method @method --iterations @iterations --convergence @convergence --rel_threshold @rel_threshold --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_crop @bench_crop --compute_metrics @compute_metrics --tv_lambda @tv_lambda --damping @damping --two_d_mode @two_d_mode --sparse_hessian_weight @sparse_hessian_weight --sparse_hessian_reg @sparse_hessian_reg --background @background --offset @offset --prefilter_sigma @prefilter_sigma --start @start --device @device --two_d_wf_aggressiveness @two_d_wf_aggressiveness --two_d_wf_bg_radius_um @two_d_wf_bg_radius_um --two_d_wf_bg_scale @two_d_wf_bg_scale",
   "inputs": [
     {
       "id": "method",
@@ -29,7 +29,7 @@
       "command-line-flag": "--iterations",
       "name": "(ess) RL iterations",
       "description": "Number of RL iterations per channel, comma-separated. A single value applies to all channels. Example: '150' or '150, 100, 200'.",
-      "default-value": "40",
+      "default-value": "150",
       "set-by-server": false,
       "optional": true,
       "type": "String"
@@ -63,23 +63,36 @@
       "maximum": 1
     },
     {
+      "id": "overrule_image_metadata",
+      "value-key": "@overrule_image_metadata",
+      "command-line-flag": "--overrule_image_metadata",
+      "name": "(ess) Overrule image metadata",
+      "description": "When disabled, image metadata is used where present and the descriptor values below are used only as fallbacks for missing metadata. When enabled, the descriptor values always replace image metadata.",
+      "default-value": false,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
       "id": "na",
       "value-key": "@na",
       "command-line-flag": "--na",
       "name": "(ess) Numerical aperture",
-      "description": "Override objective numerical aperture. 'auto' uses value from image metadata (default 1.4 if missing).",
-      "default-value": "auto",
+      "description": "Objective numerical aperture. Used as a fallback when image metadata is missing, or as an override when image metadata is overruled.",
+      "default-value": 1.4,
       "set-by-server": false,
       "optional": true,
-      "type": "String"
+      "type": "Number",
+      "minimum": 0.1,
+      "maximum": 2.0
     },
     {
       "id": "emission_wl",
       "value-key": "@emission_wl",
       "command-line-flag": "--emission_wl",
       "name": "(ess) Emission wavelengths",
-      "description": "Override emission wavelengths in nm, comma-separated (one per channel). 'auto' uses values from image metadata (default 520 nm if missing). Example: '520, 600'.",
-      "default-value": "auto",
+      "description": "Emission wavelengths in nm, comma-separated (one per channel). Used as fallbacks when image metadata is missing, or as overrides when image metadata is overruled.",
+      "default-value": "520",
       "set-by-server": false,
       "optional": true,
       "type": "String"
@@ -89,35 +102,38 @@
       "value-key": "@pixel_size_xy",
       "command-line-flag": "--pixel_size_xy",
       "name": "(ess) Pixel size XY (nm)",
-      "description": "Override lateral pixel size in nanometers. 'auto' uses value from image metadata.",
-      "default-value": "auto",
+      "description": "Lateral pixel size in nanometers. Used as a fallback when image metadata is missing, or as an override when image metadata is overruled.",
+      "default-value": 65.0,
       "set-by-server": false,
       "optional": true,
-      "type": "String"
+      "type": "Number",
+      "minimum": 1,
+      "maximum": 10000
     },
     {
       "id": "pixel_size_z",
       "value-key": "@pixel_size_z",
       "command-line-flag": "--pixel_size_z",
       "name": "(ess) Pixel size Z (nm)",
-      "description": "Override axial pixel size (Z step) in nanometers. 'auto' uses value from image metadata.",
-      "default-value": "auto",
+      "description": "Axial pixel size / Z step in nanometers. Used as a fallback when image metadata is missing, or as an override when image metadata is overruled.",
+      "default-value": 200.0,
       "set-by-server": false,
       "optional": true,
-      "type": "String"
+      "type": "Number",
+      "minimum": 1,
+      "maximum": 50000
     },
     {
       "id": "microscope_type",
       "value-key": "@microscope_type",
       "command-line-flag": "--microscope_type",
       "name": "(ess) Microscope type",
-      "description": "Override microscope type for PSF model. 'auto' uses value from image metadata (default 'widefield' if missing). Confocal uses emission × excitation PSF when excitation wavelengths are provided.",
-      "default-value": "auto",
+      "description": "Microscope type. Used as a fallback when image metadata is missing, or as an override when image metadata is overruled.",
+      "default-value": "confocal",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
-        "auto",
         "widefield",
         "confocal"
       ]
@@ -127,8 +143,8 @@
       "value-key": "@excitation_wl",
       "command-line-flag": "--excitation_wl",
       "name": "(ess) Excitation wavelengths",
-      "description": "Excitation wavelengths in nm, comma-separated (one per channel). Used for confocal PSF generation (emission × excitation model). 'auto' uses values from image metadata; falls back to squared emission PSF if unavailable. Example: '405, 488'.",
-      "default-value": "auto",
+      "description": "Excitation wavelengths in nm, comma-separated (one per channel). Used as fallbacks when image metadata is missing, or as overrides when image metadata is overruled.",
+      "default-value": "488",
       "set-by-server": false,
       "optional": true,
       "type": "String"
@@ -138,13 +154,12 @@
       "value-key": "@refractive_index",
       "command-line-flag": "--refractive_index",
       "name": "(ess) Immersion medium",
-      "description": "Immersion medium refractive index for PSF generation. 'auto' uses value from image metadata (default: oil 1.515).",
-      "default-value": "auto",
+      "description": "Immersion medium refractive index. Used as a fallback when image metadata is missing, or as an override when image metadata is overruled.",
+      "default-value": "oil (1.515)",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
-        "auto",
         "air (1.0003)",
         "water (1.333)",
         "oil (1.515)"
@@ -155,13 +170,12 @@
       "value-key": "@sample_ri",
       "command-line-flag": "--sample_ri",
       "name": "(ess) Sample / mounting medium",
-      "description": "Refractive index of the sample or mounting medium for PSF generation. 'auto' uses image metadata if available, otherwise defaults to Vectashield (1.45).",
-      "default-value": "auto",
+      "description": "Sample or mounting medium refractive index. Used as a fallback when image metadata is missing, or as an override when image metadata is overruled.",
+      "default-value": "prolong gold (1.47)",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
-        "auto",
         "water (1.333)",
         "PBS (1.334)",
         "culture medium (1.337)",

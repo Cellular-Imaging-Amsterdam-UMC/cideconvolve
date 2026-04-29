@@ -17,6 +17,7 @@ Pillow>=10.0
 
 # Benchmark system metrics
 psutil>=5.9
+nvidia-ml-py>=12.0.0
 
 # OME-TIFF and OME-Zarr reading
 bioio==3.2.0
