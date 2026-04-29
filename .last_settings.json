@@ -1,7 +1,7 @@
 {
   "values": {
     "method": "ci_rl",
-    "iterations": "100",
+    "iterations": "150",
     "convergence": "auto",
     "rel_threshold": 0.005,
     "overrule_image_metadata": false,
@@ -14,9 +14,9 @@
     "refractive_index": "oil (1.515)",
     "sample_ri": "prolong gold (1.47)",
     "projection": "none",
-    "benchmark": true,
-    "bench_crop": true,
-    "compute_metrics": true,
+    "benchmark": false,
+    "bench_crop": false,
+    "compute_metrics": false,
     "tv_lambda": 0.0001,
     "damping": "none",
     "two_d_mode": "auto",

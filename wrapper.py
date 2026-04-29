@@ -526,6 +526,24 @@ def _get_zarr_plate_info(zarr_path: Path) -> dict:
     }
 
 
+def _ensure_channel_metadata(meta: dict, n_channels: int) -> None:
+    """Keep per-channel metadata aligned with the actual image channel count."""
+    channels = [
+        dict(ch) if isinstance(ch, dict) else {}
+        for ch in (meta.get("channels") or [])
+    ]
+    if len(channels) < n_channels:
+        channels.extend({} for _ in range(n_channels - len(channels)))
+    meta["channels"] = channels[:n_channels]
+
+    channel_names = list(meta.get("channel_names") or [])
+    if len(channel_names) < n_channels:
+        channel_names.extend(
+            f"Ch{i}" for i in range(len(channel_names), n_channels)
+        )
+    meta["channel_names"] = channel_names[:n_channels]
+
+
 def _load_zarr_field(
     zarr_path: Path,
     row: str,
@@ -629,6 +647,7 @@ def _load_zarr_field(
         ch_info.append(info)
     meta["channels"] = ch_info
     meta["channel_names"] = channel_names
+    _ensure_channel_metadata(meta, n_c)
 
     def _use_value(current, value) -> bool:
         return value is not None and (overrule_metadata or current is None)
@@ -964,7 +983,14 @@ def _run_plate_zarr(
 
             img = images[ch_idx]
             # Match PSF dimensionality
-            if img.ndim == 2 and psf.ndim == 3:
+            keep_hidden_2d_psf = (
+                img.ndim == 2
+                and psf.ndim == 3
+                and meta.get("microscope_type", "widefield") == "widefield"
+                and method in ("ci_rl", "ci_rl_tv")
+                and str(two_d_mode).strip().lower() == "auto"
+            )
+            if img.ndim == 2 and psf.ndim == 3 and not keep_hidden_2d_psf:
                 psf = psf[psf.shape[0] // 2]
             elif img.ndim == 3 and psf.ndim == 2:
                 psf = psf[np.newaxis, :, :]
