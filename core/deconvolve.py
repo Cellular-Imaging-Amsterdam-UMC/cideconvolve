@@ -215,13 +215,24 @@ def _get_device() -> str:
 # Phase 2: OME-TIFF Reader & Metadata Extraction
 # ===========================================================================
 
-def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
-    """Parse an OME companion XML file and extract microscopy metadata.
+def _normalise_acquisition_mode(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    compact = text.replace("_", "").replace(" ", "").lower()
+    if compact == "widefield":
+        return "Wide Field"
+    return text.replace("_", " ").title() if text.isupper() else text
 
-    Falls back gracefully when fields are missing.
-    """
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+
+def _normalise_ome_unit(value: Any) -> Any:
+    text = str(value or "").strip()
+    if text in ("µm", "\xb5m", "痠"):
+        return "micrometer"
+    return value
+
+
+def _parse_ome_xml_root(root: ET.Element) -> dict[str, Any]:
     ns = {"ome": _OME_NS}
     meta: dict[str, Any] = {}
 
@@ -274,10 +285,11 @@ def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
         info["pinhole_size"] = (
             float(ch.get("PinholeSize")) if ch.get("PinholeSize") else None
         )
-        info["pinhole_size_unit"] = ch.get("PinholeSizeUnit")
+        info["pinhole_size_unit"] = _normalise_ome_unit(ch.get("PinholeSizeUnit"))
         acq = ch.get("AcquisitionMode")
-        info["acquisition_mode"] = acq
-        if acq and "confocal" in acq.lower():
+        info["acquisition_mode"] = _normalise_acquisition_mode(acq)
+        acq_compact = str(acq or "").replace("_", "").replace(" ", "").lower()
+        if acq_compact in ("laserscanningconfocalmicroscopy", "spinningdiskconfocal", "slitscanconfocal", "multiphotonmicroscopy") or "confocal" in acq_compact:
             microscope_type = "confocal"
         ch_info.append(info)
 
@@ -292,6 +304,17 @@ def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
     _apply_map_metadata(meta, map_values)
 
     return meta
+
+
+def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
+    """Parse an OME companion XML file and extract microscopy metadata."""
+    tree = ET.parse(xml_path)
+    return _parse_ome_xml_root(tree.getroot())
+
+
+def _parse_ome_xml_text(xml_text: str) -> dict[str, Any]:
+    """Parse embedded OME-XML text and extract microscopy metadata."""
+    return _parse_ome_xml_root(ET.fromstring(xml_text))
 
 
 def _extract_bioio_metadata(img) -> dict[str, Any]:
@@ -728,7 +751,20 @@ def load_image(
                 data = tifffile.imread(str(tiff_path))
                 images.append(np.asarray(data, dtype=np.float32))
         else:
-            data = tifffile.imread(str(path))
+            with tifffile.TiffFile(str(path)) as tif:
+                if tif.ome_metadata:
+                    try:
+                        embedded_meta = _parse_ome_xml_text(tif.ome_metadata)
+                        for k, v in embedded_meta.items():
+                            if k not in meta or meta[k] is None or meta[k] == []:
+                                meta[k] = v
+                    except Exception as ome_exc:
+                        _add_metadata_warning(
+                            meta,
+                            f"Could not parse embedded OME metadata ({type(ome_exc).__name__}: {ome_exc}); using fallbacks.",
+                        )
+                        logger.warning("Could not parse embedded OME metadata from %s: %s", path, ome_exc)
+                data = tif.asarray()
             if data.ndim == 4:  # Assume CZYX
                 for c in range(data.shape[0]):
                     images.append(np.asarray(data[c], dtype=np.float32))
@@ -754,21 +790,32 @@ def load_image(
         meta["pixel_size_y"] = pixel_size_xy
     if _use_value(meta.get("pixel_size_z"), pixel_size_z):
         meta["pixel_size_z"] = pixel_size_z
+    def _channel_param(values, index: int):
+        if not values:
+            return None
+        return values[index] if index < len(values) else values[-1]
+
     if emission_wavelengths is not None:
         if "channels" not in meta:
             meta["channels"] = [{} for _ in emission_wavelengths]
-        for i, wl in enumerate(emission_wavelengths):
+        if len(meta["channels"]) < len(images):
+            meta["channels"].extend({} for _ in range(len(images) - len(meta["channels"])))
+        for i in range(len(images)):
+            wl = _channel_param(emission_wavelengths, i)
             if i < len(meta["channels"]):
                 ch = meta["channels"][i]
-                if _use_value(ch.get("emission_wavelength"), wl):
+                if wl is not None and _use_value(ch.get("emission_wavelength"), wl):
                     ch["emission_wavelength"] = wl
     if excitation_wavelengths is not None:
         if "channels" not in meta:
             meta["channels"] = [{} for _ in excitation_wavelengths]
-        for i, wl in enumerate(excitation_wavelengths):
+        if len(meta["channels"]) < len(images):
+            meta["channels"].extend({} for _ in range(len(images) - len(meta["channels"])))
+        for i in range(len(images)):
+            wl = _channel_param(excitation_wavelengths, i)
             if i < len(meta["channels"]):
                 ch = meta["channels"][i]
-                if _use_value(ch.get("excitation_wavelength"), wl):
+                if wl is not None and _use_value(ch.get("excitation_wavelength"), wl):
                     ch["excitation_wavelength"] = wl
 
     # Apply defaults for critical missing values (setdefault won't

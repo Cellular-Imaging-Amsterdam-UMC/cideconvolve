@@ -180,6 +180,72 @@ def _rgb_to_ome_int(color: Any) -> int | None:
     return int((r << 24) | (g << 16) | (b << 8) | 255)
 
 
+_FALLBACK_COLORS = [
+    (0, 255, 0),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 0, 0),
+    (0, 0, 255),
+    (255, 255, 0),
+]
+
+_BGRCYM = [
+    (0, 0, 255),
+    (0, 255, 0),
+    (255, 0, 0),
+    (0, 255, 255),
+    (255, 255, 0),
+    (255, 0, 255),
+]
+
+
+def _emission_to_rgb(wavelength_nm: Any) -> tuple[int, int, int]:
+    try:
+        wl = float(wavelength_nm)
+    except (TypeError, ValueError):
+        return (255, 255, 255)
+    r = g = b = 0.0
+    if 380 <= wl < 440:
+        r = -(wl - 440) / 60.0
+        b = 1.0
+    elif 440 <= wl < 490:
+        g = (wl - 440) / 50.0
+        b = 1.0
+    elif 490 <= wl < 510:
+        g = 1.0
+        b = -(wl - 510) / 20.0
+    elif 510 <= wl < 580:
+        r = (wl - 510) / 70.0
+        g = 1.0
+    elif 580 <= wl < 645:
+        r = 1.0
+        g = -(wl - 645) / 65.0
+    elif 645 <= wl <= 780:
+        r = 1.0
+    else:
+        return (255, 255, 255)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def _channel_display_color(metadata: dict[str, Any], channel: int) -> tuple[int, int, int]:
+    channels = metadata.get("channels", [])
+    ch = channels[channel] if channel < len(channels) and isinstance(channels[channel], dict) else {}
+    rgb = _coerce_rgb(ch.get("color"))
+    if rgb is not None and rgb != (255, 255, 255):
+        return rgb
+    rgb = _emission_to_rgb(ch.get("emission_wavelength"))
+    if rgb == (255, 255, 255):
+        rgb = _FALLBACK_COLORS[channel % len(_FALLBACK_COLORS)]
+    return rgb
+
+
+def _resolve_channel_display_colors(metadata: dict[str, Any], count: int) -> list[tuple[int, int, int]]:
+    colors = [_channel_display_color(metadata, i) for i in range(count)]
+    if count > 1 and len(set(colors)) == 1:
+        colors = [_BGRCYM[i % len(_BGRCYM)] for i in range(count)]
+    return colors
+
+
 def _positive_float(value: Any, default: float) -> float:
     try:
         out = float(value)
@@ -286,6 +352,9 @@ def _apply_basic_metadata_defaults(meta: dict[str, Any], shape: tuple[int, int, 
             if message not in warnings:
                 warnings.append(message)
             meta["metadata_warnings"] = warnings
+        if _positive_float(ch.get("excitation_wavelength"), 0.0) <= 0:
+            ch["excitation_wavelength"] = 488.0
+            defaulted.add("excitation_wavelength")
     meta["channels"] = channels[:c]
     if not _apply_pinhole_airy_units(meta, _DEFAULT_PINHOLE_AIRY_UNITS, overrule_metadata=False):
         defaulted.add("pinhole_airy_units")
@@ -367,6 +436,15 @@ class BioImageRegionSource:
             meta["pixel_size_x"] = getattr(pps, "X", None)
             meta["pixel_size_y"] = getattr(pps, "Y", None)
             meta["pixel_size_z"] = getattr(pps, "Z", None)
+        except Exception:
+            pass
+        try:
+            from .deconvolve import _extract_bioio_metadata
+
+            rich_meta = _extract_bioio_metadata(self._img)
+            for key, value in rich_meta.items():
+                if value not in (None, [], {}):
+                    meta[key] = value
         except Exception:
             pass
         self.metadata = _apply_basic_metadata_defaults(meta, self.shape)
@@ -751,6 +829,40 @@ class ZarrPyramidSink:
     def is_tile_complete(self, tile_key: str) -> bool:
         return str(tile_key) in self._completed
 
+    def _channel_display_window(self, channel: int) -> tuple[float, float, float, float] | None:
+        """Estimate an OMERO rendering window from written level-0 data."""
+        try:
+            z_stride = max(1, math.ceil(self.shape[2] / 32))
+            y_stride = max(1, math.ceil(self.shape[3] / 512))
+            x_stride = max(1, math.ceil(self.shape[4] / 512))
+            sample = np.asarray(
+                self._level0[
+                    0,
+                    int(channel),
+                    slice(0, self.shape[2], z_stride),
+                    slice(0, self.shape[3], y_stride),
+                    slice(0, self.shape[4], x_stride),
+                ],
+                dtype=np.float32,
+            )
+        except Exception:
+            return None
+        finite = sample[np.isfinite(sample)]
+        if finite.size == 0:
+            return None
+        min_value = float(np.min(finite))
+        max_value = float(np.max(finite))
+        if max_value <= min_value:
+            end = max(max_value, min_value + 1.0)
+            return min_value, end, min_value, end
+        start = float(np.percentile(finite, 0.1))
+        end = float(np.percentile(finite, 99.9))
+        if end <= start:
+            start, end = min_value, max_value
+        if end <= start:
+            end = start + 1.0
+        return start, end, min_value, max_value
+
     def _write_metadata_stub(self) -> None:
         px_x = _positive_float(self.metadata.get("pixel_size_x"), 1.0)
         px_y = _positive_float(self.metadata.get("pixel_size_y"), px_x)
@@ -783,12 +895,13 @@ class ZarrPyramidSink:
         }]
         channel_names = list(self.metadata.get("channel_names") or [])
         source_channels = [dict(ch) if isinstance(ch, dict) else {} for ch in self.metadata.get("channels", [])]
+        resolved_colors = _resolve_channel_display_colors(self.metadata, self.shape[1])
         channels = []
         for i in range(self.shape[1]):
             src = source_channels[i] if i < len(source_channels) else {}
             label = src.get("name") or src.get("label") or (channel_names[i] if i < len(channel_names) else f"Ch{i}")
             entry: dict[str, Any] = {"label": str(label)}
-            color_hex = _rgb_to_ome_hex(src.get("color"))
+            color_hex = _rgb_to_ome_hex(resolved_colors[i] if i < len(resolved_colors) else src.get("color"))
             if color_hex is not None:
                 entry["color"] = color_hex
             else:
@@ -799,13 +912,32 @@ class ZarrPyramidSink:
             entry["inverted"] = False
             window_start = src.get("window_start")
             window_end = src.get("window_end")
-            start = float(window_start if window_start is not None else 0.0)
-            end = float(window_end if window_end is not None else max(start, 1.0))
+            data_window = self._channel_display_window(i)
+            has_metadata_window = window_start is not None and window_end is not None
+            metadata_window_is_useful = False
+            if has_metadata_window:
+                try:
+                    metadata_window_is_useful = float(window_end) > float(window_start)
+                except (TypeError, ValueError):
+                    metadata_window_is_useful = False
+            metadata_window_is_suspicious = False
+            if data_window is not None and has_metadata_window:
+                try:
+                    metadata_window_is_suspicious = float(window_end) <= 1.0 and data_window[3] > 1.0
+                except (TypeError, ValueError):
+                    metadata_window_is_suspicious = True
+            if data_window is not None and (not metadata_window_is_useful or metadata_window_is_suspicious):
+                start, end, min_value, max_value = data_window
+            else:
+                start = float(window_start if window_start is not None else 0.0)
+                end = float(window_end if window_end is not None else max(start, 1.0))
+                min_value = min(start, 0.0)
+                max_value = max(end, 1.0)
             entry["window"] = {
                 "start": start,
                 "end": end,
-                "min": min(start, 0.0),
-                "max": max(end, 1.0),
+                "min": min_value,
+                "max": max_value,
             }
             channels.append(entry)
         omero: dict[str, Any] = {
@@ -863,6 +995,7 @@ class ZarrPyramidSink:
             raise ValueError("OME-Zarr output is missing multiscales metadata")
 
     def close(self) -> None:
+        self._write_metadata_stub()
         self._save_manifest()
 
 

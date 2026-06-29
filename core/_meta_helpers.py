@@ -153,7 +153,7 @@ def _pinhole_size_to_um(size: Any, unit: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     unit_name = _ome_enum_name(unit)
-    if unit_name in ("", "µm", "um", "micrometer", "micrometre", "micrometers", "micrometres"):
+    if unit_name in ("", "µm", "um", "痠", "micrometer", "micrometre", "micrometers", "micrometres"):
         return size_f
     if unit_name in ("nm", "nanometer", "nanometre", "nanometers", "nanometres"):
         return size_f / 1000.0

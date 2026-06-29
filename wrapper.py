@@ -228,15 +228,22 @@ def _apply_cli_metadata_to_source(
     channels = [dict(ch) if isinstance(ch, dict) else {} for ch in meta.get("channels", [])]
     if len(channels) < n_channels:
         channels.extend({} for _ in range(n_channels - len(channels)))
+    def _channel_param(values, index: int):
+        if not values:
+            return None
+        return values[index] if index < len(values) else values[-1]
+
     if emission_wavelengths is not None:
-        for i, wl in enumerate(emission_wavelengths):
-            if i < len(channels) and _metadata_use_value(
+        for i in range(n_channels):
+            wl = _channel_param(emission_wavelengths, i)
+            if wl is not None and _metadata_use_value(
                 channels[i].get("emission_wavelength"), wl, overrule_metadata
             ):
                 channels[i]["emission_wavelength"] = wl
     if excitation_wavelengths is not None:
-        for i, wl in enumerate(excitation_wavelengths):
-            if i < len(channels) and _metadata_use_value(
+        for i in range(n_channels):
+            wl = _channel_param(excitation_wavelengths, i)
+            if wl is not None and _metadata_use_value(
                 channels[i].get("excitation_wavelength"), wl, overrule_metadata
             ):
                 channels[i]["excitation_wavelength"] = wl
@@ -544,6 +551,64 @@ def _print_image_details(filename: str, img_path: Path, meta: dict, images: list
               f"nonzero={stats['nonzero_percent']:.1f}%")
 
 
+def _print_region_source_details(filename: str, img_path: Path, source) -> None:
+    """Print source metadata for streamed jobs, sampling bounded regions."""
+    meta = source.metadata
+    shape = tuple(int(v) for v in source.shape)
+    size_t, size_c, size_z, size_y, size_x = shape
+    print("\n  Loaded image metadata")
+    print(f"    File       : {filename}")
+    print(f"    Path       : {img_path}")
+    if img_path.exists() and img_path.is_file():
+        print(f"    File size  : {_format_bytes(img_path.stat().st_size / (1024 * 1024))}")
+    print(f"    Channels   : {size_c}")
+    print(f"    Dimensions : X={size_x}  Y={size_y}  Z={size_z}  C={size_c}  T={size_t}")
+    print(f"    Pixel size : XY={_format_value(meta.get('pixel_size_x'), 'um')}  "
+          f"Z={_format_value(meta.get('pixel_size_z'), 'um')}")
+    print(f"    Microscope : {meta.get('microscope_type', '?')}")
+    print(f"    Objective  : NA={_format_value(meta.get('na'))}  "
+          f"Mag={_format_value(meta.get('magnification'), 'x')}  "
+          f"Immersion={meta.get('immersion', '?')}")
+    print(f"    RI         : immersion={_format_value(meta.get('refractive_index'))}  "
+          f"sample={_format_value(meta.get('sample_refractive_index'))}")
+
+    channels = meta.get("channels", [])
+    names = meta.get("channel_names") or []
+    z1 = min(size_z, 32)
+    y_len = min(size_y, 512)
+    x_len = min(size_x, 512)
+    y0 = max(0, (size_y - y_len) // 2)
+    x0 = max(0, (size_x - x_len) // 2)
+    sampled = (z1, y_len, x_len) != (size_z, size_y, size_x)
+    for i in range(size_c):
+        ch_meta = channels[i] if i < len(channels) and isinstance(channels[i], dict) else {}
+        name = names[i] if i < len(names) else f"Ch{i}"
+        print(f"    Ch{i} {name}:")
+        print(f"      wavelengths: em={_format_value(ch_meta.get('emission_wavelength'), 'nm')}  "
+              f"ex={_format_value(ch_meta.get('excitation_wavelength'), 'nm')}  "
+              f"mode={ch_meta.get('acquisition_mode', '?')}")
+        print(f"      pinhole    : size={_format_value(ch_meta.get('pinhole_size'), ch_meta.get('pinhole_size_unit') or '')}  "
+              f"effective={_format_value(ch_meta.get('pinhole_airy_units'), 'AU')}")
+        try:
+            sample = source.read_region(
+                t=0,
+                c=i,
+                z=slice(0, z1),
+                y=slice(y0, y0 + y_len),
+                x=slice(x0, x0 + x_len),
+            )
+            stats = _array_stats(sample)
+            star = "*" if sampled else " "
+            print(f"      intensity{star}: min={stats['min']:.4g} p1={stats['p1']:.4g} "
+                  f"median={stats['p50']:.4g} mean={stats['mean']:.4g} "
+                  f"p99={stats['p99']:.4g} max={stats['max']:.4g} "
+                  f"nonzero={stats['nonzero_percent']:.1f}%")
+            if sampled:
+                print(f"      *sampled from {sample.size:,} voxels for metadata logging")
+        except Exception as exc:
+            print(f"      intensity : unavailable ({exc})")
+
+
 def _print_psf_details(psfs: list[np.ndarray]) -> None:
     """Print PSF shape and normalization details."""
     if not psfs:
@@ -820,15 +885,22 @@ def _load_zarr_field(
         meta["pixel_size_y"] = pixel_size_xy
     if _use_value(meta.get("pixel_size_z"), pixel_size_z):
         meta["pixel_size_z"] = pixel_size_z
+    def _channel_param(values, index: int):
+        if not values:
+            return None
+        return values[index] if index < len(values) else values[-1]
+
     if emission_wavelengths is not None:
-        for i, wl in enumerate(emission_wavelengths):
-            if i < len(meta["channels"]):
+        for i in range(n_c):
+            wl = _channel_param(emission_wavelengths, i)
+            if wl is not None:
                 ch = meta["channels"][i]
                 if _use_value(ch.get("emission_wavelength"), wl):
                     ch["emission_wavelength"] = wl
     if excitation_wavelengths is not None:
-        for i, wl in enumerate(excitation_wavelengths):
-            if i < len(meta["channels"]):
+        for i in range(n_c):
+            wl = _channel_param(excitation_wavelengths, i)
+            if wl is not None:
                 ch = meta["channels"][i]
                 if _use_value(ch.get("excitation_wavelength"), wl):
                     ch["excitation_wavelength"] = wl
@@ -1281,6 +1353,7 @@ def _run_streaming_regular_image(
         pixel_size_z=pixel_size_z,
         overrule_metadata=overrule_metadata,
     )
+    _print_region_source_details(img_path.name, img_path, source)
     tile_xy = int(tile_limits[0])
     if tile_xy <= 0:
         tile_xy = suggest_streaming_tile_size(

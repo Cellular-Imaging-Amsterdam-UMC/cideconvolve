@@ -1611,6 +1611,8 @@ class _OmeZarrTimepointSource(_BaseTimepointSource):
         raise ValueError(f"Unsupported OME-Zarr array shape {shape}")
 
     def _metadata_from_node(self) -> dict:
+        from core.ome_zarr_io import zarr_attrs
+
         t, c, z, y, x = self._layout["shape_tczyx"]
         meta: dict[str, Any] = {
             "size_t": t,
@@ -1639,6 +1641,57 @@ class _OmeZarrTimepointSource(_BaseTimepointSource):
                     meta["pixel_size_y"] = scale[1]
                     meta["pixel_size_x"] = scale[2]
                 break
+        attrs = zarr_attrs(self._path)
+        cide_meta = attrs.get("cideconvolve")
+        if not isinstance(cide_meta, dict):
+            cide_meta = attrs.get("_creator")
+        if isinstance(cide_meta, dict):
+            if isinstance(cide_meta.get("metadata"), dict):
+                cide_meta = cide_meta["metadata"]
+            for key in (
+                "pixel_size_x",
+                "pixel_size_y",
+                "pixel_size_z",
+                "na",
+                "refractive_index",
+                "sample_refractive_index",
+                "microscope_type",
+                "objective_magnification",
+                "objective_immersion",
+                "channel_names",
+                "channels",
+                "metadata_warnings",
+                "_defaulted_keys",
+                "_inferred_keys",
+            ):
+                value = cide_meta.get(key)
+                if value not in (None, ""):
+                    meta[key] = value
+        omero = attrs.get("omero")
+        if isinstance(omero, dict):
+            omero_channels = omero.get("channels")
+            if isinstance(omero_channels, list) and omero_channels:
+                meta["channel_names"] = [
+                    str(ch.get("label") or ch.get("name") or _default_channel_name(i))
+                    if isinstance(ch, dict) else _default_channel_name(i)
+                    for i, ch in enumerate(omero_channels[:c])
+                ]
+                channels = []
+                existing = meta.get("channels") if isinstance(meta.get("channels"), list) else []
+                for i in range(c):
+                    base = dict(existing[i]) if i < len(existing) and isinstance(existing[i], dict) else {}
+                    ch = omero_channels[i] if i < len(omero_channels) and isinstance(omero_channels[i], dict) else {}
+                    window = ch.get("window") if isinstance(ch.get("window"), dict) else {}
+                    base.setdefault("name", str(ch.get("label") or ch.get("name") or _default_channel_name(i)))
+                    if ch.get("color") not in (None, ""):
+                        base.setdefault("color", ch.get("color"))
+                    if ch.get("active") is not None:
+                        base.setdefault("active", bool(ch.get("active")))
+                    if window:
+                        base.setdefault("window_start", window.get("start"))
+                        base.setdefault("window_end", window.get("end"))
+                    channels.append(base)
+                meta["channels"] = channels
         return {k: v for k, v in meta.items() if v is not None}
 
     def load_timepoint(
@@ -6129,6 +6182,108 @@ class _StreamingOmeroWorker(QThread):
             self.finished.emit(exc)
 
 
+class _SaveOriginalZarrWorker(QThread):
+    """Export the original input data to OME-Zarr with GUI-resolved metadata."""
+
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(str)
+
+    def __init__(
+        self,
+        source: _BaseTimepointSource,
+        metadata: dict,
+        output_path: str,
+        *,
+        source_factory: Optional[Callable[[], _BaseTimepointSource]] = None,
+        tile_size: int = 512,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.source = source
+        self.metadata = dict(metadata or {})
+        self.output_path = str(output_path)
+        self.source_factory = source_factory
+        self.tile_size = max(int(tile_size or 512), 64)
+
+    def run(self):
+        try:
+            from core.streaming import ZarrPyramidSink
+
+            source = self.source_factory() if self.source_factory is not None else self.source
+            if isinstance(source, _OmeroTimepointSource) and getattr(source, "is_pyramidal", False):
+                region_source = _OmeroPyramidRegionSource(source)
+            else:
+                region_source = _TimepointRegionSource(source, source_id="gui:original")
+            region_source.metadata.update(self.metadata)
+            region_source.metadata["size_t"] = region_source.shape[0]
+            region_source.metadata["size_c"] = region_source.shape[1]
+            region_source.metadata["size_z"] = region_source.shape[2]
+            region_source.metadata["size_y"] = region_source.shape[3]
+            region_source.metadata["size_x"] = region_source.shape[4]
+            region_source.metadata["n_channels"] = region_source.shape[1]
+            processing = dict(region_source.metadata.get("cideconvolve_processing") or {})
+            processing.update({"export": "original_to_ome_zarr", "tile_streaming": True})
+            region_source.metadata["cideconvolve_processing"] = processing
+
+            sink = ZarrPyramidSink(
+                self.output_path,
+                shape=region_source.shape,
+                metadata=region_source.metadata,
+                resume=False,
+            )
+            size_t, size_c, size_z, size_y, size_x = region_source.shape
+            tile_y = min(self.tile_size, size_y)
+            tile_x = min(self.tile_size, size_x)
+            total_tiles = max(size_t * size_c * math.ceil(size_y / tile_y) * math.ceil(size_x / tile_x), 1)
+            done = 0
+            self.progress.emit("")
+            self.progress.emit("Saving original input to OME-Zarr")
+            self.progress.emit(
+                f"  Shape       : T={size_t} C={size_c} Z={size_z} Y={size_y} X={size_x}"
+            )
+            self.progress.emit(f"  Tile size   : {tile_y} x {tile_x} px")
+            self.progress.emit(f"  Output      : {self.output_path}")
+            z_slice = slice(0, size_z)
+            for t_index in range(size_t):
+                for c_index in range(size_c):
+                    for y0 in range(0, size_y, tile_y):
+                        y_slice = slice(y0, min(y0 + tile_y, size_y))
+                        for x0 in range(0, size_x, tile_x):
+                            if self.isInterruptionRequested():
+                                raise RuntimeError("Stopped by user")
+                            x_slice = slice(x0, min(x0 + tile_x, size_x))
+                            tile = region_source.read_region(
+                                t=t_index,
+                                c=c_index,
+                                z=z_slice,
+                                y=y_slice,
+                                x=x_slice,
+                            )
+                            sink.write_tile(
+                                t=t_index,
+                                c=c_index,
+                                z=z_slice,
+                                y=y_slice,
+                                x=x_slice,
+                                data=np.asarray(tile, dtype=np.float32),
+                            )
+                            done += 1
+                            if done == 1 or done == total_tiles or done % 10 == 0:
+                                self.progress.emit(
+                                    f"  Copied {done}/{total_tiles} tiles "
+                                    f"(T={t_index + 1}/{size_t}, C={c_index + 1}/{size_c})"
+                                )
+            self.progress.emit("  Building OME-Zarr pyramid levels...")
+            sink.build_pyramids()
+            sink.validate()
+            sink.close()
+            self.finished.emit({"path": self.output_path, "tiles": done, "shape": region_source.shape})
+        except Exception as exc:
+            if "Stopped by user" not in str(exc):
+                traceback.print_exc()
+            self.finished.emit(exc)
+
+
 def _streaming_output_metadata(base_metadata: dict, params: dict, *, source_name: str = "") -> dict:
     meta = dict(base_metadata or {})
     if source_name:
@@ -8523,6 +8678,8 @@ class DeconvolveCIWindow(QMainWindow):
         save_menu.addSection("Preview")
         self._act_save_views = save_menu.addAction("Viewer panes as PNG\u2026", self._on_save_view)
         self._act_save_comparison = save_menu.addAction("Comparison view as PNG\u2026", self._on_save_comparison_view)
+        save_menu.addSeparator()
+        self._act_save_original_zarr = save_menu.addAction("Save Org to ZARR\u2026", self._on_save_original_zarr)
         self._btn_save.setMenu(save_menu)
         export_layout.addWidget(self._btn_save)
 
@@ -9624,6 +9781,7 @@ class DeconvolveCIWindow(QMainWindow):
         streamed_pyramid = self._is_streamed_omero_pyramid_source() if hasattr(self, "_input_source") else False
         can_save_preview = has_preview and state == "Idle"
         can_save_t_series = has_input and state == "Idle" and self._has_time_series() and not streamed_pyramid
+        can_save_original_zarr = bool(self._input_source is not None) and state == "Idle"
         can_save_projection = can_save_preview and self._has_3d_source()
         worker_running = self._worker is not None and self._worker.isRunning()
         fit_worker_running = self._fit_psf_worker is not None and self._fit_psf_worker.isRunning()
@@ -9637,7 +9795,7 @@ class DeconvolveCIWindow(QMainWindow):
         )
         self._btn_save_series.setVisible(False)
         self._btn_save_series.setEnabled(can_save_t_series)
-        self._btn_save.setEnabled(can_save_preview or can_save_t_series)
+        self._btn_save.setEnabled(can_save_preview or can_save_t_series or can_save_original_zarr)
 
         for action_name in ("_act_save_ome_tiff", "_act_save_ome_zarr"):
             action = getattr(self, action_name, None)
@@ -9646,6 +9804,9 @@ class DeconvolveCIWindow(QMainWindow):
         action = getattr(self, "_act_save_t_series", None)
         if action is not None:
             action.setEnabled(can_save_t_series)
+        action = getattr(self, "_act_save_original_zarr", None)
+        if action is not None:
+            action.setEnabled(can_save_original_zarr)
         for action_name in (
             "_act_save_ome_tiff_mip",
             "_act_save_ome_tiff_sum",
@@ -11112,6 +11273,135 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_save_dir = str(out.parent)
         self._log(f"Saving OME-Zarr preview to {out}")
         self._start_preview_save({"kind": "ome_zarr", "path": str(out), "data": data, "metadata": metadata})
+
+    def _original_zarr_export_metadata(self) -> dict:
+        base = {}
+        if self._input_source is not None:
+            base.update(dict(getattr(self._input_source, "metadata", {}) or {}))
+        base.update(dict(self._metadata or {}))
+        params = self._collect_params()
+        source_name = ""
+        if self._input_path is not None:
+            source_name = self._input_path.name
+        elif hasattr(self, "_file_label"):
+            source_name = self._file_label.text()
+        meta = _streaming_output_metadata(base, params, source_name=source_name)
+        if self._input_source is not None:
+            source_meta = getattr(self._input_source, "metadata", {}) or {}
+            for key in ("size_t", "size_c", "size_z", "size_y", "size_x", "n_channels", "default_t", "default_z"):
+                if key in source_meta:
+                    meta[key] = source_meta[key]
+        processing = dict(meta.get("cideconvolve_processing") or {})
+        processing.update({
+            "export": "original_to_ome_zarr",
+            "source": source_name,
+            "deconvolved": False,
+        })
+        meta["cideconvolve_processing"] = processing
+        return meta
+
+    def _on_save_original_zarr(self) -> None:
+        if self._input_source is None:
+            QMessageBox.information(self, "No input image", "Open an image before saving the original input to OME-Zarr.")
+            return
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "Preview running", "Stop the current preview deconvolution before saving.")
+            return
+        if self._save_worker is not None and self._save_worker.isRunning():
+            return
+
+        stem = "original"
+        if self._input_path is not None:
+            stem = _safe_filename_stem(self._input_path.stem)
+            if stem.lower().endswith(".ome"):
+                stem = stem[:-4]
+        elif hasattr(self, "_file_label"):
+            stem = _safe_filename_stem(self._file_label.text()) or stem
+        suggested = f"{stem}_org.ome.zarr"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Original Input as OME-Zarr",
+            str(Path(self._last_save_dir) / suggested),
+            "OME-Zarr (*.ome.zarr);;Zarr (*.zarr)",
+        )
+        if not path:
+            return
+        if not (path.lower().endswith(".ome.zarr") or path.lower().endswith(".zarr")):
+            path += ".ome.zarr"
+        out = Path(path)
+        if out.exists():
+            answer = QMessageBox.question(
+                self,
+                "Replace OME-Zarr",
+                f"Replace existing folder?\n{out}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                if out.is_dir():
+                    shutil.rmtree(out)
+                else:
+                    out.unlink()
+            except Exception as exc:
+                QMessageBox.critical(self, "Save Error", f"Could not replace existing output:\n{exc}")
+                return
+
+        try:
+            metadata = self._original_zarr_export_metadata()
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Error", str(exc))
+            return
+
+        self._last_save_dir = str(out.parent)
+        self._save_last_settings()
+        self._begin_busy_progress("Saving original input to OME-Zarr ...")
+        self._set_operation_state("Saving", message="Saving original input...")
+        self._btn_run.setEnabled(False)
+        self._btn_save.setEnabled(False)
+        self._btn_save_series.setEnabled(False)
+        self._monitor_bar.set_active(True)
+        self._set_log_running(True)
+        self._log("")
+        self._log("=" * 70)
+        self._log(f"Saving original input to OME-Zarr: {out}")
+        self._log("=" * 70)
+
+        self._save_worker = _SaveOriginalZarrWorker(
+            self._input_source,
+            metadata,
+            str(out),
+            source_factory=self._input_source_factory,
+            parent=self,
+        )
+        self._save_worker.progress.connect(self._on_worker_progress)
+        self._save_worker.finished.connect(self._on_save_original_zarr_done)
+        self._save_worker.finished.connect(self._save_worker.deleteLater)
+        self._save_worker.start()
+
+    def _on_save_original_zarr_done(self, result) -> None:
+        self._monitor_bar.set_active(False)
+        self._set_log_running(False)
+        self._end_progress()
+        self._save_worker = None
+        self._set_operation_state("Idle")
+
+        if isinstance(result, Exception):
+            msg = str(result)
+            if "Stopped by user" in msg:
+                self._log("Original OME-Zarr export stopped by user.")
+                self._status.showMessage("Original export stopped", 5000)
+            else:
+                self._log(f"Original OME-Zarr export failed: {msg}")
+                QMessageBox.critical(self, "Save Error", msg)
+                self._status.showMessage("Original export failed", 5000)
+            return
+
+        path = Path(str(result.get("path", "")))
+        tiles = int(result.get("tiles", 0) or 0)
+        self._log(f"Original OME-Zarr export saved: {path} ({tiles} tiles)")
+        self._status.showMessage(f"Saved -> {path.name}", 5000)
 
     def _on_save_projection(self, output_kind: str, projection: str) -> None:
         try:
