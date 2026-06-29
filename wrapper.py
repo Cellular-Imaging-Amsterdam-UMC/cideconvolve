@@ -43,8 +43,12 @@ from bioflows_local import (
 # Import core first (handles torch-before-numpy DLL load order)
 from core.deconvolve import (
     _DEFAULT_PINHOLE_AIRY_UNITS,
+    _add_metadata_warning,
     _apply_pinhole_airy_units,
     _format_float_list,
+    _metadata_description,
+    _sanitize_channel_wavelengths,
+    _sanitize_core_metadata,
     deconvolve,
     deconvolve_image,
     generate_psf,
@@ -142,9 +146,12 @@ def _parse_ri_choice(raw: str, lookup: dict[str, float]) -> float | None:
 def _parse_float_or_default(raw, default: float) -> float:
     """Parse a float, accepting legacy 'auto' as the supplied default."""
     try:
-        return float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         return float(default)
+    if not np.isfinite(value):
+        return float(default)
+    return value
 
 
 def _parse_float_list_or_default(raw, default: str) -> list[float]:
@@ -152,7 +159,17 @@ def _parse_float_list_or_default(raw, default: str) -> list[float]:
     text = str(raw if raw is not None else default).strip()
     if not text or text.lower() == "auto":
         text = default
-    values = [float(x.strip()) for x in text.split(",") if x.strip()]
+    values = []
+    for item in text.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = float(item)
+        except ValueError:
+            continue
+        if np.isfinite(value):
+            values.append(value)
     return values or [float(default)]
 
 
@@ -229,6 +246,30 @@ def _apply_cli_metadata_to_source(
         _DEFAULT_PINHOLE_AIRY if pinhole_airy_units is None else pinhole_airy_units,
         overrule_metadata=overrule_metadata,
     )
+    defaults = {
+        "na": _DEFAULT_NA,
+        "refractive_index": 1.515,
+        "sample_refractive_index": _SAMPLE_RI_DEFAULT,
+        "microscope_type": "widefield",
+        "pixel_size_x": _DEFAULT_PIXEL_SIZE_XY_NM / 1000.0,
+        "pixel_size_y": _DEFAULT_PIXEL_SIZE_XY_NM / 1000.0,
+        "pixel_size_z": _DEFAULT_PIXEL_SIZE_Z_NM / 1000.0,
+    }
+    defaulted = _sanitize_core_metadata(meta, n_channels, defaults)
+    defaulted.update(_sanitize_channel_wavelengths(meta, n_channels))
+    if not _apply_pinhole_airy_units(
+        meta,
+        _DEFAULT_PINHOLE_AIRY if pinhole_airy_units is None else pinhole_airy_units,
+        overrule_metadata=overrule_metadata,
+    ):
+        defaulted.add("pinhole_airy_units")
+        _add_metadata_warning(meta, "Missing or invalid pinhole metadata; using fallback Airy units.")
+    for ch in meta.get("channels", []):
+        if ch.get("emission_wavelength") is None:
+            ch["emission_wavelength"] = 520.0
+            defaulted.add("emission_wavelength")
+            _add_metadata_warning(meta, "Missing emission wavelength metadata; using 520.0 nm fallback where needed.")
+    meta["_defaulted_keys"] = defaulted
     return meta
 
 
@@ -792,19 +833,17 @@ def _load_zarr_field(
                 if _use_value(ch.get("excitation_wavelength"), wl):
                     ch["excitation_wavelength"] = wl
 
-    _defaulted = set()
     _defaults = {
         "na": _DEFAULT_NA,
         "refractive_index": 1.515,
+        "sample_refractive_index": _SAMPLE_RI_DEFAULT,
         "microscope_type": "widefield",
         "pixel_size_x": _DEFAULT_PIXEL_SIZE_XY_NM / 1000.0,
         "pixel_size_y": _DEFAULT_PIXEL_SIZE_XY_NM / 1000.0,
         "pixel_size_z": _DEFAULT_PIXEL_SIZE_Z_NM / 1000.0,
     }
-    for k, v in _defaults.items():
-        if meta.get(k) is None:
-            meta[k] = v
-            _defaulted.add(k)
+    _defaulted = _sanitize_core_metadata(meta, n_c, _defaults)
+    _defaulted.update(_sanitize_channel_wavelengths(meta, n_c))
     meta["_defaulted_keys"] = _defaulted
 
     # Ensure emission wavelengths have a default
@@ -815,6 +854,7 @@ def _load_zarr_field(
             _em_defaulted = True
     if _em_defaulted:
         _defaulted.add("emission_wavelength")
+        _add_metadata_warning(meta, "Missing emission wavelength metadata; using 520.0 nm fallback where needed.")
 
     if _apply_pinhole_airy_units(
         meta,
@@ -824,6 +864,7 @@ def _load_zarr_field(
         _defaulted.discard("pinhole_airy_units")
     else:
         _defaulted.add("pinhole_airy_units")
+        _add_metadata_warning(meta, "Missing or invalid pinhole metadata; using fallback Airy units.")
 
     if overrule_metadata and sample_refractive_index is not None:
         meta["sample_refractive_index"] = sample_refractive_index
@@ -998,7 +1039,13 @@ def _write_zarr_field(
     # Copy omero metadata from source
     omero = orig_field_attrs.get("omero")
     if omero is not None:
+        omero = dict(omero)
+        description = _metadata_description(metadata)
+        if description:
+            omero["description"] = description
         field_group.attrs["omero"] = omero
+    elif _metadata_description(metadata):
+        field_group.attrs["omero"] = {"description": _metadata_description(metadata)}
 
 
 def _projection_output_suffix(projection: str) -> str:
@@ -1374,10 +1421,20 @@ def main(argv):
 
         # Extract parameters with defaults from descriptor.json
         iter_raw = str(getattr(parameters, "iterations", "40")).strip()
-        niter_list = [max(1, int(s.strip())) for s in iter_raw.split(",") if s.strip()]
+        niter_list = []
+        for item in iter_raw.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                niter_list.append(max(1, int(float(item))))
+            except ValueError:
+                continue
         if not niter_list:
             niter_list = [40]
-        method = getattr(parameters, "method", "ci_rl")
+        method = str(getattr(parameters, "method", "ci_rl") or "ci_rl").strip()
+        if method not in ("ci_rl", "ci_rl_tv", "ci_sparse_hessian", "ci_rl_dl"):
+            method = "ci_rl"
         device_param = getattr(parameters, "device", "auto")
         device = None if device_param in (None, "auto") else device_param
 
@@ -1403,33 +1460,35 @@ def main(argv):
         )
 
         # Deconvolution parameters
-        tv_lambda = float(getattr(parameters, "tv_lambda", 0.0001))
+        tv_lambda = _parse_float_or_default(getattr(parameters, "tv_lambda", 0.0001), 0.0001)
         damping_raw = str(getattr(parameters, "damping", "none")).strip().lower()
         if damping_raw in ("none", "0", "0.0"):
             damping = 0.0
         elif damping_raw == "auto":
             damping = "auto"
         else:
-            damping = float(damping_raw)
+            damping = _parse_float_or_default(damping_raw, 0.0)
         bg_raw = str(getattr(parameters, "background", "auto")).strip()
-        background = bg_raw if bg_raw.lower() == "auto" else float(bg_raw)
+        background = "auto" if bg_raw.lower() == "auto" else _parse_float_or_default(bg_raw, 0.0)
         offset_raw = str(getattr(parameters, "offset", "auto")).strip().lower()
         if offset_raw in ("none", "0", "0.0"):
             offset = 0.0
         elif offset_raw == "auto":
             offset = "auto"
         else:
-            offset = float(offset_raw)
-        prefilter_sigma = float(getattr(parameters, "prefilter_sigma", 0.0))
+            offset = _parse_float_or_default(offset_raw, 0.0)
+        prefilter_sigma = max(0.0, _parse_float_or_default(getattr(parameters, "prefilter_sigma", 0.0), 0.0))
         start = str(getattr(parameters, "start", "auto")).strip().lower()
         if start not in _START_MODES:
             start = "flat"
-        sparse_hessian_weight = float(getattr(parameters, "sparse_hessian_weight", 0.6))
-        sparse_hessian_reg = float(getattr(parameters, "sparse_hessian_reg", 0.98))
+        sparse_hessian_weight = min(max(_parse_float_or_default(getattr(parameters, "sparse_hessian_weight", 0.6), 0.6), 0.0), 1.0)
+        sparse_hessian_reg = min(max(_parse_float_or_default(getattr(parameters, "sparse_hessian_reg", 0.98), 0.98), 0.0), 1.0)
         convergence = str(getattr(parameters, "convergence", "auto")).strip().lower()
         if convergence in ("none", "fixed"):
             convergence = "fixed"
-        rel_threshold = float(getattr(parameters, "rel_threshold", 0.005))
+        elif convergence != "auto":
+            convergence = "auto"
+        rel_threshold = min(max(_parse_float_or_default(getattr(parameters, "rel_threshold", 0.005), 0.005), 1e-8), 1.0)
         check_every = 5          # convergence check interval
 
         # Hardcoded defaults (removed from descriptor to reduce parameter count)
@@ -1465,7 +1524,7 @@ def main(argv):
             output_format = "ome-zarr"
         streaming_mode = str(getattr(parameters, "streaming", "auto")).strip().lower()
         tile_limits = _parse_tile_limits(getattr(parameters, "tile_limits", "auto"))
-        streaming_threshold_gb = float(getattr(parameters, "streaming_threshold_gb", 2.0))
+        streaming_threshold_gb = max(_parse_float_or_default(getattr(parameters, "streaming_threshold_gb", 2.0), 2.0), 0.01)
         scene = getattr(parameters, "scene", None)
         scene = None if scene in (None, "", "auto") else scene
         hcs_field = getattr(parameters, "hcs_field", None)
@@ -1474,8 +1533,8 @@ def main(argv):
         # 2D widefield parameters
         two_d_mode = str(getattr(parameters, "two_d_mode", "auto")).strip().lower()
         two_d_wf_aggressiveness = str(getattr(parameters, "two_d_wf_aggressiveness", "Balanced")).strip()
-        two_d_wf_bg_radius_um = float(getattr(parameters, "two_d_wf_bg_radius_um", 0.5))
-        two_d_wf_bg_scale = float(getattr(parameters, "two_d_wf_bg_scale", 1.0))
+        two_d_wf_bg_radius_um = max(_parse_float_or_default(getattr(parameters, "two_d_wf_bg_radius_um", 0.5), 0.5), 0.1)
+        two_d_wf_bg_scale = max(_parse_float_or_default(getattr(parameters, "two_d_wf_bg_scale", 1.0), 1.0), 0.1)
 
         print("=" * 70)
         print("CIDeconvolve - BIAFLOWS Workflow")

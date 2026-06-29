@@ -204,6 +204,32 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _metadata_warnings(metadata: dict[str, Any]) -> list[str]:
+    raw = metadata.get("metadata_warnings")
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item).strip()]
+    return []
+
+
+def _metadata_description(metadata: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if metadata.get("na") is not None:
+        parts.append(f"NA={metadata['na']}")
+    if metadata.get("refractive_index") is not None:
+        parts.append(f"RI={metadata['refractive_index']}")
+    if metadata.get("sample_refractive_index") is not None:
+        parts.append(f"SampleRI={metadata['sample_refractive_index']}")
+    if metadata.get("microscope_type"):
+        parts.append(f"Microscope={metadata['microscope_type']}")
+    defaulted = sorted(str(key) for key in (metadata.get("_defaulted_keys") or []))
+    if defaulted:
+        parts.append("CIDeconvolve metadata defaults: " + ", ".join(defaulted))
+    warnings = _metadata_warnings(metadata)
+    if warnings:
+        parts.append("CIDeconvolve metadata warnings: " + " | ".join(warnings))
+    return "; ".join(parts)
+
+
 def _apply_basic_metadata_defaults(meta: dict[str, Any], shape: tuple[int, int, int, int, int]) -> dict[str, Any]:
     t, c, z, y, x = shape
     meta.setdefault("size_t", t)
@@ -223,7 +249,20 @@ def _apply_basic_metadata_defaults(meta: dict[str, Any], shape: tuple[int, int, 
     }
     defaulted = set(meta.get("_defaulted_keys", set()))
     for key, value in defaults.items():
-        if meta.get(key) is None:
+        if key == "microscope_type":
+            invalid = str(meta.get(key) or "").strip().lower() not in ("widefield", "confocal")
+        else:
+            invalid = _positive_float(meta.get(key), 0.0) <= 0
+        if invalid:
+            raw = meta.get(key)
+            if raw in (None, ""):
+                message = f"Missing {key}; using {value}."
+            else:
+                message = f"Invalid {key}={raw!r}; using {value}."
+            warnings = _metadata_warnings(meta)
+            if message not in warnings:
+                warnings.append(message)
+            meta["metadata_warnings"] = warnings
             meta[key] = value
             defaulted.add(key)
     channels = [dict(ch) if isinstance(ch, dict) else {} for ch in meta.get("channels", [])]
@@ -239,9 +278,14 @@ def _apply_basic_metadata_defaults(meta: dict[str, Any], shape: tuple[int, int, 
     if len(channels) < c:
         channels.extend({} for _ in range(c - len(channels)))
     for ch in channels:
-        if ch.get("emission_wavelength") is None:
+        if _positive_float(ch.get("emission_wavelength"), 0.0) <= 0:
             ch["emission_wavelength"] = 520.0
             defaulted.add("emission_wavelength")
+            warnings = _metadata_warnings(meta)
+            message = "Missing or invalid emission wavelength metadata; using 520.0 nm fallback where needed."
+            if message not in warnings:
+                warnings.append(message)
+            meta["metadata_warnings"] = warnings
     meta["channels"] = channels[:c]
     if not _apply_pinhole_airy_units(meta, _DEFAULT_PINHOLE_AIRY_UNITS, overrule_metadata=False):
         defaulted.add("pinhole_airy_units")
@@ -773,6 +817,9 @@ class ZarrPyramidSink:
                 "model": "color",
             },
         }
+        description = _metadata_description(self.metadata)
+        if description:
+            omero["description"] = description
         image_id = self.metadata.get("id")
         try:
             if image_id is not None:
@@ -949,6 +996,7 @@ class TiledOmeTiffSink:
         return {
             "Name": str(self.metadata.get("name") or self.path.stem),
             "axes": "TCZYX",
+            "Description": _metadata_description(self.metadata),
             "PhysicalSizeX": px_x,
             "PhysicalSizeXUnit": "µm",
             "PhysicalSizeY": px_y,

@@ -72,6 +72,122 @@ _IMMERSION_RI = {
 }
 
 
+def _metadata_warnings(meta: dict[str, Any]) -> list[str]:
+    warnings = meta.get("metadata_warnings")
+    if isinstance(warnings, list):
+        return [str(item) for item in warnings if str(item).strip()]
+    return []
+
+
+def _add_metadata_warning(meta: dict[str, Any], message: str) -> None:
+    message = str(message).strip()
+    if not message:
+        return
+    warnings = _metadata_warnings(meta)
+    if message not in warnings:
+        warnings.append(message)
+    meta["metadata_warnings"] = warnings
+
+
+def _positive_metadata_float(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(out) or out <= 0.0:
+        return None
+    return out
+
+
+def _sanitize_core_metadata(
+    meta: dict[str, Any],
+    n_channels: int,
+    defaults: dict[str, Any],
+) -> set[str]:
+    """Coerce impossible critical metadata to defaults and record warnings."""
+    defaulted = set(meta.get("_defaulted_keys") or [])
+    for key, default in defaults.items():
+        if key == "microscope_type":
+            raw = str(meta.get(key) or "").strip().lower()
+            if raw not in ("widefield", "confocal"):
+                if meta.get(key) not in (None, ""):
+                    _add_metadata_warning(
+                        meta,
+                        f"Invalid microscope_type={meta.get(key)!r}; using {default!r}.",
+                    )
+                else:
+                    _add_metadata_warning(meta, f"Missing microscope_type; using {default!r}.")
+                meta[key] = default
+                defaulted.add(key)
+            else:
+                meta[key] = raw
+            continue
+
+        parsed = _positive_metadata_float(meta.get(key))
+        if parsed is None:
+            if meta.get(key) not in (None, ""):
+                _add_metadata_warning(meta, f"Invalid {key}={meta.get(key)!r}; using {default}.")
+            else:
+                _add_metadata_warning(meta, f"Missing {key}; using {default}.")
+            meta[key] = default
+            defaulted.add(key)
+        else:
+            meta[key] = parsed
+
+    channels = [dict(ch) if isinstance(ch, dict) else {} for ch in meta.get("channels", [])]
+    if len(channels) < n_channels:
+        channels.extend({} for _ in range(n_channels - len(channels)))
+    meta["channels"] = channels[:n_channels]
+    return defaulted
+
+
+def _sanitize_channel_wavelengths(meta: dict[str, Any], n_channels: int) -> set[str]:
+    """Normalize per-channel wavelength metadata and report invalid values."""
+    defaulted: set[str] = set()
+    channels = [dict(ch) if isinstance(ch, dict) else {} for ch in meta.get("channels", [])]
+    if len(channels) < n_channels:
+        channels.extend({} for _ in range(n_channels - len(channels)))
+    for idx, ch in enumerate(channels[:n_channels]):
+        for key in ("emission_wavelength", "excitation_wavelength"):
+            if key not in ch or ch.get(key) in (None, ""):
+                continue
+            parsed = _positive_metadata_float(ch.get(key))
+            if parsed is None:
+                _add_metadata_warning(
+                    meta,
+                    f"Invalid channel {idx} {key}={ch.get(key)!r}; using fallback.",
+                )
+                ch[key] = None
+                defaulted.add(key)
+            else:
+                ch[key] = parsed
+    meta["channels"] = channels[:n_channels]
+    return defaulted
+
+
+def _metadata_description(metadata: dict[str, Any]) -> str:
+    desc_parts = []
+    if metadata.get("na") is not None:
+        desc_parts.append(f"NA={metadata['na']}")
+    if metadata.get("refractive_index") is not None:
+        desc_parts.append(f"RI={metadata['refractive_index']}")
+    if metadata.get("sample_refractive_index") is not None:
+        desc_parts.append(f"SampleRI={metadata['sample_refractive_index']}")
+    if metadata.get("microscope_type"):
+        desc_parts.append(f"Microscope={metadata['microscope_type']}")
+    if metadata.get("magnification") is not None:
+        desc_parts.append(f"Magnification={metadata['magnification']}x")
+    if metadata.get("immersion"):
+        desc_parts.append(f"Immersion={metadata['immersion']}")
+    defaulted = sorted(str(key) for key in (metadata.get("_defaulted_keys") or []))
+    if defaulted:
+        desc_parts.append("CIDeconvolve metadata defaults: " + ", ".join(defaulted))
+    warnings = _metadata_warnings(metadata)
+    if warnings:
+        desc_parts.append("CIDeconvolve metadata warnings: " + " | ".join(warnings))
+    return "; ".join(desc_parts)
+
+
 def _pixel_size_to_backend_nm(value: Optional[float]) -> Optional[float]:
     """Normalize metadata-style um values and GUI-style nm values to nm."""
     if value is None:
@@ -463,7 +579,14 @@ def load_image(
 
     # Parse companion OME XML if available
     if companion_path is not None:
-        meta = _parse_ome_xml(companion_path)
+        try:
+            meta = _parse_ome_xml(companion_path)
+        except Exception as exc:
+            _add_metadata_warning(
+                meta,
+                f"Could not parse companion OME metadata ({type(exc).__name__}: {exc}); using fallbacks.",
+            )
+            logger.warning("Could not parse companion OME metadata from %s: %s", companion_path, exc)
 
     # OME-Zarr stores are directories — handle separately
     _is_zarr = path.is_dir() and path.suffix.lower() == ".zarr"
@@ -660,24 +783,31 @@ def load_image(
         "pixel_size_y": 0.065,
         "pixel_size_z": 0.2,
     }
-    _defaulted = set()
-    for _k, _v in _defaults.items():
-        if meta.get(_k) is None:
-            meta[_k] = _v
-            _defaulted.add(_k)
+    _defaulted = _sanitize_core_metadata(meta, len(images), _defaults)
+    _defaulted.update(_sanitize_channel_wavelengths(meta, len(images)))
     meta["_defaulted_keys"] = _defaulted
     if overrule_metadata and sample_refractive_index is not None:
         meta["sample_refractive_index"] = sample_refractive_index
-    elif meta.get("sample_refractive_index") is None:
+    elif _positive_metadata_float(meta.get("sample_refractive_index")) is None:
+        raw_sample_ri = meta.get("sample_refractive_index")
         meta["sample_refractive_index"] = (
             sample_refractive_index if sample_refractive_index is not None else 1.47
         )
+        _defaulted.add("sample_refractive_index")
+        if raw_sample_ri in (None, ""):
+            message = f"Missing sample_refractive_index; using {meta['sample_refractive_index']}."
+        else:
+            message = f"Invalid sample_refractive_index={raw_sample_ri!r}; using {meta['sample_refractive_index']}."
+        _add_metadata_warning(meta, message)
+    else:
+        meta["sample_refractive_index"] = float(meta["sample_refractive_index"])
     meta["n_channels"] = len(images)
 
     # Ensure channels list
     _em_defaulted = False
     if "channels" not in meta or not meta["channels"]:
         meta["channels"] = [{} for _ in range(len(images))]
+        _add_metadata_warning(meta, "Missing channel metadata; using generic channel defaults.")
     if apply_dye_wavelength_fallbacks(meta, len(images)):
         _defaulted.discard("emission_wavelength")
     # Fill in missing emission wavelengths with a default
@@ -687,6 +817,7 @@ def load_image(
             _em_defaulted = True
     if _em_defaulted:
         _defaulted.add("emission_wavelength")
+        _add_metadata_warning(meta, "Missing emission wavelength metadata; using 520.0 nm fallback where needed.")
 
     if _apply_pinhole_airy_units(
         meta,
@@ -696,6 +827,7 @@ def load_image(
         _defaulted.discard("pinhole_airy_units")
     else:
         _defaulted.add("pinhole_airy_units")
+        _add_metadata_warning(meta, "Missing or invalid pinhole metadata; using fallback Airy units.")
 
     logger.info(
         "Loaded %d channel(s), shape=%s, microscope=%s, NA=%.2f",
@@ -1528,32 +1660,32 @@ def save_result(
         if ch_info:
             em_wavelengths = []
             ex_wavelengths = []
-            for i, ch in enumerate(ch_info[:len(channels_data)]):
+            n_out_channels = len(channels_data)
+            for i, ch in enumerate(ch_info[:n_out_channels]):
                 em = ch.get("emission_wavelength")
                 ex = ch.get("excitation_wavelength")
                 if em is not None:
                     em_wavelengths.append(float(em))
                 if ex is not None:
                     ex_wavelengths.append(float(ex))
-            if em_wavelengths:
+            if len(em_wavelengths) == n_out_channels:
                 ome_meta["Channel"]["EmissionWavelength"] = em_wavelengths
-            if ex_wavelengths:
+            elif em_wavelengths:
+                _add_metadata_warning(
+                    metadata,
+                    "Incomplete emission wavelength metadata; omitted from OME-XML channel attributes.",
+                )
+            if len(ex_wavelengths) == n_out_channels:
                 ome_meta["Channel"]["ExcitationWavelength"] = ex_wavelengths
+            elif ex_wavelengths:
+                _add_metadata_warning(
+                    metadata,
+                    "Incomplete excitation wavelength metadata; omitted from OME-XML channel attributes.",
+                )
 
-        # Add objective / instrument metadata as OME Description
-        desc_parts = []
-        if metadata.get("na") is not None:
-            desc_parts.append(f"NA={metadata['na']}")
-        if metadata.get("refractive_index") is not None:
-            desc_parts.append(f"RI={metadata['refractive_index']}")
-        if metadata.get("microscope_type"):
-            desc_parts.append(f"Microscope={metadata['microscope_type']}")
-        if metadata.get("magnification") is not None:
-            desc_parts.append(f"Magnification={metadata['magnification']}x")
-        if metadata.get("immersion"):
-            desc_parts.append(f"Immersion={metadata['immersion']}")
-        if desc_parts:
-            ome_meta["Description"] = "; ".join(desc_parts)
+        description = _metadata_description(metadata)
+        if description:
+            ome_meta["Description"] = description
 
         tifffile.imwrite(
             str(output_path),
@@ -1590,6 +1722,7 @@ def save_result(
                 "PhysicalSizeY": px_y,
                 "PhysicalSizeXUnit": "µm",
                 "PhysicalSizeYUnit": "µm",
+                "Description": _metadata_description(metadata),
                 "Channel": {
                     "Name": [
                         f"Ch{i}" for i in range(len(channels_data))
@@ -1627,6 +1760,7 @@ def save_result(
                 "PhysicalSizeY": px_y,
                 "PhysicalSizeXUnit": "µm",
                 "PhysicalSizeYUnit": "µm",
+                "Description": _metadata_description(metadata),
                 "Channel": {
                     "Name": [
                         f"Ch{i}" for i in range(len(source_channels))
