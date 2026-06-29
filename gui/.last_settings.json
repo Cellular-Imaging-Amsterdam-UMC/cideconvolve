@@ -1,6 +1,6 @@
 {
   "method": "ci_rl",
-  "iterations": "80",
+  "iterations": "28",
   "tv_lambda": 0.0,
   "damping": "none",
   "damping_value": 3.0,
@@ -57,5 +57,5 @@
   "last_leica_dir": "L:\\Archief\\active\\cellular_imaging\\OMERO_test\\Leica-LIF",
   "last_zeiss_dir": "C:\\Users\\p000881\\Documents",
   "last_nikon_dir": "C:\\rahoebe\\Python\\nikon-browser-qt\\localdata",
-  "last_olympus_dir": "C:\\rahoebe\\Python\\olympus-browser-qt\\localdata"
+  "last_evident_dir": "C:\\rahoebe\\Python\\evident-browser-qt\\localdata"
 }

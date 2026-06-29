@@ -79,11 +79,11 @@ mpl_datas, mpl_binaries, mpl_hiddenimports = collect_all('matplotlib')
 # ── Collect omero_browser_qt (icons + source used by tree_model.__file__) ─────
 obqt_datas, obqt_binaries, obqt_hiddenimports = collect_all('omero_browser_qt')
 
-# ── Collect microscope browsers (Open Leica/Zeiss/Nikon/Olympus… buttons) ───
+# ── Collect microscope browsers (Open Leica/Zeiss/Nikon/Evident… buttons) ───
 leica_datas, leica_binaries, leica_hiddenimports = collect_all('leica_browser_qt')
 zeiss_datas, zeiss_binaries, zeiss_hiddenimports = collect_all('zeiss_browser_qt')
 nikon_datas, nikon_binaries, nikon_hiddenimports = collect_all('nikon_browser_qt')
-olympus_datas, olympus_binaries, olympus_hiddenimports = collect_all('olympus_browser_qt')
+evident_datas, evident_binaries, evident_hiddenimports = collect_all('evident_browser_qt')
 
 # ── Collect Pillow (movie frames / PNG exports / overlays) ───────────────────
 pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
@@ -112,7 +112,7 @@ a = Analysis(
         pyqt6_binaries + vispy_binaries + ogl_binaries + torch_binaries
         + zarr_binaries + numcodecs_binaries
         + ome_binaries + omero_binaries + obqt_binaries
-        + leica_binaries + zeiss_binaries + nikon_binaries + olympus_binaries + pil_binaries
+        + leica_binaries + zeiss_binaries + nikon_binaries + evident_binaries + pil_binaries
         + xsdata_binaries + xspb_binaries
         + pyd_binaries + pyde_binaries + dask_binaries
         + imc_binaries
@@ -131,7 +131,7 @@ a = Analysis(
     ] + pyqt6_datas + vispy_datas + ogl_datas + torch_datas
       + zarr_datas + numcodecs_datas
       + ome_datas + omero_datas + obqt_datas
-      + leica_datas + zeiss_datas + nikon_datas + olympus_datas + pil_datas
+      + leica_datas + zeiss_datas + nikon_datas + evident_datas + pil_datas
       + xsdata_datas + xspb_datas
       + pyd_datas + pyde_datas + dask_datas
       + imc_datas
@@ -205,11 +205,11 @@ a = Analysis(
         'omero_browser_qt.widgets',
         'omero_browser_qt.view_backends',
         'omero_browser_qt.omero_viewer',
-        # ── Microscope browsers (optional Open Leica/Zeiss/Nikon/Olympus…) ──
+        # ── Microscope browsers (optional Open Leica/Zeiss/Nikon/Evident…) ──
         'leica_browser_qt',
         'zeiss_browser_qt',
         'nikon_browser_qt',
-        'olympus_browser_qt',
+        'evident_browser_qt',
         # ── GPU / hardware monitoring ───────────────────────────────────────
         'psutil',
         'pynvml',
@@ -242,7 +242,7 @@ a = Analysis(
       + torch_hiddenimports
       + zarr_hiddenimports + numcodecs_hiddenimports
       + ome_hiddenimports + omero_hiddenimports + obqt_hiddenimports
-      + leica_hiddenimports + zeiss_hiddenimports + nikon_hiddenimports + olympus_hiddenimports + ice_toplevel
+      + leica_hiddenimports + zeiss_hiddenimports + nikon_hiddenimports + evident_hiddenimports + ice_toplevel
       + xsdata_hiddenimports + xspb_hiddenimports
       + pyd_hiddenimports + pyde_hiddenimports + dask_hiddenimports
       + imc_hiddenimports

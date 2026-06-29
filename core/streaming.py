@@ -27,6 +27,14 @@ from ._meta_helpers import (
 log = logging.getLogger(__name__)
 
 
+def _release_torch_cuda_cache() -> None:
+    try:
+        from .deconvolve_ci import _release_cuda_cache
+    except Exception:
+        return
+    _release_cuda_cache()
+
+
 @dataclass(frozen=True)
 class TileRegion:
     """A core output tile and the halo-extended input region that feeds it."""
@@ -1350,6 +1358,8 @@ def deconvolve_streaming(
                         "tile_index": tile.tile_index,
                         "tile_count": len(regions),
                     })
+                del tile_data, result, core
+                _release_torch_cuda_cache()
 
     if build_pyramids:
         if progress is not None:

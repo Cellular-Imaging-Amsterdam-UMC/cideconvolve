@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+from functools import wraps
 from typing import Any, Callable, Optional, Union
 
 import numpy as np
@@ -69,12 +71,37 @@ def _release_cuda_cache() -> None:
         pass
 
 
+def _release_cuda_cache_after(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _release_cuda_cache()
+    return wrapper
+
+
 def _pick_dtype(dev: torch.device) -> torch.dtype:
-    return torch.float32 if dev.type == "cuda" else torch.float64
+    if dev.type == "cpu" and os.environ.get("CIDE_CONVOLVE_CPU_FLOAT64") == "1":
+        return torch.float64
+    return torch.float32
+
+
+def _numpy_dtype_for_torch(dtype: torch.dtype) -> np.dtype:
+    return np.dtype(np.float64 if dtype == torch.float64 else np.float32)
+
+
+def _as_torch_input_array(arr: np.ndarray, dtype: torch.dtype) -> np.ndarray:
+    """Return a contiguous NumPy array matching the torch compute dtype."""
+    target_dtype = _numpy_dtype_for_torch(dtype)
+    arr_np = np.asarray(arr)
+    if arr_np.dtype != target_dtype or not arr_np.flags.c_contiguous:
+        return np.ascontiguousarray(arr_np, dtype=target_dtype)
+    return arr_np
 
 
 def _to_tensor(arr: np.ndarray, dev: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return torch.as_tensor(np.ascontiguousarray(arr), dtype=dtype, device=dev)
+    return torch.as_tensor(_as_torch_input_array(arr, dtype), dtype=dtype, device=dev)
 
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
@@ -786,11 +813,11 @@ def _suggest_max_tile_xy(
 
     Memory model: ``budget ≈ 64 × padded_z × (tile_xy + psf_xy)²`` bytes,
     where ``padded_z ≈ 4 × n_z`` (FFT zero-padding for a 3D PSF of size
-    ``2*n_z - 1``).  CPU uses float64, so effective budget is halved.
+    ``2*n_z - 1``).
     """
     budget = _get_memory_budget_bytes(device)
     dev = _pick_device(device)
-    if dev.type == "cpu":
+    if _pick_dtype(dev) == torch.float64:
         budget //= 2  # float64 uses twice the memory
     padded_z = max(1, 4 * n_z) if n_z > 1 else 1
     inner_sq = budget / max(64 * padded_z, 1)
@@ -971,7 +998,7 @@ def _ci_deconvolve_tiled(
 
         log.info("  Tile %d/%d  shape=%s", idx + 1, len(tiles), tile_img.shape)
         tile_out = solver(tile_img, psf, tiling="none", **kwargs)
-        tile_result = tile_out["result"]
+        tile_result = np.asarray(tile_out["result"], dtype=np.float32)
 
         total_iterations = max(total_iterations, tile_out["iterations_used"])
         if tile_out["convergence"]:
@@ -1004,6 +1031,7 @@ def _ci_deconvolve_tiled(
     }
 
 
+@_release_cuda_cache_after
 def _ci_rl_deconvolve_2d_widefield(
     image: np.ndarray,
     psf: np.ndarray,
@@ -1033,15 +1061,15 @@ def _ci_rl_deconvolve_2d_widefield(
 
     dev = _pick_device(device)
     dtype = _pick_dtype(dev)
-    img_t = _to_tensor(image.astype(np.float64), dev, dtype)
+    img_t = _to_tensor(image, dev, dtype)
 
     if psf.ndim == 3:
-        psf_t = _crop_psf_axial_support(_to_tensor(psf.astype(np.float64), dev, dtype))
+        psf_t = _crop_psf_axial_support(_to_tensor(psf, dev, dtype))
         psf_2d = _to_numpy(
             _collapse_widefield_psf_to_2d(psf_t, two_d_wf_aggressiveness).detach()
-        )
+        ).astype(np.float32, copy=False)
     elif psf.ndim == 2:
-        psf_2d = np.asarray(psf, dtype=np.float64)
+        psf_2d = np.asarray(psf, dtype=np.float32)
         psf_2d = psf_2d / max(float(psf_2d.sum()), 1e-12)
     else:
         raise ValueError(f"Unsupported PSF dimensionality for 2D widefield auto mode: {psf.shape}")
@@ -1107,34 +1135,50 @@ def _ci_rl_deconvolve_2d_widefield(
         effective_prefilter,
     )
 
-    return ci_rl_deconvolve(
-        image,
-        psf_2d,
-        niter=niter,
-        tv_lambda=tv_lambda,
-        damping=effective_damping,
-        offset=effective_offset,
-        prefilter_sigma=effective_prefilter,
-        start=start,
-        background=effective_background,
-        convergence=convergence,
-        rel_threshold=rel_threshold,
-        check_every=check_every,
-        pixel_size_xy=pixel_size_xy,
-        pixel_size_z=pixel_size_z,
-        microscope_type="widefield",
-        two_d_mode="legacy_2d",
-        device=device,
-        tiling="none",
-        iteration_callback=iteration_callback,
-        channel_index=channel_index,
-    )
+    try:
+        return ci_rl_deconvolve(
+            image,
+            psf_2d,
+            niter=niter,
+            tv_lambda=tv_lambda,
+            damping=effective_damping,
+            offset=effective_offset,
+            prefilter_sigma=effective_prefilter,
+            start=start,
+            background=effective_background,
+            convergence=convergence,
+            rel_threshold=rel_threshold,
+            check_every=check_every,
+            pixel_size_xy=pixel_size_xy,
+            pixel_size_z=pixel_size_z,
+            microscope_type="widefield",
+            two_d_mode="legacy_2d",
+            device=device,
+            tiling="none",
+            iteration_callback=iteration_callback,
+            channel_index=channel_index,
+        )
+    finally:
+        try:
+            del img_t
+        except UnboundLocalError:
+            pass
+        try:
+            del psf_t
+        except UnboundLocalError:
+            pass
+        try:
+            del psf_2d
+        except UnboundLocalError:
+            pass
+        _release_cuda_cache()
 
 
 # ---------------------------------------------------------------------------
 # Top-level RL deconvolution
 # ---------------------------------------------------------------------------
 
+@_release_cuda_cache_after
 def ci_rl_deconvolve(
     image: np.ndarray,
     psf: np.ndarray,
@@ -1303,8 +1347,8 @@ def ci_rl_deconvolve(
              prefilter_sigma, start, convergence, microscope_type, two_d_mode)
 
     # Move data to device
-    img_t = _to_tensor(image.astype(np.float64), dev, dtype)
-    psf_t = _to_tensor(psf.astype(np.float64), dev, dtype)
+    img_t = _to_tensor(image, dev, dtype)
+    psf_t = _to_tensor(psf, dev, dtype)
 
     # Background
     if background == "auto":
@@ -1369,6 +1413,7 @@ def ci_rl_deconvolve(
         P_fft = _rfft(p)
         Y_fft = P_fft * otf
         y = _irfft(Y_fft, work_shape)
+        del P_fft, Y_fft
 
         # --- Ratio: computed ONLY in the image domain (Bertero formulation) ---
         r = torch.zeros(work_shape, dtype=dtype, device=dev)
@@ -1377,6 +1422,7 @@ def ci_rl_deconvolve(
         # --- Back-project: IFFT(FFT(r) * conj(H)) ---
         R_fft = _rfft(r)
         corr = _irfft(R_fft * otf_conj, work_shape)
+        del R_fft, r
 
         # --- Noise-gated damping (attenuate correction in noisy regions) ---
         if use_damping:
@@ -1406,6 +1452,7 @@ def ci_rl_deconvolve(
             # but the difference is small; for exactness re-project)
             fwd_fft = _rfft(x_cur) * otf
             fwd = _irfft(fwd_fft, work_shape)
+            del fwd_fft
             idiv = _i_divergence(img_t, fwd[slices].clamp(min=bg))
             convergence_history.append(idiv)
             convergence_value = idiv
@@ -1424,6 +1471,7 @@ def ci_rl_deconvolve(
             if not check_iteration:
                 fwd_fft = _rfft(x_cur) * otf
                 fwd = _irfft(fwd_fft, work_shape)
+                del fwd_fft
                 convergence_value = _i_divergence(img_t, fwd[slices].clamp(min=bg))
             frame = x_cur[slices]
             estimated = fwd[slices]
@@ -1440,6 +1488,9 @@ def ci_rl_deconvolve(
                 "background": max(float(bg) - offset_val, 0.0),
                 "is_final": bool(stop_after_callback or k == niter),
             })
+            del frame, estimated
+        if "fwd" in locals():
+            del fwd
         if stop_after_callback:
             break
 
@@ -1450,13 +1501,17 @@ def ci_rl_deconvolve(
     if offset_val > 0.0:
         result = (result - offset_val).clamp(min=0.0)
 
+    result_np = _to_numpy(result).astype(np.float32, copy=False)
+    del result, img_t, psf_t, otf, otf_conj, W, d_work, x_prev, x_cur
+    _release_cuda_cache()
     return {
-        "result": _to_numpy(result),
+        "result": result_np,
         "convergence": convergence_history,
         "iterations_used": iterations_used,
     }
 
 
+@_release_cuda_cache_after
 def ci_sparse_hessian_deconvolve(
     image: np.ndarray,
     psf: np.ndarray,
@@ -1530,8 +1585,8 @@ def ci_sparse_hessian_deconvolve(
         offset_val, prefilter_sigma, start, convergence,
     )
 
-    img_t = _to_tensor(image.astype(np.float64), dev, dtype)
-    psf_t = _to_tensor(psf.astype(np.float64), dev, dtype)
+    img_t = _to_tensor(image, dev, dtype)
+    psf_t = _to_tensor(psf, dev, dtype)
 
     if background == "auto":
         bg = max(_estimate_background(img_t), 1e-6)
@@ -1583,6 +1638,7 @@ def ci_sparse_hessian_deconvolve(
             float(_sparse_hessian_penalty(x_cur[slices], sparse_hessian_weight, z_scale=z_scale).detach()),
             1e-6,
         )
+        del fwd0
 
     convergence_history: list[float] = []
     iterations_used = niter
@@ -1601,8 +1657,10 @@ def ci_sparse_hessian_deconvolve(
         r = torch.zeros(work_shape, dtype=dtype, device=dev)
         r[slices] = img_t / y[slices].clamp(min=bg)
         corr = _irfft(_rfft(r) * otf_conj, work_shape)
+        del y, r
 
         x_data = (p * corr * W).clamp(min=bg)
+        del corr, p
 
         prior_probe = x_data[slices].detach().requires_grad_(True)
         prior_loss_probe = _sparse_hessian_penalty(
@@ -1616,6 +1674,7 @@ def ci_sparse_hessian_deconvolve(
         x_new[slices] = (
             x_data[slices] - reg_step * prior_grad / grad_scale
         ).clamp(min=bg)
+        del prior_probe, prior_loss_probe, prior_grad, x_data
 
         x_prev = x_cur
         x_cur = x_new
@@ -1679,6 +1738,15 @@ def ci_sparse_hessian_deconvolve(
                 "background": max(float(bg) - offset_val, 0.0),
                 "is_final": bool(stop_after_callback or k == niter),
             })
+            del frame, estimated
+        if "fwd" in locals():
+            del fwd
+        if "data_loss" in locals():
+            del data_loss
+        if "prior_loss" in locals():
+            del prior_loss
+        if "total_loss" in locals():
+            del total_loss
         if stop_after_callback:
             break
 
@@ -1686,8 +1754,11 @@ def ci_sparse_hessian_deconvolve(
     if offset_val > 0.0:
         result = (result - offset_val).clamp(min=0.0)
 
+    result_np = _to_numpy(result).astype(np.float32, copy=False)
+    del result, img_t, psf_t, otf, otf_conj, W, d_work, x_prev, x_cur
+    _release_cuda_cache()
     return {
-        "result": _to_numpy(result),
+        "result": result_np,
         "convergence": convergence_history,
         "iterations_used": iterations_used,
     }
@@ -1960,7 +2031,8 @@ def _build_psf_stack(
         plane = intensity[rr_inv.flatten()].reshape(n_xy, n_xy)
         slices_out.append(plane)
 
-    psf_stack = torch.stack(slices_out, dim=0).to(dtype)  # (Z, Y, X)    
+    psf_stack = torch.stack(slices_out, dim=0).to(dtype)  # (Z, Y, X)
+    del slices_out, rr, r_unique, rr_inv, rs, thetas, zs, pupil
     return psf_stack
 
 # ---------------------------------------------------------------------------
@@ -2070,61 +2142,69 @@ def ci_generate_psf(
     def _psf_func(*, fov: float, n_xy: int, **kw) -> torch.Tensor:
         return _build_psf_stack(fov=fov, n_xy=n_xy, **{**common, **kw})
 
-    if integrate_pixels and n_subpixels > 1:
-        psf = _pixel_integrate_psf(
-            _psf_func,
-            pixel_size_xy=pixel_size_xy_nm,
-            n_xy=n_xy,
-            n_subpixels=n_subpixels,
-        )
-    else:
-        fov = pixel_size_xy_nm * n_xy
-        psf = _psf_func(fov=fov, n_xy=n_xy)
-
-    # Confocal: detection PSF × excitation PSF. Finite pinholes are modelled
-    # by laterally integrating the detection/emission PSF over a circular
-    # object-space aperture measured in Airy disk units.
-    if microscope_type == "confocal":
-        detector_psf = psf
-        pinhole_airy_units = float(pinhole_airy_units)
-        if pinhole_airy_units > 0.0:
-            kernel = _make_circular_pinhole_kernel(
-                pinhole_airy_units=pinhole_airy_units,
-                wavelength_nm=wavelength_nm,
-                na=na,
-                pixel_size_xy_nm=pixel_size_xy_nm,
-                device=dev,
-                dtype=dtype,
+    try:
+        if integrate_pixels and n_subpixels > 1:
+            psf = _pixel_integrate_psf(
+                _psf_func,
+                pixel_size_xy=pixel_size_xy_nm,
+                n_xy=n_xy,
+                n_subpixels=n_subpixels,
             )
-            detector_psf = _convolve_lateral_with_kernel(detector_psf, kernel)
-
-        if excitation_nm is not None and excitation_nm != wavelength_nm:
-            common_ex = {**common, "wavelength_nm": excitation_nm}
-
-            def _psf_ex(*, fov, n_xy, **kw):
-                return _build_psf_stack(fov=fov, n_xy=n_xy, **{**common_ex, **kw})
-
-            if integrate_pixels and n_subpixels > 1:
-                psf_ex = _pixel_integrate_psf(
-                    _psf_ex,
-                    pixel_size_xy=pixel_size_xy_nm,
-                    n_xy=n_xy,
-                    n_subpixels=n_subpixels,
-                )
-            else:
-                fov = pixel_size_xy_nm * n_xy
-                psf_ex = _psf_ex(fov=fov, n_xy=n_xy)
-            psf = detector_psf * psf_ex
         else:
-            psf = detector_psf * psf
+            fov = pixel_size_xy_nm * n_xy
+            psf = _psf_func(fov=fov, n_xy=n_xy)
 
-    # Normalise
-    psf = psf / psf.sum()
+        # Confocal: detection PSF × excitation PSF. Finite pinholes are modelled
+        # by laterally integrating the detection/emission PSF over a circular
+        # object-space aperture measured in Airy disk units.
+        if microscope_type == "confocal":
+            detector_psf = psf
+            pinhole_airy_units = float(pinhole_airy_units)
+            if pinhole_airy_units > 0.0:
+                kernel = _make_circular_pinhole_kernel(
+                    pinhole_airy_units=pinhole_airy_units,
+                    wavelength_nm=wavelength_nm,
+                    na=na,
+                    pixel_size_xy_nm=pixel_size_xy_nm,
+                    device=dev,
+                    dtype=dtype,
+                )
+                detector_psf = _convolve_lateral_with_kernel(detector_psf, kernel)
+                del kernel
 
-    result = _to_numpy(psf)
-    log.info("  PSF range [%.3g, %.3g], sum=%.6f", result.min(), result.max(),
-             result.sum())
-    return result
+            if excitation_nm is not None and excitation_nm != wavelength_nm:
+                common_ex = {**common, "wavelength_nm": excitation_nm}
+
+                def _psf_ex(*, fov, n_xy, **kw):
+                    return _build_psf_stack(fov=fov, n_xy=n_xy, **{**common_ex, **kw})
+
+                if integrate_pixels and n_subpixels > 1:
+                    psf_ex = _pixel_integrate_psf(
+                        _psf_ex,
+                        pixel_size_xy=pixel_size_xy_nm,
+                        n_xy=n_xy,
+                        n_subpixels=n_subpixels,
+                    )
+                else:
+                    fov = pixel_size_xy_nm * n_xy
+                    psf_ex = _psf_ex(fov=fov, n_xy=n_xy)
+                psf = detector_psf * psf_ex
+                del psf_ex
+            else:
+                psf = detector_psf * psf
+            del detector_psf
+
+        # Normalise
+        psf = psf / psf.sum()
+
+        result = _to_numpy(psf).astype(np.float32, copy=False)
+        log.info("  PSF range [%.3g, %.3g], sum=%.6f", result.min(), result.max(),
+                 result.sum())
+        return result
+    finally:
+        if "psf" in locals():
+            del psf
+        _release_cuda_cache()
 
 
 # ---------------------------------------------------------------------------

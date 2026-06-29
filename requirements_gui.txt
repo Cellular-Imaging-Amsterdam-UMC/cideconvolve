@@ -35,6 +35,7 @@ leica-browser-qt>=0.4.0
 zeiss-browser-qt>=0.4.0
 nikon-browser-qt>=0.1.0
 olympus-browser-qt>=0.2.0
+evident-browser-qt>=0.3.0
 
 # Optional — GPU / system monitoring widgets in the GUI
 psutil>=5.9.0

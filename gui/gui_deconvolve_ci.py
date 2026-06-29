@@ -1950,12 +1950,12 @@ _BROWSER_VENDOR_SPECS: dict[str, dict[str, str]] = {
         "dialog": "NikonBrowserDialog",
         "minimum": "0.1.0",
     },
-    "olympus": {
-        "label": "Olympus",
-        "package": "olympus-browser-qt",
-        "module": "olympus_browser_qt",
-        "dialog": "OlympusBrowserDialog",
-        "minimum": "0.1.0",
+    "evident": {
+        "label": "Evident",
+        "package": "evident-browser-qt",
+        "module": "evident_browser_qt",
+        "dialog": "EvidentBrowserDialog",
+        "minimum": "0.3.0",
     },
 }
 _BROWSER_VENDOR_KEYS = tuple(_BROWSER_VENDOR_SPECS)
@@ -2783,7 +2783,7 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                 "html": f"""
                     <h2>Open, Recent, Settings, Run, And Save Menus</h2>
                     <ul>
-                    <li><b>Open</b> loads local OME-TIFF, TIFF, Zarr, Leica, Zeiss, Nikon, Olympus, or OMERO sources. Drag-and-drop uses the same loading path.</li>
+                    <li><b>Open</b> loads local OME-TIFF, TIFF, Zarr, Leica, Zeiss, Nikon, Evident, or OMERO sources. Drag-and-drop uses the same loading path.</li>
                     <li><b>Recent</b> reopens recent image sources. The settings pane has a separate recent settings menu.</li>
                     <li><b>Settings</b> restores, saves, or loads GUI parameter presets.</li>
                     <li><b>Log</b> opens the live run log with convergence charts and optional image metrics.</li>
@@ -9689,6 +9689,8 @@ class DeconvolveCIWindow(QMainWindow):
         for vendor_key in _BROWSER_VENDOR_KEYS:
             key = f"last_{vendor_key}_dir"
             value = data.get(key)
+            if vendor_key == "evident" and value is None:
+                value = data.get("last_olympus_dir")
             if value is not None:
                 self._last_browser_dirs[vendor_key] = _accessible_directory_or_home(value)
         self._last_leica_dir = self._last_browser_dirs["leica"]
@@ -9831,8 +9833,8 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_open_nikon(self):
         self._on_open_browser("nikon")
 
-    def _on_open_olympus(self):
-        self._on_open_browser("olympus")
+    def _on_open_evident(self):
+        self._on_open_browser("evident")
 
     def _do_load(self, path: str):
         if self._operation_busy() and self._operation_state != "Loading":
@@ -11423,7 +11425,7 @@ class DeconvolveCIWindow(QMainWindow):
             "last_leica_dir": self._last_leica_dir,
             "last_zeiss_dir": self._last_browser_dirs.get("zeiss", _default_settings_dir()),
             "last_nikon_dir": self._last_browser_dirs.get("nikon", _default_settings_dir()),
-            "last_olympus_dir": self._last_browser_dirs.get("olympus", _default_settings_dir()),
+            "last_evident_dir": self._last_browser_dirs.get("evident", _default_settings_dir()),
         }
 
     def _apply_settings(self, data: dict):
@@ -11567,10 +11569,13 @@ class DeconvolveCIWindow(QMainWindow):
             self._cb_integrate.setChecked(bool(val))
         if data.get("last_leica_dir") is not None:
             self._set_last_browser_dir("leica", data.get("last_leica_dir"))
-        for vendor_key in ("zeiss", "nikon", "olympus"):
+        for vendor_key in ("zeiss", "nikon", "evident"):
             key = f"last_{vendor_key}_dir"
-            if data.get(key) is not None:
-                self._set_last_browser_dir(vendor_key, data.get(key))
+            value = data.get(key)
+            if vendor_key == "evident" and value is None:
+                value = data.get("last_olympus_dir")
+            if value is not None:
+                self._set_last_browser_dir(vendor_key, value)
         self._update_sampling_warnings()
 
     def _save_last_settings(self):
