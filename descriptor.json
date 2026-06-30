@@ -258,6 +258,17 @@
       "maximum": 1000
     },
     {
+      "id": "scene",
+      "value-key": "@scene",
+      "command-line-flag": "--scene",
+      "name": "(adv) Image scene",
+      "description": "Optional scene index or name for multi-scene images. Empty or auto uses the default scene.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
       "id": "hcs_field",
       "value-key": "@hcs_field",
       "command-line-flag": "--hcs_field",
