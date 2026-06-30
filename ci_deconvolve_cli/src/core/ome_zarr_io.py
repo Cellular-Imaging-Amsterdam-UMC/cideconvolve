@@ -1,4 +1,4 @@
-"""Small OME-Zarr helpers shared by GUI, wrapper, and streaming code."""
+"""OME-Zarr helpers for the focused ci_deconvolve CLI."""
 
 from __future__ import annotations
 
@@ -8,6 +8,57 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+
+
+def _metadata_warnings(metadata: dict[str, Any]) -> list[str]:
+    warnings = metadata.get("metadata_warnings")
+    if isinstance(warnings, list):
+        return [str(item) for item in warnings if str(item).strip()]
+    return []
+
+
+def _metadata_description(metadata: dict[str, Any]) -> str:
+    parts = []
+    defaulted = sorted(str(item) for item in metadata.get("_defaulted_keys", set()) if item)
+    if defaulted:
+        parts.append("CIDeconvolve metadata defaults: " + ", ".join(defaulted))
+    warnings = _metadata_warnings(metadata)
+    if warnings:
+        parts.append("CIDeconvolve metadata warnings: " + " | ".join(warnings))
+    return "\n".join(parts)
+
+
+def _coerce_rgb(color: Any) -> tuple[int, int, int] | None:
+    if isinstance(color, str):
+        text = color.strip().lstrip("#")
+        if len(text) == 6:
+            try:
+                return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                return None
+    if isinstance(color, (list, tuple)) and len(color) >= 3:
+        try:
+            return tuple(max(0, min(255, int(v))) for v in color[:3])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _rgb_to_ome_hex(color: Any) -> str | None:
+    rgb = _coerce_rgb(color)
+    if rgb is None:
+        return None
+    return "".join(f"{v:02X}" for v in rgb)
+
+
+def _resolve_channel_display_colors(metadata: dict[str, Any], n_channels: int) -> list[Any]:
+    channels = metadata.get("channels") or []
+    colors = []
+    default_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (255, 255, 255)]
+    for i in range(n_channels):
+        ch = channels[i] if i < len(channels) and isinstance(channels[i], dict) else {}
+        colors.append(ch.get("color") or default_colors[i % len(default_colors)])
+    return colors
 
 
 def zarr_attrs(path: Path) -> dict[str, Any]:
@@ -113,12 +164,6 @@ def _result_to_tczyx(result: dict[str, Any]) -> np.ndarray:
 
 
 def _omero_metadata(metadata: dict[str, Any], n_channels: int) -> dict[str, Any]:
-    from .streaming import (
-        _metadata_description,
-        _resolve_channel_display_colors,
-        _rgb_to_ome_hex,
-    )
-
     names = list(metadata.get("channel_names") or [])
     source_channels = [
         dict(ch) if isinstance(ch, dict) else {}
