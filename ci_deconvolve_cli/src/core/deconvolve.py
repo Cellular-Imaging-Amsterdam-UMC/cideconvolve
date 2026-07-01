@@ -509,7 +509,7 @@ def load_image(
             if len(shape) == 5:
                 size_t, size_c, size_z, size_y, size_x = shape
                 for c in range(size_c):
-                    channel_data = arr[0, c].compute()
+                    channel_data = arr[:, c].compute() if size_t > 1 else arr[0, c].compute()
                     images.append(np.asarray(channel_data, dtype=np.float32))
             elif len(shape) == 4:
                 size_t = 1
@@ -583,7 +583,18 @@ def load_image(
                             meta[k] = v
                     # Extract all channels from this file
                     for c in range(img.dims.C):
-                        if img.dims.Z > 1:
+                        if img.dims.T > 1:
+                            if img.dims.Z > 1:
+                                channel_data = np.stack([
+                                    img.get_image_data("ZYX", T=t, C=c)
+                                    for t in range(img.dims.T)
+                                ], axis=0)
+                            else:
+                                channel_data = np.stack([
+                                    img.get_image_data("YX", T=t, C=c)
+                                    for t in range(img.dims.T)
+                                ], axis=0)
+                        elif img.dims.Z > 1:
                             channel_data = img.get_image_data("ZYX", T=0, C=c)
                         else:
                             channel_data = img.get_image_data("YX", T=0, C=c)
@@ -599,7 +610,18 @@ def load_image(
                 if k not in meta or meta[k] is None:
                     meta[k] = v
             for c in range(img.dims.C):
-                if img.dims.Z > 1:
+                if img.dims.T > 1:
+                    if img.dims.Z > 1:
+                        channel_data = np.stack([
+                            img.get_image_data("ZYX", T=t, C=c)
+                            for t in range(img.dims.T)
+                        ], axis=0)
+                    else:
+                        channel_data = np.stack([
+                            img.get_image_data("YX", T=t, C=c)
+                            for t in range(img.dims.T)
+                        ], axis=0)
+                elif img.dims.Z > 1:
                     channel_data = img.get_image_data("ZYX", T=0, C=c)
                 else:
                     channel_data = img.get_image_data("YX", T=0, C=c)
@@ -639,32 +661,78 @@ def load_image(
                             f"Could not parse embedded OME metadata ({type(ome_exc).__name__}: {ome_exc}); using fallbacks.",
                         )
                         logger.warning("Could not parse embedded OME metadata from %s: %s", path, ome_exc)
-                data = tif.asarray()
-            if data.ndim == 4:  # Assume CZYX
+                series = tif.series[0]
+                axes = getattr(series, "axes", "")
+                data = series.asarray()
+            if data.ndim == 5 and axes == "TCZYX":
+                meta["size_t"], meta["size_c"], meta["size_z"], meta["size_y"], meta["size_x"] = data.shape
+                for c in range(data.shape[1]):
+                    images.append(np.asarray(data[:, c], dtype=np.float32))
+            elif data.ndim == 5 and axes == "TZCYX":
+                meta["size_t"], meta["size_z"], meta["size_c"], meta["size_y"], meta["size_x"] = data.shape
+                for c in range(data.shape[2]):
+                    images.append(np.asarray(data[:, :, c], dtype=np.float32))
+            elif data.ndim == 4 and axes == "TCYX":
+                meta["size_t"], meta["size_c"], meta["size_y"], meta["size_x"] = data.shape
+                meta["size_z"] = 1
+                for c in range(data.shape[1]):
+                    images.append(np.asarray(data[:, c], dtype=np.float32))
+            elif data.ndim == 4:  # Assume CZYX
                 for c in range(data.shape[0]):
                     images.append(np.asarray(data[c], dtype=np.float32))
-            elif data.ndim == 3:  # Single channel ZYX
+            elif data.ndim == 3:  # Single channel ZYX or TYX if metadata says Z=1, T>1
                 images.append(np.asarray(data, dtype=np.float32))
             elif data.ndim == 2:  # Single 2D image
                 images.append(np.asarray(data, dtype=np.float32))
 
+    provenance: dict[str, Any] = {}
+    channel_provenance: list[dict[str, str]] = [{} for _ in range(len(images))]
+    for key in (
+        "na",
+        "refractive_index",
+        "sample_refractive_index",
+        "microscope_type",
+        "pixel_size_x",
+        "pixel_size_y",
+        "pixel_size_z",
+    ):
+        value = meta.get(key)
+        if key == "microscope_type":
+            if str(value or "").strip():
+                provenance[key] = "image metadata"
+        elif _positive_metadata_float(value) is not None:
+            provenance[key] = "image metadata"
+    for i, ch in enumerate(meta.get("channels") or []):
+        if i >= len(channel_provenance) or not isinstance(ch, dict):
+            continue
+        for key in ("emission_wavelength", "excitation_wavelength", "pinhole_airy_units"):
+            if _positive_metadata_float(ch.get(key)) is not None:
+                channel_provenance[i][key] = "image metadata"
+        if _positive_metadata_float(ch.get("pinhole_size")) is not None:
+            channel_provenance[i]["pinhole_airy_units"] = "image metadata"
+
+    def _user_source(current) -> str:
+        if overrule_metadata and current not in (None, ""):
+            return "user setting override"
+        return "user setting fallback"
+
     def _use_value(current, value) -> bool:
         return value is not None and (overrule_metadata or current is None)
 
+    def _apply_user_scalar(key: str, value: Any) -> None:
+        current = meta.get(key)
+        if _use_value(current, value):
+            meta[key] = value
+            provenance[key] = _user_source(current)
+
     # Apply user metadata values. With overrule_metadata=False, these are
     # fallbacks only; existing image metadata is preserved.
-    if _use_value(meta.get("na"), na):
-        meta["na"] = na
-    if _use_value(meta.get("refractive_index"), refractive_index):
-        meta["refractive_index"] = refractive_index
-    if _use_value(meta.get("microscope_type"), microscope_type):
-        meta["microscope_type"] = microscope_type
-    if _use_value(meta.get("pixel_size_x"), pixel_size_xy):
-        meta["pixel_size_x"] = pixel_size_xy
-    if _use_value(meta.get("pixel_size_y"), pixel_size_xy):
-        meta["pixel_size_y"] = pixel_size_xy
-    if _use_value(meta.get("pixel_size_z"), pixel_size_z):
-        meta["pixel_size_z"] = pixel_size_z
+    _apply_user_scalar("na", na)
+    _apply_user_scalar("refractive_index", refractive_index)
+    _apply_user_scalar("microscope_type", microscope_type)
+    _apply_user_scalar("pixel_size_x", pixel_size_xy)
+    _apply_user_scalar("pixel_size_y", pixel_size_xy)
+    _apply_user_scalar("pixel_size_z", pixel_size_z)
     def _channel_param(values, index: int):
         if not values:
             return None
@@ -680,6 +748,9 @@ def load_image(
             if i < len(meta["channels"]):
                 ch = meta["channels"][i]
                 if wl is not None and _use_value(ch.get("emission_wavelength"), wl):
+                    channel_provenance[i]["emission_wavelength"] = _user_source(
+                        ch.get("emission_wavelength")
+                    )
                     ch["emission_wavelength"] = wl
     if excitation_wavelengths is not None:
         if "channels" not in meta:
@@ -691,6 +762,9 @@ def load_image(
             if i < len(meta["channels"]):
                 ch = meta["channels"][i]
                 if wl is not None and _use_value(ch.get("excitation_wavelength"), wl):
+                    channel_provenance[i]["excitation_wavelength"] = _user_source(
+                        ch.get("excitation_wavelength")
+                    )
                     ch["excitation_wavelength"] = wl
 
     # Apply defaults for critical missing values (setdefault won't
@@ -707,13 +781,22 @@ def load_image(
     }
     _defaulted = _sanitize_core_metadata(meta, len(images), _defaults)
     _defaulted.update(_sanitize_channel_wavelengths(meta, len(images)))
+    for key in _defaulted:
+        if key in _defaults:
+            provenance[key] = "built-in default"
     meta["_defaulted_keys"] = _defaulted
     if overrule_metadata and sample_refractive_index is not None:
+        provenance["sample_refractive_index"] = _user_source(
+            meta.get("sample_refractive_index")
+        )
         meta["sample_refractive_index"] = sample_refractive_index
     elif _positive_metadata_float(meta.get("sample_refractive_index")) is None:
         raw_sample_ri = meta.get("sample_refractive_index")
         meta["sample_refractive_index"] = (
             sample_refractive_index if sample_refractive_index is not None else 1.47
+        )
+        provenance["sample_refractive_index"] = (
+            "user setting fallback" if sample_refractive_index is not None else "built-in default"
         )
         _defaulted.add("sample_refractive_index")
         if raw_sample_ri in (None, ""):
@@ -730,17 +813,30 @@ def load_image(
     if "channels" not in meta or not meta["channels"]:
         meta["channels"] = [{} for _ in range(len(images))]
         _add_metadata_warning(meta, "Missing channel metadata; using generic channel defaults.")
-    if apply_dye_wavelength_fallbacks(meta, len(images)):
+    dye_inferred = apply_dye_wavelength_fallbacks(meta, len(images))
+    if dye_inferred:
         _defaulted.discard("emission_wavelength")
+        for i, ch in enumerate(meta.get("channels") or []):
+            if i >= len(channel_provenance):
+                continue
+            for key in ("emission_wavelength", "excitation_wavelength"):
+                if ch.get(f"{key}_source") == "dye_name":
+                    channel_provenance[i][key] = "dye name fallback"
     # Fill in missing emission wavelengths with a default
-    for ch in meta["channels"]:
+    for i, ch in enumerate(meta["channels"]):
         if ch.get("emission_wavelength") is None:
             ch["emission_wavelength"] = 520.0
+            if i < len(channel_provenance):
+                channel_provenance[i]["emission_wavelength"] = "built-in default"
             _em_defaulted = True
     if _em_defaulted:
         _defaulted.add("emission_wavelength")
         _add_metadata_warning(meta, "Missing emission wavelength metadata; using 520.0 nm fallback where needed.")
 
+    pinhole_before = [
+        dict(ch) if isinstance(ch, dict) else {}
+        for ch in (meta.get("channels") or [])
+    ]
     if _apply_pinhole_airy_units(
         meta,
         pinhole_airy_units,
@@ -750,6 +846,28 @@ def load_image(
     else:
         _defaulted.add("pinhole_airy_units")
         _add_metadata_warning(meta, "Missing or invalid pinhole metadata; using fallback Airy units.")
+    for i, ch in enumerate(meta.get("channels") or []):
+        if i >= len(channel_provenance):
+            continue
+        before = pinhole_before[i] if i < len(pinhole_before) else {}
+        if overrule_metadata:
+            channel_provenance[i]["pinhole_airy_units"] = _user_source(
+                before.get("pinhole_airy_units") or before.get("pinhole_size")
+            )
+        elif _positive_metadata_float(ch.get("pinhole_airy_units_from_metadata")) is not None:
+            channel_provenance[i]["pinhole_airy_units"] = "image metadata"
+        elif _positive_metadata_float(before.get("pinhole_airy_units")) is not None:
+            channel_provenance[i]["pinhole_airy_units"] = "image metadata"
+        elif _positive_metadata_float(ch.get("pinhole_airy_units")) is not None:
+            channel_provenance[i]["pinhole_airy_units"] = (
+                "user setting fallback" if pinhole_airy_units is not None else "built-in default"
+            )
+
+    meta["_metadata_provenance"] = {
+        "fields": provenance,
+        "channels": channel_provenance,
+    }
+    meta["source_path"] = str(path)
 
     logger.info(
         "Loaded %d channel(s), shape=%s, microscope=%s, NA=%.2f",
@@ -1119,6 +1237,7 @@ def deconvolve_image(
     two_d_wf_bg_radius_um: float = 0.5,
     two_d_wf_bg_scale: float = 1.0,
     device: Optional[str] = None,
+    cancel_checker: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Load, generate PSFs, and deconvolve all channels of an OME-TIFF image.
 
@@ -1172,6 +1291,8 @@ def deconvolve_image(
     psfs: list[np.ndarray] = []
 
     for ch_idx in channels:
+        if cancel_checker is not None and cancel_checker():
+            raise RuntimeError("Cancelled")
         if ch_idx >= len(images):
             raise IndexError(
                 f"Channel {ch_idx} requested but only {len(images)} available"
@@ -1193,15 +1314,25 @@ def deconvolve_image(
 
         # Match PSF dimensionality to image
         img = images[ch_idx]
+        size_t = int(metadata.get("size_t", 1) or 1)
+        size_z = int(metadata.get("size_z", 1) or 1)
+        if size_t > 1 and img.ndim == 4:
+            time_slices = [img[t] for t in range(img.shape[0])]
+        elif size_t > 1 and img.ndim == 3 and size_z == 1:
+            time_slices = [img[t] for t in range(img.shape[0])]
+        else:
+            time_slices = [img]
+
+        sample_img = time_slices[0]
         keep_hidden_2d_psf = (
-            img.ndim == 2
+            sample_img.ndim == 2
             and psf.ndim == 3
             and metadata.get("microscope_type", "widefield") == "widefield"
             and str(two_d_mode).strip().lower() == "auto"
         )
-        if img.ndim == 2 and psf.ndim == 3 and not keep_hidden_2d_psf:
+        if sample_img.ndim == 2 and psf.ndim == 3 and not keep_hidden_2d_psf:
             psf = psf[psf.shape[0] // 2]  # Take central slice
-        elif img.ndim == 3 and psf.ndim == 2:
+        elif sample_img.ndim == 3 and psf.ndim == 2:
             # Expand 2D PSF into 3D (single-plane)
             psf = psf[np.newaxis, :, :]
 
@@ -1211,22 +1342,31 @@ def deconvolve_image(
         else:
             ch_niter = niter
 
-        # Deconvolve
-        result = deconvolve(
-            img, psf, method=method,
-            niter=ch_niter, background=background, damping=damping, offset=offset,
-            prefilter_sigma=prefilter_sigma, start=start,
-            convergence=convergence, rel_threshold=rel_threshold,
-            check_every=check_every, device=device,
-            pixel_size_xy=metadata.get("pixel_size_x"),
-            pixel_size_z=metadata.get("pixel_size_z"),
-            microscope_type=metadata.get("microscope_type", "widefield"),
-            two_d_mode=two_d_mode,
-            two_d_wf_aggressiveness=two_d_wf_aggressiveness,
-            two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
-            two_d_wf_bg_scale=two_d_wf_bg_scale,
-        )
-        results.append(result)
+        channel_results: list[np.ndarray] = []
+        for t_idx, time_img in enumerate(time_slices):
+            if cancel_checker is not None and cancel_checker():
+                raise RuntimeError("Cancelled")
+            if len(time_slices) > 1:
+                logger.info(
+                    "Processing channel %d / %d, timepoint %d / %d ...",
+                    ch_idx + 1, len(channels), t_idx + 1, len(time_slices),
+                )
+            result = deconvolve(
+                time_img, psf, method=method,
+                niter=ch_niter, background=background, damping=damping, offset=offset,
+                prefilter_sigma=prefilter_sigma, start=start,
+                convergence=convergence, rel_threshold=rel_threshold,
+                check_every=check_every, device=device,
+                pixel_size_xy=metadata.get("pixel_size_x"),
+                pixel_size_z=metadata.get("pixel_size_z"),
+                microscope_type=metadata.get("microscope_type", "widefield"),
+                two_d_mode=two_d_mode,
+                two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+                two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+                two_d_wf_bg_scale=two_d_wf_bg_scale,
+            )
+            channel_results.append(result)
+        results.append(channel_results[0] if len(channel_results) == 1 else np.stack(channel_results, axis=0))
 
     return {
         "channels": results,
@@ -1397,6 +1537,7 @@ def save_result(
     *,
     compress: bool = True,
     mip_only: bool = False,
+    save_qc_mips: bool = True,
 ) -> Path:
     """Save deconvolved images as OME-TIFF, preserving metadata.
 
@@ -1423,7 +1564,15 @@ def save_result(
     channels_data = result["channels"]
 
     # Stack channels into CZYX or CYX
-    if channels_data[0].ndim == 3:
+    if channels_data[0].ndim == 4:
+        # Time series 3D: channels are (T, Z, Y, X), write (T, C, Z, Y, X)
+        stack = np.stack(channels_data, axis=1)
+        axes = "TCZYX"
+    elif channels_data[0].ndim == 3 and int(metadata.get("size_t", 1) or 1) > 1 and int(metadata.get("size_z", 1) or 1) == 1:
+        # Time series 2D: channels are (T, Y, X), write (T, C, Y, X)
+        stack = np.stack(channels_data, axis=1)
+        axes = "TCYX"
+    elif channels_data[0].ndim == 3:
         # 3D: stack to (C, Z, Y, X)
         stack = np.stack(channels_data, axis=0)
         axes = "CZYX"
@@ -1461,6 +1610,8 @@ def save_result(
             "PhysicalSizeZUnit": "µm",
             "Channel": {"Name": channel_names[:len(channels_data)]},
         }
+        if axes.startswith("T"):
+            ome_meta["TimeIncrement"] = metadata.get("time_increment")
 
         # Add per-channel emission/excitation wavelengths if available
         ch_info = metadata.get("channels", [])
@@ -1506,12 +1657,20 @@ def save_result(
         )
         logger.info("Saved deconvolved result to %s", output_path)
 
+    if not save_qc_mips:
+        return output_path
+
     # Save maximum intensity projection for 3D results
     # For 2D results, save the image directly with mip_ prefix for montage
-    if axes == "CZYX":
+    if axes == "TCZYX":
+        mip = stack.max(axis=2)  # Project along Z -> (T, C, Y, X)
+        mip_axes = "TCYX"
+    elif axes == "CZYX":
         mip = stack.max(axis=1)  # Project along Z → (C, Y, X)
+        mip_axes = "CYX"
     else:
         mip = stack  # Already (C, Y, X) — use as-is for montage
+        mip_axes = axes
 
     if mip is not None:
         mip_path = output_path.parent / ("mip_" + output_path.name)
@@ -1524,7 +1683,7 @@ def save_result(
             resolution=resolution,
             resolutionunit=resolution_unit,
             metadata={
-                "axes": "CYX",
+                "axes": mip_axes,
                 "PhysicalSizeX": px_x,
                 "PhysicalSizeY": px_y,
                 "PhysicalSizeXUnit": "µm",
@@ -1539,20 +1698,30 @@ def save_result(
         )
         logger.info("Saved MIP to %s", mip_path)
 
-        # Save colour PNG of MIP (always — needed for montage)
+        # Save colour PNG of MIP (always - needed for montage). PNG previews are
+        # 2D/3D only, so use the first timepoint for TCYX quick-look images.
         mip_png = mip_path.with_suffix(".png")
-        save_mip_png(mip, mip_png, metadata)
+        png_mip = mip[0] if getattr(mip, "ndim", 0) == 4 else mip
+        save_mip_png(png_mip, mip_png, metadata)
 
     # Save maximum intensity projection of the source image for 3D data
     # For 2D, save the source directly with mip_ prefix for montage
     source_channels = result.get("source_channels")
     if source_channels:
         src_mip_path = output_path.parent / "mip_source.ome.tiff"
-        src_stack = np.stack(source_channels, axis=0)
-        if axes == "CZYX":
+        if axes in ("TCZYX", "TCYX"):
+            src_stack = np.stack(source_channels, axis=1)
+        else:
+            src_stack = np.stack(source_channels, axis=0)
+        if axes == "TCZYX":
+            src_mip = src_stack.max(axis=2)  # (T, C, Y, X)
+            src_axes = "TCYX"
+        elif axes == "CZYX":
             src_mip = src_stack.max(axis=1)  # Project along Z → (C, Y, X)
+            src_axes = "CYX"
         else:
             src_mip = src_stack  # Already (C, Y, X)
+            src_axes = axes
         tifffile.imwrite(
             str(src_mip_path),
             src_mip.astype(np.float32),
@@ -1562,7 +1731,7 @@ def save_result(
             resolution=resolution,
             resolutionunit=resolution_unit,
             metadata={
-                "axes": "CYX",
+                "axes": src_axes,
                 "PhysicalSizeX": px_x,
                 "PhysicalSizeY": px_y,
                 "PhysicalSizeXUnit": "µm",
@@ -1577,8 +1746,9 @@ def save_result(
         )
         logger.info("Saved source MIP to %s", src_mip_path)
 
-        # Save colour PNG of source MIP (always — needed for montage)
+        # Save colour PNG of source MIP (always - needed for montage)
         src_mip_png = src_mip_path.with_suffix(".png")
-        save_mip_png(src_mip, src_mip_png, metadata)
+        png_src_mip = src_mip[0] if getattr(src_mip, "ndim", 0) == 4 else src_mip
+        save_mip_png(png_src_mip, src_mip_png, metadata)
 
     return output_path

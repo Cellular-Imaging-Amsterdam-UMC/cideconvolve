@@ -163,6 +163,16 @@ def _result_to_tczyx(result: dict[str, Any]) -> np.ndarray:
     channels = [np.asarray(ch, dtype=np.float32) for ch in result["channels"]]
     if not channels:
         raise ValueError("No channels to write")
+    metadata = dict(result.get("metadata") or {})
+    if channels[0].ndim == 4:
+        return np.stack(channels, axis=1).astype(np.float32, copy=False)
+    if (
+        channels[0].ndim == 3
+        and int(metadata.get("size_t", 1) or 1) > 1
+        and int(metadata.get("size_z", 1) or 1) == 1
+    ):
+        stack = np.stack(channels, axis=1)
+        return stack[:, :, np.newaxis, :, :].astype(np.float32, copy=False)
     if channels[0].ndim == 3:
         stack = np.stack(channels, axis=0)
         return stack[np.newaxis, ...].astype(np.float32, copy=False)
@@ -187,6 +197,62 @@ def _scale_transform(px_z: float, px_y: float, px_x: float) -> list[dict[str, An
         "type": "scale",
         "scale": [1.0, 1.0, float(px_z), float(px_y), float(px_x)],
     }]
+
+
+def _downsample_xy_mean(data: np.ndarray) -> np.ndarray:
+    """Downsample TCZYX data by 2x in XY using block means."""
+    y_even = data.shape[3] - (data.shape[3] % 2)
+    x_even = data.shape[4] - (data.shape[4] % 2)
+    cropped = data[:, :, :, :y_even, :x_even]
+    return cropped.reshape(
+        cropped.shape[0],
+        cropped.shape[1],
+        cropped.shape[2],
+        y_even // 2,
+        2,
+        x_even // 2,
+        2,
+    ).mean(axis=(4, 6), dtype=np.float32)
+
+
+def _pyramid_levels(data: np.ndarray, mode: str) -> list[np.ndarray]:
+    mode = str(mode or "auto").lower()
+    if mode in {"off", "none", "false", "0"}:
+        return [data]
+    if mode not in {"auto", "on", "true", "1"}:
+        raise ValueError(f"Unknown OME-Zarr pyramid mode: {mode}")
+
+    levels = [data]
+    current = data
+    should_continue = lambda arr: arr.shape[3] >= 512 and arr.shape[4] >= 512
+    if mode == "auto" and max(data.shape[3], data.shape[4]) < 2048:
+        return levels
+    while len(levels) < 5 and should_continue(current):
+        current = _downsample_xy_mean(current)
+        if current.shape[3] < 1 or current.shape[4] < 1:
+            break
+        levels.append(current.astype(np.float32, copy=False))
+    return levels
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe(v) for v in sorted(value, key=str)]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def _omero_metadata(metadata: dict[str, Any], n_channels: int) -> dict[str, Any]:
@@ -239,6 +305,7 @@ def save_result_ome_zarr(
     output_path: str | Path,
     *,
     overwrite: bool = True,
+    pyramid: str = "auto",
 ) -> Path:
     """Write a deconvolution result as OME-Zarr v0.4 / Zarr v2.
 
@@ -269,37 +336,49 @@ def save_result_ome_zarr(
     px_x = float(metadata.get("pixel_size_x") or 1.0)
     px_y = float(metadata.get("pixel_size_y") or px_x)
     px_z = float(metadata.get("pixel_size_z") or 1.0)
-    chunks = (1, 1, min(data.shape[2], 16), min(data.shape[3], 512), min(data.shape[4], 512))
+    levels = _pyramid_levels(data, pyramid)
 
     try:
         root = zarr.open_group(str(output_path), mode="w", zarr_format=2)
     except TypeError:
         root = zarr.open_group(str(output_path), mode="w", zarr_version=2)
 
-    create_kwargs = {
-        "shape": data.shape,
-        "chunks": chunks,
-        "dtype": data.dtype,
-    }
-    try:
-        array = root.create_dataset("0", dimension_separator="/", **create_kwargs)
-    except TypeError:
-        array = root.create_dataset("0", **create_kwargs)
-    array[:] = data
+    datasets = []
+    for level, level_data in enumerate(levels):
+        path = str(level)
+        chunks = (
+            1,
+            1,
+            min(level_data.shape[2], 16),
+            min(level_data.shape[3], 512),
+            min(level_data.shape[4], 512),
+        )
+        create_kwargs = {
+            "shape": level_data.shape,
+            "chunks": chunks,
+            "dtype": level_data.dtype,
+        }
+        try:
+            array = root.create_dataset(path, dimension_separator="/", **create_kwargs)
+        except TypeError:
+            array = root.create_dataset(path, **create_kwargs)
+        array[:] = level_data
+        scale = 2 ** level
+        datasets.append({
+            "path": path,
+            "coordinateTransformations": _scale_transform(px_z, px_y * scale, px_x * scale),
+        })
 
     name = str(metadata.get("name") or _ome_zarr_name(output_path))
     root.attrs["multiscales"] = [{
         "version": "0.4",
         "name": name,
         "axes": _axes_metadata(),
-        "datasets": [{
-            "path": "0",
-            "coordinateTransformations": _scale_transform(px_z, px_y, px_x),
-        }],
+        "datasets": datasets,
     }]
     root.attrs["omero"] = _omero_metadata(metadata, data.shape[1])
     root.attrs["cideconvolve"] = {
-        "metadata": metadata,
+        "metadata": _json_safe(metadata),
         "physical_pixel_sizes_um": {"x": px_x, "y": px_y, "z": px_z},
     }
     return output_path

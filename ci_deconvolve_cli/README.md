@@ -74,6 +74,7 @@ ci_deconvolve --input image.ome.tiff --output out ^
   --iterations 40 ^
   --device auto ^
   --output-format ome-tiff ^
+  --projection none ^
   --emission-wl 520 ^
   --excitation-wl 488 ^
   --pixel-size-xy 0.065 ^
@@ -118,6 +119,7 @@ does not process plate fields.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--output-format ome-tiff\|ome-zarr` | `ome-tiff` | Writes `<stem>_decon.ome.tiff` or `<stem>_decon.ome.zarr`. |
+| `--projection none\|max-z` | `none` | With `max-z`, writes a maximum-Z projection when the deconvolved result is 3D. 2D inputs are unchanged. |
 | `--iterations N[,N...]` | `40` | CI-RL iteration count. A comma- or semicolon-separated list applies per channel, with the last value reused for extra channels. |
 | `--device auto\|cpu\|cuda` | `auto` | Compute device. `auto` lets PyTorch choose CUDA when available, otherwise CPU. |
 | `-v`, `--verbose` | off | Enable INFO logging from the CLI and core deconvolution code. |

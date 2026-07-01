@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
 from typing import Iterable
 
+from ci_deconvolve import __version__
+
 LOGGER = logging.getLogger("ci_deconvolve")
+_CANCEL_REQUESTED = False
 
 OME_TIFF_SUFFIXES = (".ome.tif", ".ome.tiff")
 ZARR_SUFFIXES = (".zarr", ".ome.zarr")
@@ -105,12 +110,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("input_path", nargs="?", help="Input file/folder. Alias for --input.")
     parser.add_argument("--input", dest="input_option", help="OME-TIFF, OME-Zarr, or folder.")
-    parser.add_argument("--output", required=True, help="Output folder.")
+    parser.add_argument("--output", help="Output folder.")
+    parser.add_argument(
+        "--validate-env",
+        action="store_true",
+        help="Report Python/PyTorch/Zarr/CIDeconvolve environment details and exit.",
+    )
     parser.add_argument(
         "--output-format",
         choices=("ome-tiff", "ome-zarr"),
         default="ome-tiff",
         help="Output format. Default: ome-tiff.",
+    )
+    parser.add_argument(
+        "--projection",
+        choices=("none", "max-z"),
+        default="none",
+        help="Write a max-Z projection instead of the full 3D stack when input data is 3D.",
+    )
+    parser.add_argument(
+        "--ome-zarr-pyramid",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Write XY pyramid levels for OME-Zarr output. Default: auto.",
     )
     parser.add_argument("--iterations", type=_parse_int_list, default=[40])
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -161,6 +183,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--two-d-wf-bg-radius-um", type=float, default=0.5)
     parser.add_argument("--two-d-wf-bg-scale", type=float, default=1.0)
+    parser.add_argument("--save-qc-mips", dest="save_qc_mips", action="store_true", default=True)
+    parser.add_argument("--no-qc-mips", dest="save_qc_mips", action="store_false")
+    parser.add_argument("--write-manifest", dest="write_manifest", action="store_true", default=True)
+    parser.add_argument("--no-manifest", dest="write_manifest", action="store_false")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -173,6 +199,119 @@ def _output_path(input_path: Path, output_dir: Path, output_format: str) -> Path
     if output_format == "ome-zarr":
         return output_dir / f"{_stem(input_path)}_decon.ome.zarr"
     return output_dir / f"{_stem(input_path)}_decon.ome.tiff"
+
+
+def _apply_projection(result: dict, projection: str) -> dict:
+    if projection != "max-z":
+        return result
+    channels = list(result.get("channels") or [])
+    if not channels:
+        return result
+    if channels[0].ndim == 4 and channels[0].shape[1] > 1:
+        import numpy as np
+
+        projected = dict(result)
+        projected["channels"] = [
+            np.max(channel, axis=1).astype(np.float32, copy=False)
+            for channel in channels
+        ]
+        if result.get("source_channels"):
+            projected["source_channels"] = [
+                np.max(channel, axis=1).astype(np.float32, copy=False)
+                if getattr(channel, "ndim", 0) == 4 and channel.shape[1] > 1
+                else channel
+                for channel in result["source_channels"]
+            ]
+        metadata = dict(result.get("metadata") or {})
+        metadata["projection"] = {"axis": "z", "method": "max"}
+        metadata["size_z"] = 1
+        projected["metadata"] = metadata
+        return projected
+    if channels[0].ndim != 3 or channels[0].shape[0] <= 1:
+        return result
+
+    import numpy as np
+
+    projected = dict(result)
+    projected["channels"] = [np.max(channel, axis=0).astype(np.float32, copy=False) for channel in channels]
+    if result.get("source_channels"):
+        projected["source_channels"] = [
+            np.max(channel, axis=0).astype(np.float32, copy=False)
+            if getattr(channel, "ndim", 0) == 3 and channel.shape[0] > 1
+            else channel
+            for channel in result["source_channels"]
+        ]
+    metadata = dict(result.get("metadata") or {})
+    metadata["projection"] = {"axis": "z", "method": "max"}
+    metadata["size_z"] = 1
+    projected["metadata"] = metadata
+    return projected
+
+
+def _format_metadata_value(value) -> str:
+    if value is None:
+        return "missing"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def _metadata_source(metadata: dict, key: str) -> str:
+    provenance = metadata.get("_metadata_provenance") or {}
+    fields = provenance.get("fields") if isinstance(provenance, dict) else {}
+    return str((fields or {}).get(key) or "unknown")
+
+
+def _channel_metadata_source(metadata: dict, index: int, key: str) -> str:
+    provenance = metadata.get("_metadata_provenance") or {}
+    channels = provenance.get("channels") if isinstance(provenance, dict) else []
+    if isinstance(channels, list) and index < len(channels) and isinstance(channels[index], dict):
+        return str(channels[index].get(key) or "unknown")
+    return "unknown"
+
+
+def _print_metadata_report(metadata: dict) -> None:
+    fields = [
+        ("pixel_size_x", "pixel size X", "um"),
+        ("pixel_size_y", "pixel size Y", "um"),
+        ("pixel_size_z", "pixel size Z", "um"),
+        ("na", "NA", ""),
+        ("refractive_index", "immersion RI", ""),
+        ("sample_refractive_index", "sample RI", ""),
+        ("microscope_type", "microscope", ""),
+    ]
+    print("  metadata:")
+    for key, label, unit in fields:
+        value = _format_metadata_value(metadata.get(key))
+        suffix = f" {unit}" if unit else ""
+        print(f"    {label:14}: {value}{suffix} ({_metadata_source(metadata, key)})")
+
+    defaulted = sorted(str(key) for key in metadata.get("_defaulted_keys") or [])
+    inferred = sorted(str(key) for key in metadata.get("_inferred_keys") or [])
+    warnings = [str(item) for item in metadata.get("metadata_warnings") or [] if str(item).strip()]
+    if defaulted:
+        print("    defaults      : " + ", ".join(defaulted))
+    if inferred:
+        print("    inferred      : " + ", ".join(inferred))
+    if warnings:
+        print("    warnings      : " + " | ".join(warnings))
+
+    channels = list(metadata.get("channels") or [])
+    for index, channel in enumerate(channels):
+        name = channel.get("name") or channel.get("label")
+        if not name and index < len(metadata.get("channel_names") or []):
+            name = metadata["channel_names"][index]
+        print(f"    channel {index}{f' ({name})' if name else ''}:")
+        for key, label, unit in (
+            ("emission_wavelength", "emission", "nm"),
+            ("excitation_wavelength", "excitation", "nm"),
+            ("pinhole_airy_units", "pinhole", "AU"),
+        ):
+            value = _format_metadata_value(channel.get(key))
+            print(
+                f"      {label:10}: {value} {unit} "
+                f"({_channel_metadata_source(metadata, index, key)})"
+            )
 
 
 def _run_one(input_path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
@@ -212,23 +351,78 @@ def _run_one(input_path: Path, output_dir: Path, args: argparse.Namespace) -> Pa
         two_d_wf_bg_radius_um=max(0.1, float(args.two_d_wf_bg_radius_um)),
         two_d_wf_bg_scale=max(0.1, float(args.two_d_wf_bg_scale)),
         device=device,
+        cancel_checker=lambda: _CANCEL_REQUESTED,
     )
+    result = _apply_projection(result, args.projection)
+    _print_metadata_report(result.get("metadata") or {})
 
     out_path = _output_path(input_path, output_dir, args.output_format)
     if args.output_format == "ome-zarr":
-        return save_result_ome_zarr(result, out_path)
+        return save_result_ome_zarr(result, out_path, pyramid=args.ome_zarr_pyramid)
 
     tmp_dir = output_dir / ".ci_deconvolve_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / out_path.name
     try:
-        save_result(result, tmp_path)
+        save_result(result, tmp_path, save_qc_mips=bool(args.save_qc_mips))
         if out_path.exists():
             out_path.unlink()
         shutil.move(str(tmp_path), str(out_path))
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     return out_path
+
+
+def _validate_environment() -> int:
+    print("CIDECONVOLVE_OK")
+    print(f"ci_deconvolve={__version__}")
+    print(f"python={sys.version.split()[0]}")
+    try:
+        import torch
+        print(f"torch={getattr(torch, '__version__', 'unknown')}")
+        print(f"cuda_available={bool(torch.cuda.is_available())}")
+        print(f"cuda_device_count={torch.cuda.device_count() if torch.cuda.is_available() else 0}")
+    except Exception as exc:
+        print(f"torch_error={type(exc).__name__}: {exc}")
+        return 1
+    try:
+        import zarr
+        print(f"zarr={getattr(zarr, '__version__', 'unknown')}")
+        print("ome_zarr_v2_write=ok")
+    except Exception as exc:
+        print(f"zarr_error={type(exc).__name__}: {exc}")
+        return 1
+    return 0
+
+
+def _install_signal_handlers() -> None:
+    def _handler(signum, frame):
+        global _CANCEL_REQUESTED
+        _CANCEL_REQUESTED = True
+        print(f"Cancellation requested by signal {signum}.", file=sys.stderr)
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _handler)
+            except Exception:
+                pass
+
+
+def _write_manifest(output_dir: Path, records: list[dict], args: argparse.Namespace) -> None:
+    manifest = {
+        "ci_deconvolve_version": __version__,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "output_format": args.output_format,
+        "projection": args.projection,
+        "iterations": args.iterations,
+        "records": records,
+    }
+    (output_dir / "ci_deconvolve_manifest.json").write_text(
+        json.dumps(manifest, indent=2, default=str),
+        encoding="utf-8",
+    )
 
 
 def run(argv: Iterable[str] | None = None) -> int:
@@ -238,6 +432,12 @@ def run(argv: Iterable[str] | None = None) -> int:
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    if args.validate_env:
+        return _validate_environment()
+    if not args.output:
+        parser.error("--output is required unless --validate-env is used")
+    _install_signal_handlers()
 
     input_value = args.input_option or args.input_path
     if not input_value:
@@ -254,20 +454,50 @@ def run(argv: Iterable[str] | None = None) -> int:
     print(f"  input count  : {len(inputs)}")
     print(f"  output       : {output_dir}")
     print(f"  output format: {args.output_format}")
+    print(f"  projection   : {args.projection}")
     print(f"  iterations   : {', '.join(str(v) for v in args.iterations)}")
 
     failures: list[tuple[Path, Exception]] = []
+    records: list[dict] = []
     for index, item in enumerate(inputs, start=1):
+        if _CANCEL_REQUESTED:
+            print("\nCancelled before remaining inputs.", file=sys.stderr)
+            return 130
         print(f"\n[{index}/{len(inputs)}] {item}")
         start = time.time()
         try:
             out_path = _run_one(item, output_dir, args)
             print(f"  saved: {out_path}")
-            print(f"  time : {time.time() - start:.1f}s")
+            elapsed = time.time() - start
+            print(f"  time : {elapsed:.1f}s")
+            records.append({
+                "input": str(item),
+                "output": str(out_path),
+                "status": "success",
+                "seconds": elapsed,
+            })
         except Exception as exc:
+            if _CANCEL_REQUESTED or str(exc) == "Cancelled":
+                elapsed = time.time() - start
+                print("  CANCELLED", file=sys.stderr)
+                records.append({
+                    "input": str(item),
+                    "status": "cancelled",
+                    "seconds": elapsed,
+                })
+                if args.write_manifest:
+                    _write_manifest(output_dir, records, args)
+                return 130
             failures.append((item, exc))
             print(f"  ERROR: {exc}", file=sys.stderr)
+            records.append({
+                "input": str(item),
+                "status": "failed",
+                "error": str(exc),
+            })
 
+    if args.write_manifest:
+        _write_manifest(output_dir, records, args)
     if failures:
         print(f"\nFailed inputs: {len(failures)}", file=sys.stderr)
         for item, exc in failures:
