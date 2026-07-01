@@ -27,7 +27,8 @@ dependencies = [
   "imagecodecs>=2024.1.1",
   "bioio==3.2.0",
   "bioio-ome-tiff==1.4.0",
-  "ome-zarr>=0.18,<0.19",
+  "ome-zarr>=0.9,<0.19",
+  "zarr>=2.16,<4",
   "numcodecs>=0.14",
 ]
 

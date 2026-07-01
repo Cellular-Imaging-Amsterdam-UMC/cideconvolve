@@ -69,18 +69,12 @@ def test_project_dependencies_do_not_declare_excluded_packages():
 
     assert '"torch' not in lower
     assert "bioio-ome-zarr" not in lower
-    assert '"zarr' not in lower
     assert "pyqt6" not in lower
 
 
 def test_save_result_ome_zarr_smoke(tmp_path):
     np = pytest.importorskip("numpy")
-    try:
-        from ome_zarr.io import parse_url
-        from ome_zarr.reader import Reader
-        from ome_zarr.writer import write_image  # noqa: F401
-    except Exception as exc:
-        pytest.skip(f"ome-zarr import is not usable in this environment: {exc}")
+    pytest.importorskip("zarr")
 
     from core.ome_zarr_io import save_result_ome_zarr
 
@@ -98,7 +92,19 @@ def test_save_result_ome_zarr_smoke(tmp_path):
 
     save_result_ome_zarr(result, path)
 
-    loc = parse_url(str(path), mode="r")
-    nodes = [node for node in Reader(loc)() if getattr(node, "data", None)]
-    assert nodes
-    assert tuple(nodes[0].data[0].shape) == (1, 1, 1, 8, 9)
+    assert (path / ".zgroup").is_file()
+    assert (path / ".zattrs").is_file()
+    assert not (path / "zarr.json").exists()
+
+    import json
+
+    attrs = json.loads((path / ".zattrs").read_text(encoding="utf-8"))
+    assert attrs["multiscales"][0]["version"] == "0.4"
+    assert attrs["multiscales"][0]["datasets"][0]["path"] == "0"
+    assert attrs["omero"]["channels"][0]["label"] == "CH1"
+    assert attrs["omero"]["channels"][0]["color"] == "FF0000"
+
+    import zarr
+
+    root = zarr.open(str(path), mode="r")
+    assert tuple(root["0"].shape) == (1, 1, 1, 8, 9)

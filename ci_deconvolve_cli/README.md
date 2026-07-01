@@ -36,8 +36,8 @@ From PyPI after publishing:
 pip install ci-deconvolve
 ```
 
-The package depends on `ome-zarr` for OME-Zarr reading and writing. `zarr` is
-installed transitively by `ome-zarr`; it is not declared as a direct dependency.
+The package depends on `ome-zarr` for OME-Zarr reading and `zarr>=2.16,<4` for
+writing QuPath- and OMERO-compatible OME-Zarr output.
 
 ## Usage
 
@@ -163,6 +163,12 @@ List syntax:
 ```
 
 Commas and semicolons are both accepted.
+
+### OME-Zarr Compatibility
+
+OME-Zarr output is written as OME-NGFF 0.4 on Zarr v2, with `.zgroup` and
+`.zattrs` metadata plus OMERO channel display metadata. This layout is intended
+to open in QuPath 0.7 and remain compatible with OMERO tooling.
 
 ### 2D Widefield Options
 

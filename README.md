@@ -538,7 +538,7 @@ When `--overrule_image_metadata false` (default), image metadata wins and CLI va
 
 Batch and streaming writers preserve metadata in the output:
 
-- **OME-Zarr:** NGFF multiscales with physical pixel-size coordinate transforms; OMERO channel labels, colors, active state, and contrast windows; CIDeconvolve/source metadata in the root `cideconvolve` attribute.
+- **OME-Zarr:** OME-NGFF 0.4 multiscales on Zarr v2, with physical pixel-size coordinate transforms; OMERO channel labels, colors, active state, and contrast windows; CIDeconvolve/source metadata in the root `cideconvolve` attribute. This layout targets QuPath 0.7 and OMERO compatibility.
 - **OME-TIFF:** OME-XML physical pixel sizes, channel names, channel colors, and emission wavelengths where available; full CIDeconvolve/source metadata in private TIFF tag `65000`.
 
 Confocal pinhole diameters in the metadata are converted to Airy disk units as:

@@ -51,6 +51,15 @@ def _rgb_to_ome_hex(color: Any) -> str | None:
     return "".join(f"{v:02X}" for v in rgb)
 
 
+def _ome_zarr_name(path: Path) -> str:
+    name = path.name
+    lower = name.lower()
+    for suffix in (".ome.zarr", ".zarr"):
+        if lower.endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
 def _resolve_channel_display_colors(metadata: dict[str, Any], n_channels: int) -> list[Any]:
     channels = metadata.get("channels") or []
     colors = []
@@ -163,6 +172,23 @@ def _result_to_tczyx(result: dict[str, Any]) -> np.ndarray:
     raise ValueError(f"OME-Zarr output expects 2D or 3D channels, got {channels[0].ndim}D")
 
 
+def _axes_metadata() -> list[dict[str, str]]:
+    return [
+        {"name": "t", "type": "time"},
+        {"name": "c", "type": "channel"},
+        {"name": "z", "type": "space", "unit": "micrometer"},
+        {"name": "y", "type": "space", "unit": "micrometer"},
+        {"name": "x", "type": "space", "unit": "micrometer"},
+    ]
+
+
+def _scale_transform(px_z: float, px_y: float, px_x: float) -> list[dict[str, Any]]:
+    return [{
+        "type": "scale",
+        "scale": [1.0, 1.0, float(px_z), float(px_y), float(px_x)],
+    }]
+
+
 def _omero_metadata(metadata: dict[str, Any], n_channels: int) -> dict[str, Any]:
     names = list(metadata.get("channel_names") or [])
     source_channels = [
@@ -214,7 +240,12 @@ def save_result_ome_zarr(
     *,
     overwrite: bool = True,
 ) -> Path:
-    """Write a deconvolution result as regular OME-Zarr using ome-zarr-py."""
+    """Write a deconvolution result as OME-Zarr v0.4 / Zarr v2.
+
+    This targets the common compatibility floor for QuPath 0.7 and OMERO:
+    `.zgroup`/`.zattrs` metadata, NGFF multiscales version 0.4, and OMERO
+    channel display metadata at the image root.
+    """
     output_path = Path(output_path)
     if output_path.exists():
         if not overwrite:
@@ -226,11 +257,11 @@ def save_result_ome_zarr(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        from ome_zarr.writer import write_image
+        import zarr
     except Exception as exc:
         raise ImportError(
-            "OME-Zarr output requires a working ome-zarr installation. "
-            "Install the CLI package dependencies or run: pip install 'ome-zarr>=0.18,<0.19'."
+            "OME-Zarr output requires zarr. "
+            "Install the CLI package dependencies or run: pip install 'zarr>=2.16,<4'."
         ) from exc
 
     data = _result_to_tczyx(result)
@@ -238,21 +269,37 @@ def save_result_ome_zarr(
     px_x = float(metadata.get("pixel_size_x") or 1.0)
     px_y = float(metadata.get("pixel_size_y") or px_x)
     px_z = float(metadata.get("pixel_size_z") or 1.0)
-    storage_options = {"chunks": (1, 1, min(data.shape[2], 16), min(data.shape[3], 512), min(data.shape[4], 512))}
+    chunks = (1, 1, min(data.shape[2], 16), min(data.shape[3], 512), min(data.shape[4], 512))
 
-    write_image(
-        data,
-        str(output_path),
-        name=str(metadata.get("name") or output_path.stem),
-        axes=["t", "c", "z", "y", "x"],
-        axes_units={"z": "micrometer", "y": "micrometer", "x": "micrometer"},
-        scale={"t": 1, "c": 1, "z": px_z, "y": px_y, "x": px_x},
-        storage_options=storage_options,
-        compute=True,
-        omero=_omero_metadata(metadata, data.shape[1]),
-        cideconvolve={
-            "metadata": metadata,
-            "physical_pixel_sizes_um": {"x": px_x, "y": px_y, "z": px_z},
-        },
-    )
+    try:
+        root = zarr.open_group(str(output_path), mode="w", zarr_format=2)
+    except TypeError:
+        root = zarr.open_group(str(output_path), mode="w", zarr_version=2)
+
+    create_kwargs = {
+        "shape": data.shape,
+        "chunks": chunks,
+        "dtype": data.dtype,
+    }
+    try:
+        array = root.create_dataset("0", dimension_separator="/", **create_kwargs)
+    except TypeError:
+        array = root.create_dataset("0", **create_kwargs)
+    array[:] = data
+
+    name = str(metadata.get("name") or _ome_zarr_name(output_path))
+    root.attrs["multiscales"] = [{
+        "version": "0.4",
+        "name": name,
+        "axes": _axes_metadata(),
+        "datasets": [{
+            "path": "0",
+            "coordinateTransformations": _scale_transform(px_z, px_y, px_x),
+        }],
+    }]
+    root.attrs["omero"] = _omero_metadata(metadata, data.shape[1])
+    root.attrs["cideconvolve"] = {
+        "metadata": metadata,
+        "physical_pixel_sizes_um": {"x": px_x, "y": px_y, "z": px_z},
+    }
     return output_path
