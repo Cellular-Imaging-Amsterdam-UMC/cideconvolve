@@ -1,20 +1,20 @@
 ﻿# CIDeconvolve
 
-**GPU-accelerated 3-D / 2-D fluorescence microscopy deconvolution — SHB Richardson-Lucy, experimental 2.5D DL refinement, TV regularisation, and sparse-Hessian variational solver, all via PyTorch.**
+**GPU-accelerated 3-D / 2-D fluorescence microscopy deconvolution — SHB Richardson-Lucy, TV regularisation, and sparse-Hessian variational solver, all via PyTorch.**
 
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
 | **Version** | v2.2.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
-| **Methods** | `ci_rl` · `ci_rl_dl` · `ci_rl_tv` · `ci_sparse_hessian` |
+| **Methods** | `ci_rl` · `ci_rl_tv` · `ci_sparse_hessian` |
 | **Benchmark** | built-in with timing metrics CSV and MIP montages |
 
 ---
 
 ## Overview
 
-CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible workflow that deconvolves widefield and confocal fluorescence microscopy images.  It reads OME-TIFF / OME-Zarr metadata where available, auto-generates a physically accurate PSF from the optical parameters, and applies native GPU-capable deconvolution methods. The optional `ci_rl_dl` path is experimental and refines the physics-based `ci_rl` result with a trained residual model.
+CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible workflow that deconvolves widefield and confocal fluorescence microscopy images. It reads OME-TIFF / OME-Zarr metadata where available, auto-generates a physically accurate PSF from the optical parameters, and applies native GPU-capable deconvolution methods.
 
 **Three user-facing entry points:**
 
@@ -45,14 +45,6 @@ Same SHB-RL engine with an additional **Total Variation (TV) penalty** after eac
 A quality-focused **sparse-Hessian / SPITFIRE-style** variational method.  Combines the same FFT-based forward model and preprocessing stack with a sparse-Hessian prior that favours thin, high-contrast structures while suppressing noise.  Controlled by `--sparse_hessian_weight` (0–1) and `--sparse_hessian_reg` (0–1).
 
 **Best for:** Filaments, membranes, and synapses; sparse structures that need to stand out against diffuse background.
-
-### `ci_rl_dl` — Experimental 2.5D DL Refinement
-
-`ci_rl_dl` is an experimental research pipeline that runs `ci_rl` deconvolution first, then refines the result with a trained 2.5D residual U-Net. This is not a replacement for physics-based deconvolution — treat trained models as sample- and microscope-specific refiners.
-
-For full details on the DL method, training presets, GPU training tips, API usage, and references see **[READMEDL.md](docs/READMEDL.md)**.
-
-**Best for:** Exploratory refinement of `ci_rl` output with a trained checkpoint; requires a matching trained model.
 
 ### Stabilisation and PSF options
 
@@ -93,8 +85,6 @@ These flags are understood only by `gui_deconvolve_ci.py` and are **not** part o
 | `--movie` | Reveals the **Iteration Movie** panel in Advanced Parameters for exporting per-iteration MP4 / GIF recordings. |
 | `--fitpsf` | Reveals the **Fit PSF** panel for experimental refractive-index fitting from the loaded image. |
 
-`ci_rl_dl` and its DL refinement controls are always available in the GUI. When a matching `models/defaultwidefield` or `models/defaultconfocal` folder exists, the GUI can load the default checkpoint automatically after an image is loaded and `ci_rl_dl` is selected.
-
 Example — enable movie export and Fit PSF:
 
 ```bash
@@ -131,7 +121,7 @@ Drag-and-drop uses the same loading path as the Open menu.  Large pyramidal OMER
 #### Method
 | Control | Default | Options |
 |---|---|---|
-| Method | `ci_rl` | `ci_rl`, `ci_rl_dl`, `ci_rl_tv`, `ci_sparse_hessian` |
+| Method | `ci_rl` | `ci_rl`, `ci_rl_tv`, `ci_sparse_hessian` |
 | Iterations | `80` widefield / `50` confocal | comma-separated per-channel |
 | Convergence | `auto` | `auto`, `fixed` |
 | Rel. threshold | `0.001` | 1×10⁻⁸ – 1.0 |
@@ -162,7 +152,6 @@ Drag-and-drop uses the same loading path as the Open menu.  Large pyramidal OMER
 | RI sample | `1.47` | editable spin box |
 
 #### Advanced parameters (collapsible)
-- **DL Refinement Parameters** — visible model checkpoint picker and residual strength for `ci_rl_dl`; compatible model JSON/settings can supply z-context, batch size, and mixed-precision inference settings.
 - **Method Tuning** — TV lambda, damping mode/value, sparse-Hessian weight/reg, background mode/value, offset mode/value, prefilter sigma, convergence check interval, and device (`auto`, `cuda`, `cpu`).
 - **2D Widefield Expert** — background estimator radius (`0.50 µm`) and auto background scale (`1.00`) for 2D widefield auto mode.
 - **Coverslip / Depth** — actual/design coverslip thickness, design immersion thickness, and particle depth.
@@ -222,7 +211,7 @@ Use the **Save…** menu in the top workflow bar:
 | **Save Comparison as PNG…** | Export the active comparison mode with display settings and scale bar |
 | **Save T-Series…** | Export full T-series using memory-mapped staging |
 
-For full-resolution streamed OMERO pyramid jobs, **Run Deconvolution** asks for an OME-Zarr output path and writes tiles directly to that directory.  Streamed OMERO output currently supports `ci_rl`, `ci_rl_tv`, and `ci_sparse_hessian`; `ci_rl_dl` should be run as a preview/non-streamed job.  OME-TIFF and OME-Zarr exports preserve physical pixel metadata where available; PNG exports are display/rendering snapshots for reports.
+For full-resolution streamed OMERO pyramid jobs, **Run Deconvolution** asks for an OME-Zarr output path and writes tiles directly to that directory. OME-TIFF and OME-Zarr exports preserve physical pixel metadata where available; PNG exports are display/rendering snapshots for reports.
 
 ### Settings and run history
 
@@ -322,7 +311,7 @@ python wrapper.py \
     --benchmark True --bench_crop True --compute_metrics True
 ```
 
-Runs the three classical benchmark methods (`ci_rl`, `ci_rl_tv`, and `ci_sparse_hessian`), writes `benchmark_metrics_*.csv` with per-method timing and quality metrics, and generates MIP montage comparison images. `ci_rl_dl` is not included by default because it depends on a trained checkpoint.
+Runs the three methods (`ci_rl`, `ci_rl_tv`, and `ci_sparse_hessian`), writes `benchmark_metrics_*.csv` with per-method timing and quality metrics, and generates MIP montage comparison images.
 See [metrics.md](docs/metrics.md) for metric formulas and interpretation.
 
 ### Parameters
@@ -561,9 +550,6 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 | `wrapper.py` | BIAFLOWS / BIOMERO CLI entrypoint, benchmark runner, metrics |
 | `deconvolve.py` | High-level pipeline: image loading, metadata extraction, PSF sizing, dispatch |
 | `deconvolve_ci.py` | Core PyTorch engine: SHB-RL, RLTV, sparse-Hessian, PSF generation, tiling |
-| `deconvolve_ci_dl.py` | Experimental `ci_rl_dl` wrapper and 2.5D residual U-Net inference |
-| `training/train.py` | Synthetic-data generation and training loop for `ci_rl_dl` checkpoints |
-| `gui/gui_train.py` | PyQt6 launcher for the two default-model `ci_rl_dl` training presets |
 | `descriptor.json` | BIAFLOWS / BIOMERO parameter descriptor (single source of truth) |
 | `bioflows_local.py` | Local BIAFLOWS compatibility shim |
 | `Dockerfile` | Docker build (NVIDIA CUDA 12.6 runtime + Python 3.11) |
@@ -578,7 +564,6 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 
 - **SHB Acceleration:** Wang, Y. & Miller, E. L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* **23**(12), 5284–5297.
 - **TV Regularisation:** Dey, N. et al. (2006). "Richardson-Lucy Algorithm With Total Variation Regularization for 3D Confocal Microscope Deconvolution." *Microsc. Res. Tech.* **69**(4), 260–266.
-- **DL Refinement (U-Net, Residual Learning):** see [READMEDL.md](docs/READMEDL.md#references)
 - **Content-Aware Image Restoration:** Weigert, M. et al. (2018). "Content-aware image restoration: pushing the limits of fluorescence microscopy." *Nat Methods* **15**, 1090–1097. [doi:10.1038/s41592-018-0216-7](https://doi.org/10.1038/s41592-018-0216-7)
 - **BIOMERO:** Luik, T. T., Rosas-Bertolini, R., Reits, E. A. J., Hoebe, R. A. & Krawczyk, P. M. (2024). "BIOMERO: A scalable and extensible image analysis framework." *Patterns* **5**(8), 101024. [doi:10.1016/j.patter.2024.101024](https://doi.org/10.1016/j.patter.2024.101024) · [GitHub](https://github.com/NL-BioImaging/biomero) · [Documentation](https://nl-bioimaging.github.io/biomero/)
 - **BIAFLOWS:** Rubens, U. et al. (2020). "BIAFLOWS: A Collaborative Framework to Reproducibly Deploy and Benchmark Bioimage Analysis Workflows." *Patterns* **1**(3), 100040. [doi:10.1016/j.patter.2020.100040](https://doi.org/10.1016/j.patter.2020.100040)
@@ -590,7 +575,7 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 
 ## Further Reading
 
-- [DECONVOLVE_CI.MD](docs/DECONVOLVE_CI.MD) — full algorithmic documentation: SHB momentum derivation, experimental `ci_rl_dl` refinement, TV and sparse-Hessian formulations, PSF model details, tiling strategy, and convergence criteria.
+- [DECONVOLVE_CI.MD](docs/DECONVOLVE_CI.MD) — full algorithmic documentation: SHB momentum derivation, TV and sparse-Hessian formulations, PSF model details, tiling strategy, and convergence criteria.
 - [metrics.md](docs/metrics.md) — benchmark metric formulas and interpretation: timing CSV columns, FFT detail energy, edge strength, signal sparsity, and robust range.
 
 ---

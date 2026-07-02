@@ -5,11 +5,9 @@
 `deconvolve_ci.py` is the PyTorch-based deconvolution and PSF-generation engine
 used by CIDeconvolve. It supports both the Richardson-Lucy family of methods
 and sparse-Hessian variational deconvolution, in a single GPU-friendly module
-with CPU fallback. `deconvolve_ci_dl.py` adds the first experimental deep-learning
-refinement path on top of the existing `ci_rl` solver without changing the
-classical implementation.
+with CPU fallback.
 
-**Methods**: `ci_rl` (accelerated RL), `ci_rl_dl` (accelerated RL plus experimental 2.5D residual U-Net refinement), `ci_rl_tv` (accelerated RL with Total Variation), and `ci_sparse_hessian` (sparse-Hessian variational deconvolution)
+**Methods**: `ci_rl` (accelerated RL), `ci_rl_tv` (accelerated RL with Total Variation), and `ci_sparse_hessian` (sparse-Hessian variational deconvolution)
 
 ---
 
@@ -67,117 +65,6 @@ Applied multiplicatively to the post-RL update in the current implementation.
 **Spacing awareness**: for anisotropic 3D data the Z derivative terms are scaled by
 `pixel_size_xy / pixel_size_z`, so TV no longer treats coarse axial sampling as if it
 were equal to the lateral spacing.
-
-### `ci_rl_dl` — Experimental 2.5D Residual U-Net Refinement
-
-`ci_rl_dl` is a conservative two-stage pipeline:
-
-```
-raw image -> existing ci_rl -> 2.5D residual U-Net -> clamp(result >= 0)
-```
-
-It is implemented in `deconvolve_ci_dl.py` as a wrapper around
-`ci_rl_deconvolve`. The classical RL output remains the baseline; the network
-only predicts a residual correction for each central Z plane. If no model
-checkpoint is supplied, `ci_rl_dl` returns the normal `ci_rl` result unchanged.
-
-**Input convention**:
-- Single-channel 2D: `Y, X`
-- Single-channel 3D: `Z, Y, X`
-- Multichannel API: `C, Z, Y, X`
-- The GUI and high-level deconvolution API still process channels independently, matching the
-  existing PSF-per-channel workflow.
-
-**2.5D input channels**:
-- neighbouring raw planes
-- neighbouring `ci_rl` planes
-- one optional central residual channel
-- optional scalar conditioning planes for V2 checkpoints
-
-For the default `z_context=2`, this is 5 raw planes + 5 deconvolved planes +
-1 residual channel = 11 image-derived input channels. V2 checkpoints can append
-constant 2D conditioning planes for the requested/used RL iteration count, PSF
-sigma summaries, pixel spacing, NA, emission wavelength, and microscope type
-where relevant.
-
-Two checkpoint families are supported:
-- `ResidualUNet25D` is the original legacy model. It predicts one residual map.
-- `GatedResidualUNet25D` is the default for new training. It predicts a residual
-  proposal and a gate in `[0, 1]`, then bounds the applied correction relative
-  to the local `ci_rl` signal.
-
-The residual head supports a fixed `residual_scale` multiplier. Training and
-inference use `1.0` by default. Lower values, for example `0.25`, make the
-learned correction more conservative:
-
-```text
-x_final = clamp(x_ci_rl + residual_scale * gate * bounded_residual, min=0)
-```
-
-**Training source**: `training/train.py` creates synthetic microscopy-like volumes,
-convolves them with CIDeconvolve PSFs, adds Poisson shot noise, Gaussian read
-noise, background, hot pixels, and optional clipping, then runs the existing
-`ci_rl` solver to form the network input. Synthetic volumes are split by whole
-volume before patch extraction, so validation and test patches are not sampled
-from training volumes.
-
-V2 training can randomize the RL preprocessing strength per synthetic volume
-with `--rl-iteration-pool`. The strong-restoration presets bias this toward
-already-good physics results, for example `50,80,100` with
-`--rl-iteration-weights 0.35,0.40,0.25`. Each sample stores
-`rl_requested_iterations`, `rl_iterations_used`, the pool, and optional weights
-in metadata.
-The run caches `ci_rl` outputs by iteration count (`ci_rl_iter_XXX.tif`), so
-changing the pool only computes missing deconvolutions for already generated
-raw/GT volumes.
-
-V2 training can also create a deliberate PSF mismatch. The `forward_psf` blurs
-the ground truth into raw synthetic data, while the `deconv_psf` is used by RL
-preprocessing and optional reconvolution consistency. `--psf-mismatch none`
-uses the same PSF, `mild` applies optical perturbations, and `moderate`
-applies stronger perturbations. Strong artifact training also adds lightweight
-coma/astigmatism-like PSF asymmetry to the forward PSF, while the deconvolution
-PSF remains generated from the perturbed optical parameters. Both PSFs, both
-parameter dictionaries, and the aberration summary are saved with each sample.
-
-`--synthetic-artifact-level strong` targets real post-RL failure modes rather
-than only clean synthetic blur. It adds harder camera/background artifacts:
-lower/wider photon-count ranges, uneven illumination, haze/background offsets,
-row/column banding, read-noise outliers, stronger hot pixels, mild clipping,
-and PSF mismatch likely to produce residual ringing or halo errors.
-
-Strong training can add an intensity-retention loss. This loss is computed in
-foreground-like regions and penalizes the refined plane when its summed signal
-falls below or rises above configured ratios relative to `ci_rl`. It is meant
-to prevent the stronger model from solving synthetic background mismatch by
-darkening real biological structures too aggressively.
-
-`--super-sample-xy 2` enables the first experimental high-resolution training
-path. The requested `volume_shape` is treated as the camera grid. Clean GT,
-forward PSF, deconvolution PSF, `ci_rl`, and DL targets are generated on a 2x
-finer XY grid. Image formation still happens correctly at the camera level:
-the high-resolution blurred image is averaged down to the camera grid, Poisson
-noise, offset, read noise, and artifacts are added there, and that noisy camera
-raw image is upsampled before high-resolution `ci_rl` preprocessing. The
-original camera raw is saved as `raw_observed.tif`; `raw.tif` is the
-upsampled training/deconvolution input.
-
-Validation is morphology-aware. Synthetic samples carry a bucket label such as
-`generic`, `dna`, `mitotic`, `membrane`, `actin`, `dendrite`, or `puncta`.
-Training logs include per-bucket validation losses and the examples folder can
-contain per-bucket montages. The evaluator can group synthetic metrics by
-morphology, microscope type, RL iteration count, and PSF mismatch mode.
-
-**Optional reconvolution consistency**: the training loop can add a small
-physics consistency term. It reconvolves the refined prediction with a PSF
-approximation and penalizes disagreement with the raw observation. This is off
-by default because it adds compute and should be tuned per training setup, but
-it helps discourage residual corrections that do not explain the measured data.
-
-**Important limitation**: `ci_rl_dl` is experimental. It is intended as a
-sample- and microscope-specific refinement layer, not as a replacement for
-physics-based deconvolution. Quantitative microscopy use requires validation
-against appropriate controls.
 
 ### `ci_sparse_hessian` — Sparse-Hessian Variational Deconvolution
 
@@ -459,7 +346,7 @@ Uses Simpson's rule quadrature with a configurable number of pupil samples
 | Acceleration | SHB momentum | Proven convergence guarantees ([Wang 2014](#ref3)), no extra FFTs per iteration, 5-10× speedup |
 | Boundary handling | Bertero weights | Mathematically rigorous, superior to reflection/zero padding |
 | Convergence metric | I-divergence | Natural for Poisson noise model underlying RL |
-| Regularization | TV, sparse-Hessian, optional residual DL | TV for RL-family denoising; sparse-Hessian for quality-focused variational restoration; `ci_rl_dl` is an optional learned residual after physics-based RL |
+| Regularization | TV, sparse-Hessian | TV for RL-family denoising; sparse-Hessian for quality-focused variational restoration |
 | PSF model | Vectorial + Scalar | Auto-select based on NA; vectorial essential for high-NA (immersion) objectives |
 | PSF Aberration | Gibson-Lanni | Accounts for real-world RI mismatches; critical for accurate PSF at depth |
 | Pixel integration | Sub-pixel grid | Measurable accuracy gain, optional for speed |
@@ -508,44 +395,6 @@ historical center-slice-only 2D PSF approximation.
 - `"result"` — deconvolved image as numpy ndarray (same shape as input)
 - `"convergence"` — list of I-divergence values at check points
 - `"iterations_used"` — actual number of iterations performed
-
-### `deconvolve_ci_rl_dl(image, psf, model_path=None, **kwargs) → ndarray or dict`
-
-Runs `ci_rl_deconvolve` first, then optionally applies the trained 2.5D residual
-U-Net from `deconvolve_ci_dl.py`.
-
-**Main parameters**:
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `image` | ndarray | required | Input image, either `Y,X`, `Z,Y,X`, or multichannel `C,Z,Y,X` |
-| `psf` | ndarray/list | required | PSF for all channels, a `C,...` PSF stack, or one PSF reused for every channel |
-| `model_path` | str/Path/None | None | Trained `best_model.pt` checkpoint; when None, returns normal `ci_rl` unchanged |
-| `device` | str | "auto" | `"auto"`, `"cuda"`, or `"cpu"` |
-| `rl_kwargs` | dict/None | None | Passed through to `ci_rl_deconvolve` |
-| `dl_kwargs` | dict/None | None | DL options such as `z_radius`, `batch_size`, `mixed_precision`, and `residual_scale` |
-| `return_diagnostics` | bool | False | Return raw, `ci_rl`, refined output, residual, reconvolution prediction, and diagnostics |
-
-The high-level `deconvolve(..., method="ci_rl_dl")` API and
-`gui_deconvolve_ci.py` expose the same method through:
-- `dl_model_path`
-- `dl_z_context`
-- `dl_batch_size`
-- `dl_mixed_precision`
-- `dl_residual_strength`
-
-In the interactive GUI, `ci_rl_dl` is always present in the Method selector.
-The GUI can auto-load matching default checkpoints from `models/defaultwidefield`
-or `models/defaultconfocal` when image metadata identifies the microscope type.
-
-`gui/gui_train.py` now exposes only the two default-model recipes:
-`Large widefield standard long` and `Large confocal standard long`. They match
-the bundled `models/defaultwidefield` and `models/defaultconfocal` checkpoints.
-Both use standard artifact severity, high-RL weighted sampling (`50,80,100`),
-mild PSF mismatch with 20% moderate cases, XY supersampling, tighter
-foreground/global intensity losses, background-offset loss, and training-time
-XY padding. New checkpoints write a JSON sidecar containing `model_type`,
-conditioning channel names, residual-bound settings, training config, and
-recommended inference settings.
 
 ### `ci_sparse_hessian_deconvolve(image, psf, **kwargs) → dict`
 
@@ -712,16 +561,4 @@ deconvolve_ci.py
 │
 └── _to_tensor() / _to_numpy()     — device transfer helpers
 
-deconvolve_ci_dl.py
-├── deconvolve_ci_rl_dl()          — ci_rl wrapper + optional DL refinement
-├── apply_dl_refinement_25d()      — slice-wise residual inference
-├── ResidualUNet25D               — compact 2.5D residual U-Net
-├── GatedResidualUNet25D           — bounded residual proposal + gate model
-└── reconvolve_same()              — PSF consistency diagnostic helper
-
-training/train.py
-├── generate_synthetic_gt()        — synthetic microscopy-like GT volumes
-├── generate_training_data()       — GT -> PSF mismatch/noise -> cached ci_rl data
-├── SyntheticVolumeDataset         — random 2.5D patches split by volume
-└── train()                        — checkpoint/log/figure training loop
 ```

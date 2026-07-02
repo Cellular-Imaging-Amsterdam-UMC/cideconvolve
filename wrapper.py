@@ -1336,9 +1336,6 @@ def _run_streaming_regular_image(
     hcs_field=None,
 ) -> Path:
     """Stream a regular image to OME-Zarr, reading only halo-extended tiles."""
-    if method == "ci_rl_dl":
-        raise ValueError("Streaming ci_rl_dl is not enabled yet; use ci_rl/ci_rl_tv or eager ci_rl_dl.")
-
     source = open_region_source(img_path, scene=scene, hcs_field=hcs_field)
     source.metadata = _apply_cli_metadata_to_source(
         source.metadata,
@@ -1506,7 +1503,7 @@ def main(argv):
         if not niter_list:
             niter_list = [40]
         method = str(getattr(parameters, "method", "ci_rl") or "ci_rl").strip()
-        if method not in ("ci_rl", "ci_rl_tv", "ci_sparse_hessian", "ci_rl_dl"):
+        if method not in ("ci_rl", "ci_rl_tv", "ci_sparse_hessian"):
             method = "ci_rl"
         device_param = getattr(parameters, "device", "auto")
         device = None if device_param in (None, "auto") else device_param

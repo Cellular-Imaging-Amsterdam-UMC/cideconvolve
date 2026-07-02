@@ -5,7 +5,6 @@
 # Produces:  dist/cideconvolve/cideconvolve.exe  (folder distribution)
 #            Run cideconvolve.exe from inside dist/cideconvolve/ — it needs
 #            the _internal/ sibling folder next to it.
-#            Default DL models are copied to dist/cideconvolve/models/.
 #            For release: zip the dist/cideconvolve/ folder itself.
 #
 # Why use this instead of cideconvolve.spec?
@@ -18,26 +17,11 @@
 
 import os
 import pkgutil
-import shutil
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 _SPEC_DIR = os.path.abspath(SPECPATH)
 _ROOT = os.path.abspath(os.path.join(_SPEC_DIR, os.pardir))
-
-
-def _collect_model_datas():
-    """Return PyInstaller (source, destination) tuples for bundled DL models."""
-    model_root = os.path.join(_ROOT, 'models')
-    if not os.path.isdir(model_root):
-        return []
-    datas = []
-    for dirpath, _, filenames in os.walk(model_root):
-        rel_dir = os.path.relpath(dirpath, model_root)
-        target_dir = 'models' if rel_dir == '.' else os.path.join('models', rel_dir)
-        for filename in filenames:
-            datas.append((os.path.join(dirpath, filename), target_dir))
-    return datas
 
 # ── Collect full PyQt6 ecosystem ──────────────────────────────────────────────
 pyqt6_datas, pyqt6_binaries, pyqt6_hiddenimports = collect_all('PyQt6')
@@ -149,13 +133,11 @@ a = Analysis(
       + bioio_datas + bioio_b_datas
       + bioio_ot_datas + bioio_oz_datas
       + bioio_cz_datas + bioio_nd_datas
-      + omezarr_datas
-      + _collect_model_datas(),  # default ci_rl_dl models
+      + omezarr_datas,
     hiddenimports=[
         # ── local modules ───────────────────────────────────────────────────
         'ci_dual_viewer',
         'core.deconvolve_ci',
-        'core.deconvolve_ci_dl',
         'core.deconvolve',
         'core.streaming',
         'core._meta_helpers',
@@ -332,16 +314,3 @@ _stale = _os.path.join(DISTPATH, 'cideconvolve.exe')
 if _os.path.isfile(_stale):
     _os.remove(_stale)
     print(f'Removed stale bootloader: {_stale}')
-
-# ── Post-build: keep default ci_rl_dl models as a visible folder next to
-#    dist/cideconvolve/cideconvolve.exe so they can be inspected or replaced
-#    without rebuilding the executable.
-_dist_models = _os.path.join(DISTPATH, 'cideconvolve', 'models')
-_src_models = _os.path.join(_ROOT, 'models')
-if _os.path.isdir(_src_models):
-    if _os.path.isdir(_dist_models):
-        shutil.rmtree(_dist_models)
-    shutil.copytree(_src_models, _dist_models)
-    print(f'Copied default DL models: {_dist_models}')
-else:
-    print(f'Skipped default DL models: {_src_models} not found')

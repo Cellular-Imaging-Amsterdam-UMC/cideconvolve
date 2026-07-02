@@ -2822,7 +2822,7 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                     <ol>
                     <li>Open an image, Zarr folder, microscope browser source, or OMERO image from the Open menu.</li>
                     <li>Check highlighted metadata fields. Green fields are loaded or confident; red fields need attention.</li>
-                    <li>Choose a method. Start with <code>ci_rl</code>, or <code>ci_rl_dl</code> when a matching DL model is available.</li>
+                    <li>Choose a method. Start with <code>ci_rl</code>, then use TV or sparse-Hessian when you explicitly want regularization.</li>
                     <li>Inspect Original and Deconvolved views with channels, projection, scale bar, navigator, and linked zoom.</li>
                     <li>Save deconvolved data as OME-TIFF or OME-Zarr, or save the current visual view as PNG.</li>
                     </ol>
@@ -2865,14 +2865,13 @@ _HELP_TOPICS: list[dict[str, Any]] = [
             {
                 "id": "documentation-links",
                 "title": "Documentation Links",
-                "keywords": ["github", "documentation", "readme", "manual", "metrics", "training", "dl"],
+                "keywords": ["github", "documentation", "readme", "manual", "metrics"],
                 "html": f"""
                     <h2>Documentation Links</h2>
-                    <p>The in-app help is a quick reference. The GitHub documentation has deeper algorithm and training detail.</p>
+                    <p>The in-app help is a quick reference. The GitHub documentation has deeper algorithm detail.</p>
                     <ul>
                     <li><a href="{GITHUB_DOCS_BASE_URL}/README.md">README</a> - installation, GUI overview, command-line examples, and parameter tables.</li>
                     <li><a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">Algorithm documentation</a> - RL, TV, sparse-Hessian, PSF model, tiling, convergence, and implementation notes.</li>
-                    <li><a href="{GITHUB_DOCS_BASE_URL}/docs/READMEDL.md">DL refinement documentation</a> - training and use of <code>ci_rl_dl</code> residual models.</li>
                     <li><a href="{GITHUB_DOCS_BASE_URL}/docs/metrics.md">Metrics documentation</a> - image quality and evaluation metric definitions.</li>
                     </ul>
                 """,
@@ -2962,24 +2961,7 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                     <li><b>Watch for:</b> noise amplification at high iteration counts, edge artifacts with very small tiles, and wrong Z behavior when pixel Z or RI metadata is off.</li>
                     <li><b>Typical tuning:</b> adjust iterations and convergence first, then background/offset/damping only if the log or preview shows a clear problem.</li>
                     </ul>
-                    <p>Use it for a conservative, explainable result or when no matching DL refinement model is available. More detail: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a>.</p>
-                """,
-            },
-            {
-                "id": "method-ci-rl-dl",
-                "title": "ci_rl_dl",
-                "keywords": ["ci_rl_dl", "dl", "model", "residual", "widefield", "confocal"],
-                "html": f"""
-                    <h2><code>ci_rl_dl</code></h2>
-                    <p>Runs CI-RL and then applies a trained DL residual refinement. The DL model path, model JSON, and residual strength are high-impact settings.</p>
-                    <ul>
-                    <li>Use a model trained for the same microscope class: widefield, confocal, or mixed.</li>
-                    <li>Keep residual strength modest when preserving background and total intensity is critical.</li>
-                    <li>The GUI can auto-load default widefield/confocal models when the method and image metadata match.</li>
-                    <li>Prefer <code>best_model.pt</code> plus its model JSON so inference settings match the trained checkpoint.</li>
-                    <li>If the DL output shifts the background or total sum, lower residual strength before changing optical metadata.</li>
-                    </ul>
-                    <p>Training and model details: <a href="{GITHUB_DOCS_BASE_URL}/docs/READMEDL.md">DL refinement documentation</a>.</p>
+                    <p>Use it for a conservative, explainable result. More detail: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a>.</p>
                 """,
             },
             {
@@ -2992,7 +2974,7 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                     <ul>
                     <li><b>TV</b> can reduce noise but may flatten fine texture when too strong.</li>
                     <li><b>Sparse Hessian</b> can sharpen curvilinear or punctate structure, but aggressive settings may create artificial-looking detail.</li>
-                    <li>Use these methods when plain RL is plausible but the sample needs explicit regularization rather than learned refinement.</li>
+                    <li>Use these methods when plain RL is plausible but the sample needs explicit regularization.</li>
                     <li>Keep a matched <code>ci_rl</code> run as a reference so you can see what the regularizer changed.</li>
                     </ul>
                     <p>Mathematical background: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a>.</p>
@@ -3011,7 +2993,7 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                     <h2>Essential Parameters</h2>
                     <p>These settings define the physical model and the stopping behavior. If the result looks wrong, check these before reaching for advanced tuning.</p>
                     <ul>
-                    <li><b>Method</b> chooses the solver. Use <code>ci_rl</code> as the reference run; use <code>ci_rl_dl</code> only with a matching trained model; use TV or sparse-Hessian when you explicitly want regularization.</li>
+                    <li><b>Method</b> chooses the solver. Use <code>ci_rl</code> as the reference run; use TV or sparse-Hessian when you explicitly want regularization.</li>
                     <li><b>Iterations</b> is the maximum number of RL or optimization updates. Low values may leave blur; high values can amplify noise, ringing, or small PSF errors. Comma-separated values allow per-channel tuning.</li>
                     <li><b>Convergence</b> set to <code>auto</code> stops when relative improvement is small. <code>fixed</code> is useful for controlled comparisons because every channel runs the requested count.</li>
                     <li><b>Relative threshold</b> is the early-stop sensitivity. Smaller thresholds run longer; larger thresholds stop sooner. If a run stops too early, lower this value before simply raising iterations.</li>
@@ -3042,12 +3024,9 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                     <li><b>TV lambda</b> controls Total Variation strength for <code>ci_rl_tv</code>. Increase gradually; too much TV gives flat, piecewise-smooth images.</li>
                     <li><b>Sparse Hessian weight</b> balances Hessian smoothing versus sparsity in <code>ci_sparse_hessian</code>. Higher values emphasize the Hessian prior; lower values allow more sparse-detail behavior.</li>
                     <li><b>Sparse Hessian reg</b> controls the data-vs-regularizer balance. Higher values stay closer to the observed image; lower values let the regularizer dominate more.</li>
-                    <li><b>DL model path / JSON</b> must match the trained model. When a model JSON supplies inference parameters, the GUI hides or locks fields that should not be edited manually.</li>
-                    <li><b>DL residual strength</b> blends learned correction on top of CI-RL. Values below 1.0 are often better when preserving total energy and avoiding background offsets is more important than maximum visual refinement.</li>
-                    <li><b>DL tiling, z-context, batch size, and mixed precision</b> affect inference speed, VRAM use, and border behavior. Prefer model defaults unless you are diagnosing memory limits or tile artifacts.</li>
                     <li><b>2D WF expert background radius/scale</b> controls local background estimation for 2D widefield auto mode. Larger radius follows slower background trends; higher scale subtracts more haze.</li>
                     </ul>
-                    <p>If a parameter is defined by the model JSON and locked in the GUI, treat it as part of the trained model contract. More detail: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a> and <a href="{GITHUB_DOCS_BASE_URL}/docs/READMEDL.md">DL documentation</a>.</p>
+                    <p>More detail: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a>.</p>
                 """,
             },
             {
@@ -4538,7 +4517,7 @@ class _IterationMovieRecorder:
             self.initial_planes[ch_idx] = initial_plane.astype(np.float32, copy=False)
             self.initial_levels[ch_idx] = self._levels_for(ch_idx, self.initial_planes[ch_idx], "original", initial)
             niter = niter_list[ch_idx] if ch_idx < len(niter_list) else niter_list[-1]
-            staged_frames = max(int(niter), 1) + (1 if self.method == "ci_rl_dl" else 0)
+            staged_frames = max(int(niter), 1)
             stage_path = Path(self.temp_dir) / f"channel_{ch_idx:03d}.dat"
             self.memmaps[ch_idx] = np.memmap(
                 stage_path,
@@ -4996,7 +4975,6 @@ def _deconvolve_channel_stacks(
             ci_rl_deconvolve,
             ci_sparse_hessian_deconvolve,
         )
-        from core.deconvolve_ci_dl import deconvolve_ci_rl_dl
     except OSError as exc:
         raise RuntimeError(
             f"Failed to load deconvolve_ci (torch DLL error).\n\n"
@@ -5069,7 +5047,7 @@ def _deconvolve_channel_stacks(
             use_2d_wf_auto = (
                 ch_data.ndim == 2
                 and params["microscope_type"] == "widefield"
-                and params["method"] in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
+                and params["method"] in ("ci_rl", "ci_rl_tv")
                 and params["two_d_mode"] == "auto"
             )
 
@@ -5138,22 +5116,6 @@ def _deconvolve_channel_stacks(
                 start = (psf.shape[0] - ch_data.shape[0]) // 2
                 psf = psf[start:start + ch_data.shape[0]]
 
-            psf_xy_est = max(psf.shape[-1], psf.shape[-2]) if psf.ndim >= 2 else 65
-            auto_tile_count = _auto_n_tiles(
-                ch_data.shape,
-                device=params.get("device"),
-                psf_xy_est=psf_xy_est,
-            )
-            if (
-                params["method"] == "ci_rl_dl"
-                and params.get("dl_model_path")
-                and auto_tile_count > 1
-            ):
-                _progress(
-                    f"  Ch{ci}: large ci_rl_dl input will run RL+DL per tile "
-                    f"(RL estimate {auto_tile_count} tiles; DL may choose smaller tiles)."
-                )
-
             gc.collect()
             try:
                 import torch as _torch
@@ -5209,53 +5171,6 @@ def _deconvolve_channel_stacks(
                     sparse_hessian_reg=params["sparse_hessian_reg"],
                     **common,
                 )
-            elif params["method"] == "ci_rl_dl":
-                compute_reconvolution_diagnostics = bool(
-                    params.get("dl_model_path")
-                    and (movie_recorder is not None or _live_cb is not None)
-                    and auto_tile_count <= 1
-                )
-                out = deconvolve_ci_rl_dl(
-                    ch_data,
-                    psf,
-                    model_path=params.get("dl_model_path") or None,
-                    device=params["device"],
-                    rl_kwargs={
-                        **common,
-                        "tv_lambda": 0.0,
-                        "damping": params["damping"],
-                        "microscope_type": params["microscope_type"],
-                        "two_d_mode": params["two_d_mode"],
-                        "two_d_wf_aggressiveness": params["two_d_wf_aggressiveness"],
-                        "two_d_wf_bg_radius_um": params["two_d_wf_bg_radius_um"],
-                        "two_d_wf_bg_scale": params["two_d_wf_bg_scale"],
-                    },
-                    dl_kwargs={
-                        "z_radius": params["dl_z_context"],
-                        "batch_size": params["dl_batch_size"],
-                        "mixed_precision": params["dl_mixed_precision"],
-                        "residual_strength": params["dl_residual_strength"],
-                        "compute_reconvolution_diagnostics": compute_reconvolution_diagnostics,
-                    },
-                    return_diagnostics=True,
-                )
-                if (movie_recorder is not None or _live_cb is not None) and params.get("dl_model_path"):
-                    dl_frame_idx = int(niter) + 1
-                    movie_payload: dict[str, Any] = {
-                        "channel_index": int(ci),
-                        "iteration": dl_frame_idx,
-                        "total_iterations": dl_frame_idx,
-                        "image": out["result"],
-                        "stage_label": "DL refinement",
-                        "is_final": True,
-                    }
-                    if out.get("reconvolved_prediction") is not None:
-                        movie_payload["estimated"] = out["reconvolved_prediction"]
-                        movie_payload["background"] = 0.0
-                    if movie_recorder is not None:
-                        movie_recorder.capture(movie_payload)
-                    if _live_cb is not None:
-                        _live_cb(movie_payload)
             else:
                 out = ci_rl_deconvolve(
                     ch_data,
@@ -5487,7 +5402,7 @@ class _DeconvolveWorker(QThread):
             )
             if self.params["method"] == "ci_rl_tv":
                 self.progress.emit(f"  TV lambda   : {self.params['tv_lambda']}")
-            if self.params["method"] in ("ci_rl", "ci_rl_tv", "ci_rl_dl"):
+            if self.params["method"] in ("ci_rl", "ci_rl_tv"):
                 self.progress.emit(f"  Damping     : {self.params['damping']}")
                 if self.params["microscope_type"] == "confocal":
                     self.progress.emit(
@@ -5498,16 +5413,6 @@ class _DeconvolveWorker(QThread):
                     f"(aggr={self.params['two_d_wf_aggressiveness']}, "
                     f"bg radius={self.params['two_d_wf_bg_radius_um']} um, "
                     f"bg scale={self.params['two_d_wf_bg_scale']})"
-                )
-            if self.params["method"] == "ci_rl_dl":
-                self.progress.emit(
-                    f"  DL model    : {self.params.get('dl_model_path') or '(none; ci_rl unchanged)'}"
-                )
-                self.progress.emit(
-                    f"  DL params   : z-context={self.params['dl_z_context']}, "
-                    f"batch={self.params['dl_batch_size']}, "
-                    f"mixed_precision={self.params['dl_mixed_precision']}, "
-                    f"residual_strength={self.params['dl_residual_strength']}"
                 )
             if self.params["method"] == "ci_sparse_hessian":
                 self.progress.emit(
@@ -5911,9 +5816,6 @@ class _StreamingOmeroWorker(QThread):
     def run(self):
         monitor = None
         try:
-            if self.params.get("method") == "ci_rl_dl":
-                raise RuntimeError("Streaming ci_rl_dl is not enabled yet. Choose ci_rl, ci_rl_tv, or ci_sparse_hessian.")
-
             from core.streaming import (
                 ZarrPyramidSink,
                 deconvolve_streaming,
@@ -6396,9 +6298,6 @@ def _run_streaming_deconvolution_job(
     progress: Optional[Callable[[dict], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> dict:
-    if params.get("method") == "ci_rl_dl":
-        raise RuntimeError("Batch streaming does not support ci_rl_dl yet. Choose ci_rl, ci_rl_tv, or ci_sparse_hessian.")
-
     from core.streaming import (
         ProjectionPyramidSink,
         TiledOmeTiffSink,
@@ -7788,7 +7687,7 @@ class DeconvolveCIWindow(QMainWindow):
         method_group.setLayout(ml)
 
         self._method_combo = NoWheelComboBox()
-        self._method_combo.addItems(["ci_rl", "ci_rl_dl", "ci_rl_tv", "ci_sparse_hessian"])
+        self._method_combo.addItems(["ci_rl", "ci_rl_tv", "ci_sparse_hessian"])
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
 
@@ -7850,46 +7749,6 @@ class DeconvolveCIWindow(QMainWindow):
 
         advanced_section = CollapsibleSection("Advanced Parameters", expanded=False)
         advanced_layout = advanced_section.content_layout()
-
-        # --- DL Refinement parameters ---
-        self._dl_group = QGroupBox("DL Refinement Parameters")
-        dl_group_layout = QFormLayout()
-        self._dl_group.setLayout(dl_group_layout)
-
-        dl_model_widget = QWidget()
-        self._dl_model_widget = dl_model_widget
-        dl_model_row = QHBoxLayout(dl_model_widget)
-        dl_model_row.setContentsMargins(0, 0, 0, 0)
-        self._le_dl_model = QLineEdit("")
-        self._le_dl_model.setPlaceholderText("optional best_model.pt")
-        self._btn_dl_model = QPushButton("Browse")
-        self._btn_dl_model.clicked.connect(self._on_browse_dl_model)
-        dl_model_row.addWidget(self._le_dl_model)
-        dl_model_row.addWidget(self._btn_dl_model)
-        dl_group_layout.addRow("DL model:", dl_model_widget)
-
-        self._sp_dl_z_context = NoWheelSpinBox()
-        self._sp_dl_z_context.setRange(0, 8)
-        self._sp_dl_z_context.setValue(2)
-
-        self._sp_dl_batch_size = NoWheelSpinBox()
-        self._sp_dl_batch_size.setRange(1, 128)
-        self._sp_dl_batch_size.setValue(8)
-
-        self._cb_dl_mixed_precision = QCheckBox()
-        self._cb_dl_mixed_precision.setChecked(True)
-
-        self._sp_dl_residual_strength = NoWheelDoubleSpinBox()
-        self._sp_dl_residual_strength.setRange(0.0, 2.0)
-        self._sp_dl_residual_strength.setDecimals(2)
-        self._sp_dl_residual_strength.setSingleStep(0.05)
-        self._sp_dl_residual_strength.setValue(1.0)
-        self._sp_dl_residual_strength.setToolTip(
-            "Inference-only multiplier for the learned residual. Use 0.25-0.5 when the DL refinement is too aggressive."
-        )
-        dl_group_layout.addRow("DL residual strength:", self._sp_dl_residual_strength)
-
-        advanced_layout.addWidget(self._dl_group)
 
         # --- Method tuning ---
         method_adv_group = QGroupBox("Method Tuning")
@@ -8294,7 +8153,6 @@ class DeconvolveCIWindow(QMainWindow):
             ml,
             self._method_combo,
             "Choose the deconvolution algorithm. `ci_rl` is the standard Richardson-Lucy "
-            "workflow, `ci_rl_dl` adds an experimental trained 2.5D residual refinement, "
             "`ci_rl_tv` adds edge-preserving TV regularization, and "
             "`ci_sparse_hessian` favors sparse filament-like structure with a different prior.",
         )
@@ -9479,7 +9337,7 @@ class DeconvolveCIWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _on_method_changed(self, text: str):
-        is_rl_family = text in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
+        is_rl_family = text in ("ci_rl", "ci_rl_tv")
         is_tv = text == "ci_rl_tv"
         is_sparse = text == "ci_sparse_hessian"
         self._sp_tv_lambda.setEnabled(is_tv)
@@ -9521,7 +9379,6 @@ class DeconvolveCIWindow(QMainWindow):
 
         self._on_damping_changed(self._damping_combo.currentText())
         self._refresh_two_d_wf_expert_state()
-        self._maybe_load_default_ci_rl_dl_model()
 
     def _on_bg_changed(self, text: str):
         self._sp_bg_value.setEnabled(text == "manual")
@@ -9530,7 +9387,7 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_offset.setEnabled(text == "manual")
 
     def _on_damping_changed(self, text: str):
-        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
+        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv")
         self._sp_damping.setEnabled(rl_family and text == "manual")
 
     def _on_conv_changed(self, text: str):
@@ -9580,11 +9437,10 @@ class DeconvolveCIWindow(QMainWindow):
             self._le_niter.setText("80")
         self._refresh_confocal_only_metadata_styles()
         self._refresh_two_d_wf_expert_state()
-        self._maybe_load_default_ci_rl_dl_model()
         self._update_sampling_warnings()
 
     def _refresh_two_d_wf_expert_state(self, _text: str = ""):
-        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv", "ci_rl_dl")
+        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv")
         widefield = self._micro_combo.currentText() == "widefield"
         auto_mode = self._two_d_mode_combo.currentText() == "Auto"
         try:
@@ -9606,89 +9462,6 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _on_proj_changed(self, text: str):
         del text
-
-    def _on_browse_dl_model(self):
-        start_dir = str(Path(self._le_dl_model.text()).parent) if self._le_dl_model.text().strip() else str(Path.cwd())
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open ci_rl_dl Model",
-            start_dir,
-            "PyTorch checkpoints (*.pt *.pth);;All Files (*)",
-        )
-        if path:
-            self._le_dl_model.setText(path)
-            self._apply_dl_model_metadata(Path(path))
-
-    def _default_ci_rl_dl_model_path(self) -> Optional[Path]:
-        if self._method_combo.currentText() != "ci_rl_dl":
-            return None
-        if not self._metadata:
-            return None
-        microscope = str(self._micro_combo.currentText() or self._metadata.get("microscope_type") or "").strip().lower()
-        if microscope not in {"confocal", "widefield"}:
-            return None
-        model_name = "defaultconfocal" if microscope == "confocal" else "defaultwidefield"
-        for root in _resource_roots():
-            model_dir = root / "models" / model_name
-            model_path = model_dir / "best_model.pt"
-            meta_path = model_dir / "best_model.json"
-            if model_dir.is_dir() and model_path.exists() and meta_path.exists():
-                return model_path
-        return None
-
-    def _maybe_load_default_ci_rl_dl_model(self) -> None:
-        model_path = self._default_ci_rl_dl_model_path()
-        if model_path is None:
-            return
-        current = self._le_dl_model.text().strip()
-        if current and Path(current) == model_path:
-            return
-        self._le_dl_model.setText(str(model_path))
-        self._apply_dl_model_metadata(model_path)
-        self._status.showMessage(f"Default ci_rl_dl model loaded: {model_path.parent.name}", 4000)
-
-    def _apply_dl_model_metadata(self, model_path: Path):
-        meta_path = model_path.with_suffix(".json")
-        if not meta_path.exists():
-            self._log(f"No ci_rl_dl metadata JSON found next to model: {meta_path.name}")
-            return
-        try:
-            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            self._log(f"Could not read ci_rl_dl metadata JSON: {exc}")
-            return
-
-        recommended = metadata.get("recommended_inference") or {}
-        rl_kwargs = recommended.get("rl_kwargs") or {}
-        dl_kwargs = recommended.get("dl_kwargs") or {}
-
-        niter = recommended.get("iterations", rl_kwargs.get("niter"))
-        if niter is not None:
-            self._le_niter.setText(str(int(niter)))
-        z_context = recommended.get("dl_z_context", dl_kwargs.get("z_radius"))
-        if z_context is not None:
-            self._sp_dl_z_context.setValue(int(z_context))
-        batch_size = recommended.get("dl_batch_size", dl_kwargs.get("batch_size"))
-        if batch_size is not None:
-            self._sp_dl_batch_size.setValue(int(batch_size))
-        mixed_precision = recommended.get("dl_mixed_precision", dl_kwargs.get("mixed_precision"))
-        if mixed_precision is not None:
-            self._cb_dl_mixed_precision.setChecked(bool(mixed_precision))
-        start = rl_kwargs.get("start")
-        if start:
-            self._start_combo.setCurrentText(str(start))
-        convergence = rl_kwargs.get("convergence")
-        if convergence:
-            self._conv_combo.setCurrentText(str(convergence))
-        if rl_kwargs.get("two_d_mode") and str(rl_kwargs.get("two_d_mode")).lower() != "auto":
-            self._log("Ignoring ci_rl_dl model metadata two_d_mode; 2D WF model stays on Auto.")
-        self._two_d_mode_combo.setCurrentText("Auto")
-
-        best = metadata.get("best_epoch") or {}
-        best_text = ""
-        if best:
-            best_text = f", best epoch={int(best.get('epoch', 0))}, val={float(best.get('val_loss', 0.0)):.5g}"
-        self._log(f"Loaded ci_rl_dl model metadata from {meta_path.name}{best_text}")
 
     def _begin_progress(self, total: int, text: str) -> None:
         self._progress.setRange(0, max(int(total), 1))
@@ -10370,11 +10143,6 @@ class DeconvolveCIWindow(QMainWindow):
             "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText().strip().lower(),
             "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
             "two_d_wf_bg_scale": self._sp_two_d_wf_bg_scale.value(),
-            "dl_model_path": self._le_dl_model.text().strip(),
-            "dl_z_context": self._sp_dl_z_context.value(),
-            "dl_batch_size": self._sp_dl_batch_size.value(),
-            "dl_mixed_precision": self._cb_dl_mixed_precision.isChecked(),
-            "dl_residual_strength": self._sp_dl_residual_strength.value(),
             "offset": offset,
             "prefilter_sigma": self._sp_prefilter.value(),
             "start": self._start_combo.currentText(),
@@ -10455,13 +10223,6 @@ class DeconvolveCIWindow(QMainWindow):
             if "name" not in channels_meta[i] and i < len(names):
                 channels_meta[i]["name"] = names[i]
         streaming_metadata["channels"] = channels_meta
-        if params.get("method") == "ci_rl_dl":
-            QMessageBox.warning(
-                self,
-                "Streaming not available",
-                "Streaming ci_rl_dl is not enabled yet. Choose ci_rl, ci_rl_tv, or ci_sparse_hessian.",
-            )
-            return
         movie_params = params.get("movie") or {}
         if movie_params.get("enabled"):
             QMessageBox.warning(
@@ -11666,11 +11427,6 @@ class DeconvolveCIWindow(QMainWindow):
             "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText(),
             "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
             "two_d_wf_bg_scale": self._sp_two_d_wf_bg_scale.value(),
-            "dl_model_path": self._le_dl_model.text(),
-            "dl_z_context": self._sp_dl_z_context.value(),
-            "dl_batch_size": self._sp_dl_batch_size.value(),
-            "dl_mixed_precision": self._cb_dl_mixed_precision.isChecked(),
-            "dl_residual_strength": self._sp_dl_residual_strength.value(),
             "background": self._bg_combo.currentText(),
             "background_value": self._sp_bg_value.value(),
             "offset": self._offset_combo.currentText(),
@@ -11755,11 +11511,6 @@ class DeconvolveCIWindow(QMainWindow):
             self._two_d_wf_aggr_combo.setCurrentText(lookup.get(str(aggr).strip().lower(), str(aggr)))
         _spin(self._sp_two_d_wf_bg_radius, "two_d_wf_bg_radius_um")
         _spin(self._sp_two_d_wf_bg_scale, "two_d_wf_bg_scale")
-        _line(self._le_dl_model, "dl_model_path")
-        dl_model_path = self._le_dl_model.text().strip()
-        if dl_model_path and Path(dl_model_path).exists():
-            self._apply_dl_model_metadata(Path(dl_model_path))
-        _spin(self._sp_dl_residual_strength, "dl_residual_strength")
         _combo(self._bg_combo, "background")
         _spin(self._sp_bg_value, "background_value")
         _combo(self._offset_combo, "offset")
@@ -12068,7 +11819,6 @@ class DeconvolveCIWindow(QMainWindow):
             self._btn_save_series.setVisible(False)
             if source_is_pyramidal:
                 self._btn_fit_psf.setEnabled(False)
-            self._maybe_load_default_ci_rl_dl_model()
             if source_path is not None:
                 kind = recent_kind or ("zarr" if str(source_path).lower().endswith((".zarr", ".ome.zarr")) or source_path.is_dir() else "file")
                 self._remember_recent_source(

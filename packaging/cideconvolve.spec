@@ -3,32 +3,16 @@
 #              (run from the repository root)
 #
 # Produces:  dist/cideconvolve.exe  (single-file executable)
-#            dist/models/           (visible default DL models; also embedded)
 #
 # NOTE: icon.ico is used for the Windows executable icon.
 
 import os
 import pkgutil
-import shutil
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 _SPEC_DIR = os.path.abspath(SPECPATH)
 _ROOT = os.path.abspath(os.path.join(_SPEC_DIR, os.pardir))
-
-
-def _collect_model_datas():
-    """Return PyInstaller (source, destination) tuples for bundled DL models."""
-    model_root = os.path.join(_ROOT, 'models')
-    if not os.path.isdir(model_root):
-        return []
-    datas = []
-    for dirpath, _, filenames in os.walk(model_root):
-        rel_dir = os.path.relpath(dirpath, model_root)
-        target_dir = 'models' if rel_dir == '.' else os.path.join('models', rel_dir)
-        for filename in filenames:
-            datas.append((os.path.join(dirpath, filename), target_dir))
-    return datas
 
 # ── Collect full PyQt6 ecosystem ──────────────────────────────────────────────
 pyqt6_datas, pyqt6_binaries, pyqt6_hiddenimports = collect_all('PyQt6')
@@ -140,13 +124,11 @@ a = Analysis(
       + bioio_datas + bioio_b_datas
       + bioio_ot_datas + bioio_oz_datas
       + bioio_cz_datas + bioio_nd_datas
-      + omezarr_datas
-      + _collect_model_datas(),  # default ci_rl_dl models
+      + omezarr_datas,
     hiddenimports=[
         # ── local modules ───────────────────────────────────────────────────
         'ci_dual_viewer',
         'core.deconvolve_ci',
-        'core.deconvolve_ci_dl',
         'core.deconvolve',
         'core.streaming',
         'core._meta_helpers',
@@ -305,16 +287,3 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-
-# Also copy the model folder next to the one-file executable.  The models are
-# embedded above, but this visible folder lets releases swap/update defaults
-# without rebuilding the executable.
-_dist_models = os.path.join(DISTPATH, 'models')
-_src_models = os.path.join(_ROOT, 'models')
-if os.path.isdir(_src_models):
-    if os.path.isdir(_dist_models):
-        shutil.rmtree(_dist_models)
-    shutil.copytree(_src_models, _dist_models)
-    print(f'Copied default DL models: {_dist_models}')
-else:
-    print(f'Skipped default DL models: {_src_models} not found')
