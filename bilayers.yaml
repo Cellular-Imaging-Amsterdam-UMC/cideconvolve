@@ -15,9 +15,6 @@ exec_function:
   name: generate_cli_command
   cli_command: python wrapper.py
   hidden_args:
-  - cli_tag: --gtfolder
-    value: /data/gt
-    cli_order: 3
   - cli_tag: --local
     value: true
     append_value: false
@@ -98,7 +95,7 @@ parameters:
   type: textbox
   label: RL Iterations
   description: Number of iterations per channel, comma-separated. A single value applies to all channels.
-  default: '150'
+  default: '60'
   cli_tag: --iterations
   cli_order: 11
   optional: true

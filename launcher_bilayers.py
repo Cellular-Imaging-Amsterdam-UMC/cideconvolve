@@ -155,7 +155,6 @@ def build_docker_command(
     cmd.extend([
         "-v", f"{folders['infolder']}:/data/in",
         "-v", f"{folders['outfolder']}:/data/out",
-        "-v", f"{folders['gtfolder']}:/data/gt",
         _docker_image_name(config),
     ])
 
@@ -430,7 +429,6 @@ class LauncherWindow(QMainWindow):
         return {
             "infolder": self.folder_widgets["infolder"].text(),
             "outfolder": self.folder_widgets["outfolder"].text(),
-            "gtfolder": str(SCRIPT_DIR / "gtfolder"),
         }
 
     def _get_docker_options(self) -> dict:

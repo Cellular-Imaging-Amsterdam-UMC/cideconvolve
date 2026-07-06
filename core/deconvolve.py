@@ -624,12 +624,13 @@ def load_image(
                 meta.update(data["metadata"])
                 images.extend(data["images"])
             else:
-                from core.ome_zarr_io import open_ome_zarr_image_node
+                from core.ome_zarr_io import open_ome_zarr_image_node, zarr_attrs
 
                 image_path, node = open_ome_zarr_image_node(path)
                 arr = node.data[0]
                 shape = tuple(int(v) for v in arr.shape)
                 node_meta = dict(getattr(node, "metadata", {}) or {})
+                raw_attrs = zarr_attrs(image_path)
                 logger.info("Reading OME-Zarr image group: %s", image_path)
                 if len(shape) == 5:
                     size_t, size_c, size_z, size_y, size_x = shape
@@ -655,6 +656,11 @@ def load_image(
                     images.append(np.asarray(arr.compute(), dtype=np.float32))
                 else:
                     raise ValueError(f"Unsupported OME-Zarr array shape: {shape}")
+                for key in ("cideconvolve", "_creator"):
+                    payload = raw_attrs.get(key) or node_meta.get(key)
+                    if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
+                        meta.update(dict(payload["metadata"]))
+                        break
                 meta.update({
                     "size_t": size_t,
                     "size_c": size_c,

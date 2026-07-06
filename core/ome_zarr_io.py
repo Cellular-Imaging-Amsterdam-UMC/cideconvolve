@@ -6,6 +6,7 @@ import json
 import shutil
 from pathlib import Path
 from typing import Any, Optional
+from xml.sax.saxutils import escape
 
 import numpy as np
 
@@ -121,20 +122,251 @@ def _result_to_tczyx(result: dict[str, Any]) -> np.ndarray:
     raise ValueError(f"OME-Zarr output expects 2D or 3D channels, got {channels[0].ndim}D")
 
 
-def _axes_metadata() -> list[dict[str, str]]:
-    return [
-        {"name": "t", "type": "time"},
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, set):
+        return sorted((_jsonable(v) for v in value), key=str)
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if number <= 0 or not np.isfinite(number):
+        return float(default)
+    return number
+
+
+def _cideconvolve_metadata_payload(metadata: dict[str, Any], shape: tuple[int, ...]) -> dict[str, Any]:
+    return {
+        "creator": "CIDeconvolve",
+        "shape_tczyx": list(shape),
+        "metadata": _jsonable(metadata),
+        "physical_pixel_sizes_um": {
+            "x": _positive_float(metadata.get("pixel_size_x"), 1.0),
+            "y": _positive_float(
+                metadata.get("pixel_size_y"),
+                _positive_float(metadata.get("pixel_size_x"), 1.0),
+            ),
+            "z": _positive_float(metadata.get("pixel_size_z"), 1.0),
+        },
+        "channels": _jsonable(metadata.get("channels") or []),
+        "processing": _jsonable(metadata.get("cideconvolve_processing") or {}),
+        "source": {
+            "id": metadata.get("id"),
+            "name": metadata.get("name"),
+            "source_id": metadata.get("source_id"),
+        },
+    }
+
+
+def _ome_dtype(dtype: np.dtype) -> str:
+    dtype = np.dtype(dtype)
+    if dtype == np.dtype("float32"):
+        return "float"
+    if dtype == np.dtype("float64"):
+        return "double"
+    if dtype == np.dtype("uint8"):
+        return "uint8"
+    if dtype == np.dtype("uint16"):
+        return "uint16"
+    if dtype == np.dtype("uint32"):
+        return "uint32"
+    if dtype == np.dtype("int8"):
+        return "int8"
+    if dtype == np.dtype("int16"):
+        return "int16"
+    if dtype == np.dtype("int32"):
+        return "int32"
+    return "float"
+
+
+def _xml_escape_attr(value: Any) -> str:
+    return escape(str(value), {'"': "&quot;"})
+
+
+def _xml_attr(name: str, value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    return f' {name}="{_xml_escape_attr(value)}"'
+
+
+def _ome_xml_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return number
+
+
+def _ome_acquisition_mode(value: Any) -> str | None:
+    text = str(value or "").strip().lower().replace("_", " ").replace("-", " ")
+    mapping = {
+        "wide field": "WideField",
+        "widefield": "WideField",
+        "confocal": "LaserScanningConfocalMicroscopy",
+        "laser scanning confocal": "LaserScanningConfocalMicroscopy",
+        "spinning disk": "SpinningDiskConfocal",
+        "spinning disk confocal": "SpinningDiskConfocal",
+        "tirm": "TIRF",
+        "tirf": "TIRF",
+        "sted": "STED",
+    }
+    return mapping.get(text)
+
+
+def _ome_channel_color(color: Any) -> int | None:
+    rgb = None
+    if isinstance(color, str):
+        text = color.strip().lstrip("#")
+        if len(text) == 6:
+            try:
+                rgb = tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                rgb = None
+    elif isinstance(color, (list, tuple)) and len(color) >= 3:
+        try:
+            rgb = tuple(max(0, min(255, int(v))) for v in color[:3])
+        except (TypeError, ValueError):
+            rgb = None
+    if rgb is None:
+        return None
+    r, g, b = rgb
+    rgba = (r << 24) | (g << 16) | (b << 8) | 255
+    return rgba - (1 << 32) if rgba >= (1 << 31) else rgba
+
+
+def _channel_xml_attrs(channel: dict[str, Any], index: int) -> str:
+    attrs = [
+        _xml_attr("ID", channel.get("id") or f"Channel:{index}"),
+        _xml_attr("Name", channel.get("name") or channel.get("label") or f"Channel {index + 1}"),
+    ]
+    color = _ome_channel_color(channel.get("color"))
+    if color is not None:
+        attrs.append(_xml_attr("Color", color))
+    for src, dst in (
+        ("emission_wavelength", "EmissionWavelength"),
+        ("excitation_wavelength", "ExcitationWavelength"),
+    ):
+        value = _ome_xml_float(channel.get(src))
+        if value is not None:
+            attrs.append(_xml_attr(dst, value))
+            attrs.append(_xml_attr(f"{dst}Unit", "nm"))
+    return "".join(attrs)
+
+
+def _metadata_xml_annotation(metadata: dict[str, Any], shape_tczyx: tuple[int, ...]) -> str:
+    payload = _cideconvolve_metadata_payload(metadata, shape_tczyx)
+    payload["ome_xml_note"] = "Full CIDeconvolve metadata serialized as JSON because not every key maps to a native OME-XML field."
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    return (
+        '<StructuredAnnotations>'
+        '<CommentAnnotation ID="Annotation:CIDeconvolve:0" Namespace="CIDeconvolve">'
+        f"<Value>{escape(text)}</Value>"
+        '</CommentAnnotation>'
+        '</StructuredAnnotations>'
+    )
+
+
+def _write_ome_xml_metadata(
+    output_path: Path,
+    metadata: dict[str, Any],
+    shape_tczyx: tuple[int, int, int, int, int],
+    dtype: np.dtype,
+    image_name: str,
+) -> None:
+    t, c, z, y, x = shape_tczyx
+    ome_dir = output_path / "OME"
+    ome_dir.mkdir(parents=True, exist_ok=True)
+    (ome_dir / ".zgroup").write_text(json.dumps({"zarr_format": 2}, indent=2), encoding="utf-8")
+
+    objective_attrs = [_xml_attr("ID", "Objective:0")]
+    na = _ome_xml_float(metadata.get("na"))
+    if na is not None:
+        objective_attrs.append(_xml_attr("LensNA", na))
+    mag = _ome_xml_float(metadata.get("magnification"))
+    if mag is not None:
+        objective_attrs.append(_xml_attr("NominalMagnification", mag))
+    immersion = str(metadata.get("immersion") or "").lower()
+    if "oil" in immersion:
+        objective_attrs.append(_xml_attr("Immersion", "Oil"))
+    elif "water" in immersion:
+        objective_attrs.append(_xml_attr("Immersion", "Water"))
+    elif "air" in immersion:
+        objective_attrs.append(_xml_attr("Immersion", "Air"))
+
+    objective_settings_attrs = [_xml_attr("ID", "Objective:0")]
+    sample_ri = _ome_xml_float(metadata.get("sample_refractive_index"))
+    if sample_ri is not None:
+        objective_settings_attrs.append(_xml_attr("RefractiveIndex", sample_ri))
+
+    channels = [
+        dict(ch) if isinstance(ch, dict) else {}
+        for ch in (metadata.get("channels") or [])
+    ]
+    if len(channels) < c:
+        channels.extend({} for _ in range(c - len(channels)))
+    channel_xml = "".join(
+        f"<Channel{_channel_xml_attrs(channels[i], i)}/>"
+        for i in range(c)
+    )
+    description = escape(json.dumps(_jsonable(metadata.get("cideconvolve_processing") or {}), ensure_ascii=False))
+    structured_annotations = _metadata_xml_annotation(metadata, shape_tczyx)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+        f"<Instrument ID=\"Instrument:0\"><Objective{''.join(objective_attrs)}/></Instrument>"
+        f"<Image ID=\"Image:0\" Name=\"{_xml_escape_attr(image_name)}\">"
+        f"<Description>{description}</Description>"
+        '<InstrumentRef ID="Instrument:0"/>'
+        f"<ObjectiveSettings{''.join(objective_settings_attrs)}/>"
+        f"<Pixels DimensionOrder=\"XYZCT\" ID=\"Pixels:0\""
+        f" PhysicalSizeX=\"{_positive_float(metadata.get('pixel_size_x'), 1.0)}\" PhysicalSizeXUnit=\"µm\""
+        f" PhysicalSizeY=\"{_positive_float(metadata.get('pixel_size_y'), _positive_float(metadata.get('pixel_size_x'), 1.0))}\" PhysicalSizeYUnit=\"µm\""
+        f" PhysicalSizeZ=\"{_positive_float(metadata.get('pixel_size_z'), 1.0)}\" PhysicalSizeZUnit=\"µm\""
+        f" SizeC=\"{c}\" SizeT=\"{t}\" SizeX=\"{x}\" SizeY=\"{y}\" SizeZ=\"{z}\" Type=\"{_ome_dtype(dtype)}\">"
+        f"{channel_xml}</Pixels></Image>{structured_annotations}</OME>"
+    )
+    (ome_dir / "METADATA.ome.xml").write_text(xml, encoding="utf-8")
+
+
+def _axes_metadata(include_time: bool) -> list[dict[str, str]]:
+    axes = []
+    if include_time:
+        axes.append({"name": "t", "type": "time"})
+    axes.extend([
         {"name": "c", "type": "channel"},
         {"name": "z", "type": "space", "unit": "micrometer"},
         {"name": "y", "type": "space", "unit": "micrometer"},
         {"name": "x", "type": "space", "unit": "micrometer"},
-    ]
+    ])
+    return axes
 
 
-def _scale_transform(px_z: float, px_y: float, px_x: float) -> list[dict[str, Any]]:
+def _scale_transform(px_z: float, px_y: float, px_x: float, include_time: bool) -> list[dict[str, Any]]:
+    scale = [1.0, float(px_z), float(px_y), float(px_x)]
+    if include_time:
+        scale.insert(0, 1.0)
     return [{
         "type": "scale",
-        "scale": [1.0, 1.0, float(px_z), float(px_y), float(px_x)],
+        "scale": scale,
     }]
 
 
@@ -220,11 +452,17 @@ def save_result_ome_zarr(
         ) from exc
 
     data = _result_to_tczyx(result)
-    metadata = dict(result.get("metadata") or {})
+    metadata = _jsonable(dict(result.get("metadata") or {}))
     px_x = float(metadata.get("pixel_size_x") or 1.0)
     px_y = float(metadata.get("pixel_size_y") or px_x)
     px_z = float(metadata.get("pixel_size_z") or 1.0)
-    chunks = (1, 1, min(data.shape[2], 16), min(data.shape[3], 512), min(data.shape[4], 512))
+    write_data = data[0] if data.shape[0] == 1 else data
+    include_time = write_data.ndim == 5
+    axes = ["t", "c", "z", "y", "x"] if include_time else ["c", "z", "y", "x"]
+    if include_time:
+        chunks = (1, 1, min(write_data.shape[2], 16), min(write_data.shape[3], 512), min(write_data.shape[4], 512))
+    else:
+        chunks = (1, min(write_data.shape[1], 16), min(write_data.shape[2], 512), min(write_data.shape[3], 512))
 
     try:
         root = zarr.open_group(str(output_path), mode="w", zarr_format=2)
@@ -232,29 +470,35 @@ def save_result_ome_zarr(
         root = zarr.open_group(str(output_path), mode="w", zarr_version=2)
 
     create_kwargs = {
-        "shape": data.shape,
+        "shape": write_data.shape,
         "chunks": chunks,
-        "dtype": data.dtype,
+        "dtype": write_data.dtype,
     }
     try:
         array = root.create_dataset("0", dimension_separator="/", **create_kwargs)
     except TypeError:
         array = root.create_dataset("0", **create_kwargs)
-    array[:] = data
+    array[:] = write_data
+    array.attrs["_ARRAY_DIMENSIONS"] = axes
 
-    name = str(metadata.get("name") or _ome_zarr_name(output_path))
+    name = output_path.name
+    display_metadata = dict(metadata)
+    display_metadata["name"] = name
     root.attrs["multiscales"] = [{
         "version": "0.4",
         "name": name,
-        "axes": _axes_metadata(),
+        "axes": _axes_metadata(include_time),
         "datasets": [{
             "path": "0",
-            "coordinateTransformations": _scale_transform(px_z, px_y, px_x),
+            "coordinateTransformations": _scale_transform(px_z, px_y, px_x, include_time),
         }],
+        "type": "mean",
+        "metadata": {"method": "single-scale"},
     }]
-    root.attrs["omero"] = _omero_metadata(metadata, data.shape[1])
-    root.attrs["cideconvolve"] = {
-        "metadata": metadata,
-        "physical_pixel_sizes_um": {"x": px_x, "y": px_y, "z": px_z},
-    }
+    root.attrs["omero"] = _omero_metadata(display_metadata, data.shape[1])
+    payload = _cideconvolve_metadata_payload(metadata, tuple(int(v) for v in data.shape))
+    payload["streaming"] = False
+    root.attrs["_creator"] = payload
+    root.attrs["cideconvolve"] = payload
+    _write_ome_xml_metadata(output_path, metadata, tuple(int(v) for v in data.shape), data.dtype, name)
     return output_path

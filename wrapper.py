@@ -56,6 +56,7 @@ from core.deconvolve import (
     save_mip_png,
     save_result,
 )
+from core.ome_zarr_io import save_result_ome_zarr
 from core.streaming import (
     ZarrPyramidSink,
     deconvolve_streaming,
@@ -182,6 +183,23 @@ def _format_bytes(mb):
     if mb >= 1024:
         return f"{mb / 1024:.1f} GB"
     return f"{mb:.0f} MB"
+
+
+def _path_size_bytes(path: Path) -> int:
+    """Return total size for either a file or a directory tree."""
+    path = Path(path)
+    if path.is_dir():
+        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+    return path.stat().st_size
+
+
+def _remove_existing_path(path: Path) -> None:
+    """Remove a stale file or directory before writing/replacing output."""
+    path = Path(path)
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
 
 
 def _normalise_image(arr: np.ndarray) -> np.ndarray:
@@ -1252,9 +1270,10 @@ def _run_streaming_regular_image(
             psf_xy_est=65,
             method=method,
             device=device,
-        )
+    )
     tile_limits = (tile_xy, int(tile_limits[1]))
     out_zarr = Path(out_path) / f"{stem}_decon.ome.zarr"
+    _remove_existing_path(out_zarr)
     sink = ZarrPyramidSink(
         out_zarr,
         shape=source.shape,
@@ -1618,10 +1637,10 @@ def main(argv):
             try:
                 use_streaming = False
                 if projection != "none" and output_format == "ome-zarr":
-                    raise ValueError("OME-Zarr streaming output currently writes full Z data; set projection=none.")
+                    raise ValueError("OME-Zarr output currently writes full Z data; set projection=none.")
                 if streaming_mode not in ("auto", "always", "never"):
                     raise ValueError("--streaming must be auto, always, or never")
-                if output_format == "ome-zarr" or streaming_mode == "always":
+                if streaming_mode == "always":
                     use_streaming = True
                 elif streaming_mode == "auto":
                     try:
@@ -1856,18 +1875,24 @@ def main(argv):
                     save_result(proj_result, str(tmp_file))
                     print(f"  Saved {projection.upper()}: {out_name}")
                 else:
-                    out_name = f"{stem}_decon.ome.tiff"
-                    tmp_file = tmp_work / out_name
-                    save_result(result, str(tmp_file))
+                    if output_format == "ome-zarr":
+                        out_name = f"{stem}_decon.ome.zarr"
+                        tmp_file = tmp_work / out_name
+                        save_result_ome_zarr(result, tmp_file)
+                    else:
+                        out_name = f"{stem}_decon.ome.tiff"
+                        tmp_file = tmp_work / out_name
+                        save_result(result, str(tmp_file))
                     print(f"  Saved: {out_name}")
                 save_time = time.time() - t_save
 
-                # Move only the deconvolved TIFF to the output folder
+                # Move only the deconvolved output to the output folder.
                 dest = Path(out_path) / out_name
+                _remove_existing_path(dest)
                 shutil.move(str(tmp_file), str(dest))
                 if dest.exists():
                     print(f"  Output file : {dest}")
-                    print(f"  Output size : {_format_bytes(dest.stat().st_size / (1024 * 1024))}")
+                    print(f"  Output size : {_format_bytes(_path_size_bytes(dest) / (1024 * 1024))}")
 
                 # Clean up the temp working directory
                 shutil.rmtree(tmp_work, ignore_errors=True)

@@ -202,6 +202,8 @@ def test_save_result_ome_zarr_smoke(tmp_path):
 
     assert (path / ".zgroup").is_file()
     assert (path / ".zattrs").is_file()
+    assert (path / "OME" / ".zgroup").is_file()
+    assert (path / "OME" / "METADATA.ome.xml").is_file()
     assert not (path / "zarr.json").exists()
 
     import json
@@ -211,13 +213,17 @@ def test_save_result_ome_zarr_smoke(tmp_path):
     assert attrs["multiscales"][0]["datasets"][0]["path"] == "0"
     assert attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"][0]["scale"] == [
         1.0,
-        1.0,
         0.5,
         0.12,
         0.12,
     ]
     assert attrs["omero"]["channels"][0]["label"] == "CH1"
     assert attrs["omero"]["channels"][0]["color"] == "FF0000"
+    assert attrs["_creator"]["physical_pixel_sizes_um"] == {"x": 0.12, "y": 0.12, "z": 0.5}
+    assert attrs["cideconvolve"]["streaming"] is False
+
+    array_attrs = json.loads((path / "0" / ".zattrs").read_text(encoding="utf-8"))
+    assert array_attrs["_ARRAY_DIMENSIONS"] == ["c", "z", "y", "x"]
     assert attrs["cideconvolve"]["metadata"]["_defaulted_keys"] == [
         "pixel_size_x",
         "pixel_size_z",
@@ -227,4 +233,11 @@ def test_save_result_ome_zarr_smoke(tmp_path):
     import zarr
 
     root = zarr.open(str(path), mode="r")
-    assert tuple(root["0"].shape) == (1, 1, 1, 8, 9)
+    assert tuple(root["0"].shape) == (1, 1, 8, 9)
+
+    ome_xml = (path / "OME" / "METADATA.ome.xml").read_text(encoding="utf-8")
+    assert 'PhysicalSizeX="0.12"' in ome_xml
+    assert 'PhysicalSizeZ="0.5"' in ome_xml
+    assert 'EmissionWavelength' not in ome_xml
+    assert 'CommentAnnotation ID="Annotation:CIDeconvolve:0"' in ome_xml
+    assert "source_path" in ome_xml

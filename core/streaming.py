@@ -598,9 +598,10 @@ class OmeZarrRegionSource:
     """Region source backed by the official ome-zarr-py reader."""
 
     def __init__(self, path: str | Path, *, array_path: str = "0"):
-        from core.ome_zarr_io import open_ome_zarr_image_node
+        from core.ome_zarr_io import open_ome_zarr_image_node, zarr_attrs
 
         self.path, self._node = open_ome_zarr_image_node(path)
+        self._attrs = zarr_attrs(self.path)
         self._level = int(array_path)
         self._levels = self._node.data
         self._array = self._levels[self._level]
@@ -620,6 +621,12 @@ class OmeZarrRegionSource:
             "n_channels": c,
         }
         node_meta = dict(getattr(self._node, "metadata", {}) or {})
+        raw_attrs = dict(getattr(self, "_attrs", {}) or {})
+        for key in ("cideconvolve", "_creator"):
+            payload = raw_attrs.get(key) or node_meta.get(key)
+            if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
+                meta.update(dict(payload["metadata"]))
+                break
         if node_meta.get("name"):
             meta["name"] = node_meta.get("name")
         transforms = node_meta.get("coordinateTransformations") or []

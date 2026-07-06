@@ -1,7 +1,7 @@
 {
   "values": {
     "method": "ci_rl",
-    "iterations": "150",
+    "iterations": "60",
     "convergence": "auto",
     "rel_threshold": 0.005,
     "start": "auto",
@@ -39,8 +39,7 @@
   },
   "folders": {
     "infolder": "C:\\rahoebe\\Python\\cideconvolve\\infolder",
-    "outfolder": "C:\\rahoebe\\Python\\cideconvolve\\outfolder",
-    "gtfolder": "C:\\rahoebe\\Python\\cideconvolve\\gtfolder"
+    "outfolder": "C:\\rahoebe\\Python\\cideconvolve\\outfolder"
   },
   "docker_options": {
     "use_gpus": true
