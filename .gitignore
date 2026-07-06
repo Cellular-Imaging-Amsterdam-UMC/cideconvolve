@@ -55,6 +55,7 @@ bin/
 run.cmd
 pushdocker.cmd
 release_github.cmd
+*.ps1
 ci_deconvolve_cli/publish.cmd
 
 # Misc build artifacts
@@ -64,3 +65,6 @@ ci_deconvolve_cli/publish.cmd
 
 # standalone
 standalone/
+
+# Local BIOMERO / Slurm debug logs
+slurm_logs/

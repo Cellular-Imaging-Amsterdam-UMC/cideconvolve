@@ -35,7 +35,7 @@ def _load_config(config_path: Path) -> dict[str, Any]:
 
 def _iter_cli_items(config: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for source in ("inputs", "parameters"):
+    for source in ("inputs", "outputs", "parameters"):
         for spec in config.get(source, []) or []:
             item = dict(spec)
             item["source"] = source[:-1]

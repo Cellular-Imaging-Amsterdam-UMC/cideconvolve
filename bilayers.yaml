@@ -1,8 +1,10 @@
 citations:
-- name: cideconvolve_shb_rl
-  doi: 10.1109/TIP.2014.2361594
+- name: cideconvolve
+  authors:
+  - name: Ron Hoebe
+  doi: Unknown
   license: Unknown
-  description: Scaled heavy-ball acceleration for Richardson-Lucy deconvolution.
+  description: 3D/2D deconvolution for widefield and confocal microscopy images using CI SHB-accelerated Richardson-Lucy, SHB-RL with Total Variation regularisation, or sparse-Hessian variational deconvolution. Supports GPU acceleration via CUDA (PyTorch).
 docker_image:
   org: cellularimagingcf
   name: w_cideconvolve
@@ -13,9 +15,6 @@ exec_function:
   name: generate_cli_command
   cli_command: python wrapper.py
   hidden_args:
-  - cli_tag: --outfolder
-    value: /data/out
-    cli_order: 2
   - cli_tag: --gtfolder
     value: /data/gt
     cli_order: 3
@@ -56,6 +55,8 @@ outputs:
   type: image
   label: Deconvolved Outputs
   description: Output folder containing OME-TIFF, OME-Zarr, benchmark CSV, and montage results.
+  cli_tag: --outfolder
+  cli_order: 2
   default: directory
   optional: false
   format:
