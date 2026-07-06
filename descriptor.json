@@ -29,7 +29,7 @@
       "command-line-flag": "--iterations",
       "name": "(ess) RL iterations",
       "description": "Number of RL iterations per channel, comma-separated. A single value applies to all channels. Example: '150' or '150, 100, 200'.",
-      "default-value": "150",
+      "default-value": "60",
       "set-by-server": false,
       "optional": true,
       "type": "String"
