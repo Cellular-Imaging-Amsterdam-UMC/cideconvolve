@@ -34,9 +34,11 @@ RUN python -m pip install --upgrade pip \
 
 # --- Application code ---
 COPY core/ /app/core/
-COPY bioflows_local.py /app/bioflows_local.py
+COPY biaflows_cli.py /app/biaflows_cli.py
 COPY wrapper.py /app/wrapper.py
 COPY descriptor.json /app/descriptor.json
+COPY bilayers_cli.py /app/bilayers_cli.py
+COPY bilayers.yaml /app/bilayers.yaml
 
 # --- BIAFLOWS data directories ---
 RUN mkdir -p /data/in /data/out /data/gt

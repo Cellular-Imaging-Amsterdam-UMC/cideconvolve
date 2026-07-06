@@ -1,12 +1,12 @@
 """
-launcher.py — PyQt6 GUI frontend for W_CIDeconvolve descriptor.json.
+launcher_biaflows.py — PyQt6 GUI frontend for W_CIDeconvolve descriptor.json.
 
 Dynamically reads descriptor.json and builds a form with appropriate
 widgets for each parameter. On "Run" it executes the Docker container
 in the console that launched this script.
 
 Usage:
-    python launcher.py
+    python launcher_biaflows.py
 """
 
 import json

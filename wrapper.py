@@ -2,7 +2,7 @@
 wrapper.py - BIAFLOWS-compatible entrypoint for CIDeconvolve.
 
 Parses BIAFLOWS job parameters (--infolder, --outfolder, --gtfolder, etc.)
-via bioflows_local, then processes each input image through the CI
+via biaflows_cli, then processes each input image through the CI
 deconvolution pipeline in deconvolve.py and writes results to the output
 folder.
 
@@ -21,7 +21,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 # Configure logging so deconvolve.py INFO messages are visible
 logging.basicConfig(
@@ -33,11 +32,12 @@ logging.basicConfig(
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from bioflows_local import (
+from biaflows_cli import (
     CLASS_SPTCNT,
     BiaflowsJob,
     get_discipline,
     prepare_data,
+    resolve_workflow_parameters,
 )
 
 # Import core first (handles torch-before-numpy DLL load order)
@@ -72,26 +72,6 @@ import numpy as np
 # ---------------------------------------------------------------------------
 OUTPUT_ZARR_FORMAT = 2
 
-# ---------------------------------------------------------------------------
-# RI lookup tables - value-choices in descriptor.json use "name (RI)" format
-# ---------------------------------------------------------------------------
-_IMMERSION_RI = {
-    "air":   1.0003,
-    "water": 1.333,
-    "oil":   1.515,
-}
-
-_SAMPLE_RI = {
-    "water":          1.333,
-    "pbs":            1.334,
-    "culture medium": 1.337,
-    "vectashield":    1.45,
-    "prolong gold":   1.47,
-    "glycerol":       1.474,
-    "oil":            1.515,
-    "prolong glass":  1.52,
-}
-
 # GUI-matched metadata fallback defaults.
 _DEFAULT_NA = 1.4
 _DEFAULT_EMISSION_WL = "520"
@@ -100,93 +80,7 @@ _DEFAULT_PIXEL_SIZE_Z_NM = 200.0
 _DEFAULT_MICROSCOPE_TYPE = "confocal"
 _DEFAULT_EXCITATION_WL = "488"
 _DEFAULT_PINHOLE_AIRY = _DEFAULT_PINHOLE_AIRY_UNITS
-_DEFAULT_IMMERSION_RI_CHOICE = "oil (1.515)"
-_DEFAULT_SAMPLE_RI_CHOICE = "prolong gold (1.47)"
 _SAMPLE_RI_DEFAULT = 1.47
-_START_MODES = (
-    "auto",
-    "flat",
-    "percentile_flat",
-    "observed",
-    "observed_bgsub",
-    "lowpass",
-    "lowpass_bgsub",
-    "hybrid",
-)
-
-
-def _to_bool(value) -> bool:
-    """Convert a value to bool, handling string 'True'/'False' from CLI."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("true", "1", "yes")
-    return bool(value)
-
-
-def _parse_ri_choice(raw: str, lookup: dict[str, float]) -> float | None:
-    """Parse a RI choice string like 'oil (1.515)' or a bare float.
-
-    Returns None when the value cannot be parsed.
-    """
-    s = str(raw).strip().lower()
-    if not s:
-        return None
-    # Try "name (1.234)" format - extract the name part
-    name = s.split("(")[0].strip()
-    if name in lookup:
-        return lookup[name]
-    # Try bare float
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def _parse_float_or_default(raw, default: float) -> float:
-    """Parse a float, accepting legacy 'auto' as the supplied default."""
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return float(default)
-    if not np.isfinite(value):
-        return float(default)
-    return value
-
-
-def _parse_float_list_or_default(raw, default: str) -> list[float]:
-    """Parse comma-separated floats, accepting legacy 'auto' as default."""
-    text = str(raw if raw is not None else default).strip()
-    if not text or text.lower() == "auto":
-        text = default
-    values = []
-    for item in text.replace(";", ",").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            value = float(item)
-        except ValueError:
-            continue
-        if np.isfinite(value):
-            values.append(value)
-    return values or [float(default)]
-
-
-def _parse_tile_limits(raw, default: tuple[int, int] = (0, 64)) -> tuple[int, int]:
-    """Parse tile limits as ``max_xy,max_z``; XY <= 0 means auto tile sizing."""
-    text = str(raw or "").strip()
-    if not text or text.lower() == "auto":
-        return default
-    parts = [p.strip() for p in text.replace("x", ",").split(",") if p.strip()]
-    try:
-        max_xy = int(parts[0]) if parts else default[0]
-        max_z = int(parts[1]) if len(parts) > 1 else default[1]
-    except ValueError:
-        return default
-    if max_xy <= 0:
-        max_xy = 0
-    return (max_xy if max_xy == 0 else max(max_xy, 64)), max(max_z, 1)
 
 
 def _metadata_use_value(current, value, overrule_metadata: bool) -> bool:
@@ -1487,124 +1381,61 @@ def _run_streaming_regular_image(
 
 def main(argv):
     with BiaflowsJob.from_cli(argv) as bj:
-        parameters = getattr(bj, "parameters", SimpleNamespace())
-
-        # Extract parameters with defaults from descriptor.json
-        iter_raw = str(getattr(parameters, "iterations", "40")).strip()
-        niter_list = []
-        for item in iter_raw.replace(";", ",").split(","):
-            item = item.strip()
-            if not item:
-                continue
-            try:
-                niter_list.append(max(1, int(float(item))))
-            except ValueError:
-                continue
-        if not niter_list:
-            niter_list = [40]
-        method = str(getattr(parameters, "method", "ci_rl") or "ci_rl").strip()
-        if method not in ("ci_rl", "ci_rl_tv", "ci_sparse_hessian"):
-            method = "ci_rl"
-        device_param = getattr(parameters, "device", "auto")
-        device = None if device_param in (None, "auto") else device_param
-
-        # PSF metadata parameters. By default image metadata wins; these values
-        # are fallbacks for missing metadata. With overrule enabled they replace
-        # any image metadata.
-        overrule_metadata = _to_bool(getattr(parameters, "overrule_image_metadata", False))
-        na_value = _parse_float_or_default(getattr(parameters, "na", _DEFAULT_NA), _DEFAULT_NA)
-        ri_raw = str(getattr(parameters, "refractive_index", _DEFAULT_IMMERSION_RI_CHOICE))
-        ri_value = _parse_ri_choice(ri_raw, _IMMERSION_RI) or 1.515
-        sample_ri_raw = str(getattr(parameters, "sample_ri", _DEFAULT_SAMPLE_RI_CHOICE))
-        sample_ri_value = _parse_ri_choice(sample_ri_raw, _SAMPLE_RI) or _SAMPLE_RI_DEFAULT
-        micro_value = str(getattr(parameters, "microscope_type", _DEFAULT_MICROSCOPE_TYPE)).strip().lower()
-        if micro_value == "auto":
-            micro_value = _DEFAULT_MICROSCOPE_TYPE
-        em_raw = str(getattr(parameters, "emission_wl", _DEFAULT_EMISSION_WL)).strip()
-        em_value = _parse_float_list_or_default(em_raw, _DEFAULT_EMISSION_WL)
-        ex_raw = str(getattr(parameters, "excitation_wl", _DEFAULT_EXCITATION_WL)).strip()
-        ex_value = _parse_float_list_or_default(ex_raw, _DEFAULT_EXCITATION_WL)
-        pinhole_airy = _parse_float_list_or_default(
-            getattr(parameters, "pinhole_airy", str(_DEFAULT_PINHOLE_AIRY)),
-            str(_DEFAULT_PINHOLE_AIRY),
-        )
-
-        # Deconvolution parameters
-        tv_lambda = _parse_float_or_default(getattr(parameters, "tv_lambda", 0.0001), 0.0001)
-        damping_raw = str(getattr(parameters, "damping", "none")).strip().lower()
-        if damping_raw in ("none", "0", "0.0"):
-            damping = 0.0
-        elif damping_raw == "auto":
-            damping = "auto"
-        else:
-            damping = _parse_float_or_default(damping_raw, 0.0)
-        bg_raw = str(getattr(parameters, "background", "auto")).strip()
-        background = "auto" if bg_raw.lower() == "auto" else _parse_float_or_default(bg_raw, 0.0)
-        offset_raw = str(getattr(parameters, "offset", "auto")).strip().lower()
-        if offset_raw in ("none", "0", "0.0"):
-            offset = 0.0
-        elif offset_raw == "auto":
-            offset = "auto"
-        else:
-            offset = _parse_float_or_default(offset_raw, 0.0)
-        prefilter_sigma = max(0.0, _parse_float_or_default(getattr(parameters, "prefilter_sigma", 0.0), 0.0))
-        start = str(getattr(parameters, "start", "auto")).strip().lower()
-        if start not in _START_MODES:
-            start = "flat"
-        sparse_hessian_weight = min(max(_parse_float_or_default(getattr(parameters, "sparse_hessian_weight", 0.6), 0.6), 0.0), 1.0)
-        sparse_hessian_reg = min(max(_parse_float_or_default(getattr(parameters, "sparse_hessian_reg", 0.98), 0.98), 0.0), 1.0)
-        convergence = str(getattr(parameters, "convergence", "auto")).strip().lower()
-        if convergence in ("none", "fixed"):
-            convergence = "fixed"
-        elif convergence != "auto":
-            convergence = "auto"
-        rel_threshold = min(max(_parse_float_or_default(getattr(parameters, "rel_threshold", 0.005), 0.005), 1e-8), 1.0)
-        check_every = 5          # convergence check interval
-
-        # Hardcoded defaults (removed from descriptor to reduce parameter count)
-        t_g = 170000.0           # coverslip thickness (nm) — standard #1.5
-        t_g0 = 170000.0          # design coverslip thickness (nm)
-        t_i0 = 100000.0          # design immersion thickness (nm)
-        z_p = 0.0                # particle depth (nm)
-
-        # Pixel size parameters from descriptor are in nm; loader metadata uses um.
-        px_xy_raw = str(getattr(parameters, "pixel_size_xy", _DEFAULT_PIXEL_SIZE_XY_NM)).strip()
-        px_xy_nm = _parse_float_or_default(px_xy_raw, _DEFAULT_PIXEL_SIZE_XY_NM)
-        px_xy_value = px_xy_nm / 1000.0
-        px_z_raw = str(getattr(parameters, "pixel_size_z", _DEFAULT_PIXEL_SIZE_Z_NM)).strip()
-        px_z_nm = _parse_float_or_default(px_z_raw, _DEFAULT_PIXEL_SIZE_Z_NM)
-        px_z_value = px_z_nm / 1000.0
-
-        na_override = na_value
-        ri_override = ri_value
-        sample_ri = sample_ri_value
-        micro_override = micro_value
-        em_override = em_value
-        ex_override = ex_value
-        pinhole_airy_override = pinhole_airy
-        px_xy_override = px_xy_value
-        px_z_override = px_z_value
-
-        projection = str(getattr(parameters, "projection", "none")).lower()
-        benchmark = _to_bool(getattr(parameters, "benchmark", False))
-        bench_crop = _to_bool(getattr(parameters, "bench_crop", False))
-        compute_metrics = _to_bool(getattr(parameters, "compute_metrics", False))
-        output_format = str(getattr(parameters, "output_format", "ome-tiff")).strip().lower()
-        if output_format in ("ome_zarr", "zarr"):
-            output_format = "ome-zarr"
-        streaming_mode = str(getattr(parameters, "streaming", "auto")).strip().lower()
-        tile_limits = _parse_tile_limits(getattr(parameters, "tile_limits", "auto"))
-        streaming_threshold_gb = max(_parse_float_or_default(getattr(parameters, "streaming_threshold_gb", 2.0), 2.0), 0.01)
-        scene = getattr(parameters, "scene", None)
-        scene = None if scene in (None, "", "auto") else scene
-        hcs_field = getattr(parameters, "hcs_field", None)
-        hcs_field = None if hcs_field in (None, "", "auto") else str(hcs_field)
-
-        # 2D widefield parameters
-        two_d_mode = str(getattr(parameters, "two_d_mode", "auto")).strip().lower()
-        two_d_wf_aggressiveness = str(getattr(parameters, "two_d_wf_aggressiveness", "Balanced")).strip()
-        two_d_wf_bg_radius_um = max(_parse_float_or_default(getattr(parameters, "two_d_wf_bg_radius_um", 0.5), 0.5), 0.1)
-        two_d_wf_bg_scale = max(_parse_float_or_default(getattr(parameters, "two_d_wf_bg_scale", 1.0), 1.0), 0.1)
+        run_params = resolve_workflow_parameters(getattr(bj, "parameters", None))
+        niter_list = run_params.niter_list
+        method = run_params.method
+        device_param = run_params.device_param
+        device = run_params.device
+        overrule_metadata = run_params.overrule_metadata
+        na_value = run_params.na_value
+        ri_raw = run_params.ri_raw
+        ri_value = run_params.ri_value
+        sample_ri_raw = run_params.sample_ri_raw
+        sample_ri_value = run_params.sample_ri_value
+        micro_value = run_params.micro_value
+        em_value = run_params.em_value
+        ex_value = run_params.ex_value
+        pinhole_airy = run_params.pinhole_airy
+        tv_lambda = run_params.tv_lambda
+        damping = run_params.damping
+        background = run_params.background
+        offset = run_params.offset
+        prefilter_sigma = run_params.prefilter_sigma
+        start = run_params.start
+        sparse_hessian_weight = run_params.sparse_hessian_weight
+        sparse_hessian_reg = run_params.sparse_hessian_reg
+        convergence = run_params.convergence
+        rel_threshold = run_params.rel_threshold
+        check_every = run_params.check_every
+        t_g = run_params.t_g
+        t_g0 = run_params.t_g0
+        t_i0 = run_params.t_i0
+        z_p = run_params.z_p
+        px_xy_nm = run_params.px_xy_nm
+        px_z_nm = run_params.px_z_nm
+        na_override = run_params.na_override
+        ri_override = run_params.ri_override
+        sample_ri = run_params.sample_ri
+        micro_override = run_params.micro_override
+        em_override = run_params.em_override
+        ex_override = run_params.ex_override
+        pinhole_airy_override = run_params.pinhole_airy_override
+        px_xy_override = run_params.px_xy_override
+        px_z_override = run_params.px_z_override
+        projection = run_params.projection
+        benchmark = run_params.benchmark
+        bench_crop = run_params.bench_crop
+        compute_metrics = run_params.compute_metrics
+        output_format = run_params.output_format
+        streaming_mode = run_params.streaming_mode
+        tile_limits = run_params.tile_limits
+        streaming_threshold_gb = run_params.streaming_threshold_gb
+        scene = run_params.scene
+        hcs_field = run_params.hcs_field
+        two_d_mode = run_params.two_d_mode
+        two_d_wf_aggressiveness = run_params.two_d_wf_aggressiveness
+        two_d_wf_bg_radius_um = run_params.two_d_wf_bg_radius_um
+        two_d_wf_bg_scale = run_params.two_d_wf_bg_scale
 
         print("=" * 70)
         print("CIDeconvolve - BIAFLOWS Workflow")

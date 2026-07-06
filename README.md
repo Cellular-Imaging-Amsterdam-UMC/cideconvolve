@@ -21,7 +21,8 @@ CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible workflow 
 | Entry point | Purpose |
 |---|---|
 | `gui_deconvolve_ci.py` | Full standalone interactive GUI — open files, configure parameters, run deconvolution, inspect results side-by-side |
-| `launcher.py` | Docker launcher GUI — builds and runs a `docker run` command from a parameter form |
+| `launcher_bilayers.py` | Docker launcher GUI backed by `bilayers.yaml` |
+| `launcher_biaflows.py` | Legacy Docker launcher GUI backed by `descriptor.json` |
 | `wrapper.py` | BIAFLOWS / BIOMERO CLI entrypoint for batch and HPC use |
 
 ---
@@ -484,19 +485,19 @@ docker run --rm --gpus all \
 
 ---
 
-## Launcher — Docker GUI (`launcher.py`)
+## Launcher — Docker GUI (`launcher_bilayers.py`)
 
 ![Launcher](docs/screenshots/launcher.png)
 
-The launcher provides a graphical interface that reads `descriptor.json` at runtime, builds a matching parameter form, and generates / executes a `docker run` command — no command-line knowledge required.
+The Bilayers launcher provides a graphical interface that reads `bilayers.yaml` at runtime, builds a matching parameter form, and generates / executes a `docker run` command — no command-line knowledge required.
 
 ```bash
-python launcher.py
+python launcher_bilayers.py
 ```
 
 ### Layout
 
-1. **Header** — workflow name and description from `descriptor.json`
+1. **Header** — workflow name from `bilayers.yaml`
 2. **Data Folders** — input / output folder pickers with Browse… buttons
 3. **Docker Runtime** — GPU toggle (`--gpus all`, enabled by default)
 4. **Parameters** — two-column grid of all essential parameters with an expandable **Advanced** section for less-common settings
@@ -546,12 +547,13 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 |------|---------|
 | `gui_deconvolve_ci.py` | Standalone interactive deconvolution GUI |
 | `ci_dual_viewer.py` | Synchronized dual-pane XYZT / 3D viewer widget |
-| `launcher.py` | Docker launcher GUI |
+| `launcher_bilayers.py` | Docker launcher GUI backed by `bilayers.yaml` |
+| `launcher_biaflows.py` | Legacy Docker launcher GUI backed by `descriptor.json` |
 | `wrapper.py` | BIAFLOWS / BIOMERO CLI entrypoint, benchmark runner, metrics |
 | `deconvolve.py` | High-level pipeline: image loading, metadata extraction, PSF sizing, dispatch |
 | `deconvolve_ci.py` | Core PyTorch engine: SHB-RL, RLTV, sparse-Hessian, PSF generation, tiling |
 | `descriptor.json` | BIAFLOWS / BIOMERO parameter descriptor (single source of truth) |
-| `bioflows_local.py` | Local BIAFLOWS compatibility shim |
+| `biaflows_cli.py` | Local BIAFLOWS compatibility shim |
 | `Dockerfile` | Docker build (NVIDIA CUDA 12.6 runtime + Python 3.11) |
 | `requirements.txt` | Python dependencies (local install) |
 | `requirements_gui.txt` | Python dependencies for GUI features |
