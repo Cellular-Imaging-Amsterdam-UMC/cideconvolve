@@ -54,6 +54,7 @@ bin/
 # Private build / push scripts
 run.cmd
 pushdocker.cmd
+release_github.cmd
 ci_deconvolve_cli/publish.cmd
 
 # Misc build artifacts
