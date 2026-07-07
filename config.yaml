@@ -1,9 +1,7 @@
 citations:
 - name: cideconvolve
-  authors:
-  - name: Ron Hoebe
-  doi: Unknown
-  license: Unknown
+  doi: https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve
+  license: MIT
   description: 3D/2D deconvolution for widefield and confocal microscopy images using CI SHB-accelerated Richardson-Lucy, SHB-RL with Total Variation regularisation, or sparse-Hessian variational deconvolution. Supports GPU acceleration via CUDA (PyTorch).
 docker_image:
   org: cellularimagingcf
@@ -16,7 +14,7 @@ exec_function:
   cli_command: python wrapper.py
   hidden_args:
   - cli_tag: --local
-    value: true
+    value: "true"
     append_value: false
     cli_order: 4
 inputs:
@@ -39,10 +37,24 @@ inputs:
   - bmp
   - npy
   - zarr
+  unique_string:
+  - .tif
+  - .tiff
+  - .ome.tif
+  - .ome.tiff
+  - .png
+  - .jpg
+  - .jpeg
+  - .bmp
+  - .npy
+  - .zarr
   folder_name: /data/in
   file_count: multiple
   section_id: inputs
   mode: beginner
+  subtype:
+  - grayscale
+  - color
   depth: true
   timepoints: true
   tiled: true
@@ -64,14 +76,25 @@ outputs:
   - csv
   - png
   - json
+  unique_string:
+  - .ome.tiff
+  - .ome.tif
+  - .ome.zarr
+  - .csv
+  - .png
+  - .json
   folder_name: /data/out
   file_count: multiple
   section_id: outputs
   mode: beginner
+  subtype:
+  - grayscale
+  - color
   depth: true
   timepoints: true
   tiled: true
   pyramidal: true
+display_only: []
 parameters:
 - name: method
   type: dropdown
@@ -186,7 +209,7 @@ parameters:
   label: Confocal Pinhole (AU)
   description: Confocal pinhole diameter in Airy disk units, comma-separated per channel. Use 0 for the legacy point-detector
     model.
-  default: '1.0'
+  default: '1'
   cli_tag: --pinhole_airy
   cli_order: 17
   optional: true

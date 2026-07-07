@@ -1,24 +1,26 @@
 """
-launcher_biaflows.py — PyQt6 GUI frontend for W_CIDeconvolve descriptor.json.
+launcher.py - PyQt6 GUI frontend for CIDeconvolve config.yaml.
 
-Dynamically reads descriptor.json and builds a form with appropriate
-widgets for each parameter. On "Run" it executes the Docker container
-in the console that launched this script.
+Dynamically reads config.yaml and builds a form with appropriate widgets for
+each parameter. On "Run" it executes the Docker container in the console that
+launched this script.
 
 Usage:
-    python launcher_biaflows.py
+    python launcher.py
 """
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 # Windows taskbar: set AppUserModelID so the taskbar shows our icon, not Python's
 if sys.platform == "win32":
     import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ci.w_cideconvolve.launcher")
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ci.w_cideconvolve.bilayers_launcher")
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
@@ -33,21 +35,20 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QSpinBox,
-    QLineEdit,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-# Resolve paths relative to this script
 SCRIPT_DIR = Path(__file__).resolve().parent
-DESCRIPTOR_PATH = SCRIPT_DIR / "descriptor.json"
+CONFIG_PATH = SCRIPT_DIR / "config.yaml"
 ICON_PATH = SCRIPT_DIR / "gui" / "icon.svg"
-LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
+LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_launcher_settings.json"
 
 
 class ToggleSwitch(QCheckBox):
@@ -108,62 +109,77 @@ class CollapsiblePanel(QWidget):
             window.adjustSize()
 
 
-def load_descriptor() -> dict:
-    with open(DESCRIPTOR_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_bilayers_config() -> dict:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _docker_image_name(config: dict) -> str:
+    image = config.get("docker_image", {})
+    name = str(image.get("name", "w_cideconvolve"))
+    tag = str(image.get("tag", "latest"))
+    return name if tag in ("", "latest") else f"{name}:{tag}"
+
+
+def _cli_items(config: dict) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for source in ("inputs", "outputs", "parameters"):
+        for spec in config.get(source, []) or []:
+            item = dict(spec)
+            item["source"] = source[:-1]
+            items.append(item)
+    for spec in config.get("exec_function", {}).get("hidden_args", []) or []:
+        item = dict(spec)
+        item["source"] = "hidden"
+        items.append(item)
+    return sorted(items, key=lambda item: int(item.get("cli_order", 0)))
+
+
+def _append_cli_value(cmd: list[str], cli_tag: str, value: Any) -> None:
+    if cli_tag in ("", None, "None") or value in (None, ""):
+        return
+    cmd.extend([str(cli_tag), str(value)])
 
 
 def build_docker_command(
-    descriptor: dict,
+    config: dict,
     values: dict,
     folders: dict,
     docker_options: dict | None = None,
 ) -> list[str]:
-    """Build the docker run command from descriptor and current widget values."""
-    # Derive from descriptor, strip namespace (e.g. "cellularimagingcf/") for local run
-    full_image = descriptor.get("container-image", {}).get("image", "w_cideconvolve")
-    image = full_image.rsplit("/", 1)[-1]
-    name = descriptor.get("name", image)
+    """Build the docker run command from config.yaml and current values."""
     docker_options = docker_options or {}
-    use_gpus = bool(docker_options.get("use_gpus", True))
-
-    cmd = [
-        "docker", "run", "--rm",
-    ]
-    if use_gpus:
+    cmd = ["docker", "run", "--rm"]
+    if bool(docker_options.get("use_gpus", True)):
         cmd.extend(["--gpus", "all"])
     cmd.extend([
         "-v", f"{folders['infolder']}:/data/in",
         "-v", f"{folders['outfolder']}:/data/out",
-        "-v", f"{folders['gtfolder']}:/data/gt",
-        image,
-        "--infolder", "/data/in",
-        "--outfolder", "/data/out",
-        "--gtfolder", "/data/gt",
-        "--local",
+        _docker_image_name(config),
     ])
 
-    for inp in descriptor.get("inputs", []):
-        param_id = inp["id"]
-        flag = inp.get("command-line-flag", f"--{param_id}")
-        val = values.get(param_id)
-        if val is None:
+    for item in _cli_items(config):
+        cli_tag = item.get("cli_tag")
+        if cli_tag in (None, "None"):
             continue
-        if inp["type"] == "Boolean":
-            default_val = inp.get("default-value", False)
-            if default_val is True:
-                # Default-true booleans use --no-<id> in argparse (store_false)
-                # Only emit flag when user unchecks (wants False)
-                if not val:
-                    neg_flag = f"--no-{param_id.replace('_', '-')}"
-                    cmd.append(neg_flag)
-            else:
-                # Default-false booleans use --<flag> in argparse (store_true)
-                # Only emit flag when user checks (wants True)
-                if val:
-                    cmd.append(flag)
+        source = item.get("source")
+        if source == "hidden":
+            value = item.get("value")
+            append_value = bool(item.get("append_value", True))
+        elif source == "input":
+            value = item.get("folder_name") or values.get(item["name"])
+            append_value = True
         else:
-            cmd.extend([flag, str(val)])
+            value = values.get(item["name"], item.get("default"))
+            append_value = bool(item.get("append_value", False))
+
+        if item.get("type") == "checkbox" or isinstance(value, bool):
+            if append_value:
+                _append_cli_value(cmd, str(cli_tag), value)
+            elif value:
+                cmd.append(str(cli_tag))
+            continue
+        _append_cli_value(cmd, str(cli_tag), value)
 
     return cmd
 
@@ -171,14 +187,9 @@ def build_docker_command(
 class LauncherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.descriptor = load_descriptor()
+        self.config = load_bilayers_config()
         self.widgets: dict[str, QWidget] = {}
         self._build_ui()
-
-    @staticmethod
-    def _is_advanced_input(inp: dict) -> bool:
-        name = str(inp.get("name", "")).strip().lower()
-        return name.startswith("(adv)")
 
     @staticmethod
     def _add_two_column_row(grid: QGridLayout, row_index: int, label: QLabel, widget: QWidget):
@@ -188,8 +199,9 @@ class LauncherWindow(QMainWindow):
         grid.addWidget(widget, row, col + 1)
 
     def _build_ui(self):
-        name = self.descriptor.get("name", "W_CIDeconvolve")
-        self.setWindowTitle(f"{name} — Launcher")
+        image = self.config.get("docker_image", {})
+        name = str(image.get("name", "W_CIDeconvolve"))
+        self.setWindowTitle(f"{name} - Bilayers Launcher")
         self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.setMinimumWidth(920)
 
@@ -198,33 +210,29 @@ class LauncherWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setSpacing(12)
 
-        # -- Header --
-        title = QLabel(name)
+        title = QLabel(f"{name} - Bilayers")
         title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         layout.addWidget(title)
 
-        desc = self.descriptor.get("description", "")
-        if desc:
-            desc_label = QLabel(desc)
-            desc_label.setWordWrap(True)
-            desc_label.setStyleSheet("color: #666; margin-bottom: 8px;")
-            layout.addWidget(desc_label)
+        desc_label = QLabel("Docker launcher generated from config.yaml.")
+        desc_label.setWordWrap(True)
+        desc_label.setStyleSheet("color: #666; margin-bottom: 8px;")
+        layout.addWidget(desc_label)
 
-        # -- Data folders with browse buttons --
         folder_group = QGroupBox("Data Folders")
         folder_layout = QFormLayout()
         folder_group.setLayout(folder_layout)
 
         self.folder_widgets: dict[str, QLineEdit] = {}
         for key, label_text, default_path in [
-            ("infolder",  "Input folder",  str(SCRIPT_DIR / "infolder")),
+            ("infolder", "Input folder", str(SCRIPT_DIR / "infolder")),
             ("outfolder", "Output folder", str(SCRIPT_DIR / "outfolder")),
         ]:
             row = QHBoxLayout()
             line = QLineEdit(default_path)
             line.setMinimumWidth(360)
             line.textChanged.connect(self._update_preview)
-            browse_btn = QPushButton("Browse…")
+            browse_btn = QPushButton("Browse...")
             browse_btn.setFixedWidth(80)
             browse_btn.clicked.connect(lambda checked, le=line: self._browse_folder(le))
             row.addWidget(line)
@@ -234,7 +242,6 @@ class LauncherWindow(QMainWindow):
 
         layout.addWidget(folder_group)
 
-        # -- Docker runtime options --
         docker_group = QGroupBox("Docker Runtime")
         docker_layout = QFormLayout()
         docker_group.setLayout(docker_layout)
@@ -243,15 +250,12 @@ class LauncherWindow(QMainWindow):
         self.use_gpus_checkbox.setChecked(True)
         self.use_gpus_checkbox.setToolTip(
             "When enabled, Docker is run with '--gpus all'. "
-            "Turn this off to test the container as if no GPU is available; "
-            "with device=auto the workflow should fall back to CPU."
+            "Turn this off to test CPU fallback behavior."
         )
         self.use_gpus_checkbox.stateChanged.connect(self._update_preview)
         docker_layout.addRow("GPU:", self.use_gpus_checkbox)
-
         layout.addWidget(docker_group)
 
-        # -- Parameters from descriptor --
         param_group = QGroupBox("Parameters")
         param_layout = QVBoxLayout()
         param_layout.setSpacing(8)
@@ -275,31 +279,28 @@ class LauncherWindow(QMainWindow):
 
         main_count = 0
         advanced_count = 0
-
-        for inp in self.descriptor.get("inputs", []):
-            if inp.get("set-by-server", False):
+        for param in self.config.get("parameters", []):
+            widget = self._create_widget(param)
+            if widget is None:
                 continue
-            widget = self._create_widget(inp)
-            if widget is not None:
-                tooltip = inp.get("description", "")
-                widget.setToolTip(tooltip)
-                label = QLabel(inp.get("name", inp["id"]))
-                label.setToolTip(tooltip)
-                label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                if self._is_advanced_input(inp):
-                    self._add_two_column_row(advanced_grid, advanced_count, label, widget)
-                    advanced_count += 1
-                else:
-                    self._add_two_column_row(main_grid, main_count, label, widget)
-                    main_count += 1
-                self.widgets[inp["id"]] = widget
+            tooltip = param.get("description", "")
+            widget.setToolTip(tooltip)
+            label = QLabel(param.get("label", param["name"]))
+            label.setToolTip(tooltip)
+            label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if param.get("mode") == "advanced":
+                self._add_two_column_row(advanced_grid, advanced_count, label, widget)
+                advanced_count += 1
+            else:
+                self._add_two_column_row(main_grid, main_count, label, widget)
+                main_count += 1
+            self.widgets[param["name"]] = widget
 
         param_layout.addWidget(main_params)
         if advanced_count:
             param_layout.addWidget(advanced_panel)
         layout.addWidget(param_group)
 
-        # -- Command preview --
         self.cmd_preview = QTextEdit()
         self.cmd_preview.setReadOnly(True)
         self.cmd_preview.setMaximumHeight(163)
@@ -308,9 +309,7 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(QLabel("Command preview:"))
         layout.addWidget(self.cmd_preview)
 
-        # -- Buttons --
         btn_layout = QHBoxLayout()
-
         restore_btn = QPushButton("Restore Last Settings")
         restore_btn.setStyleSheet("padding: 8px 16px;")
         restore_btn.setToolTip("Restore parameter values from the previous run")
@@ -348,12 +347,12 @@ class LauncherWindow(QMainWindow):
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
 
-        # Initial preview
         self._update_preview()
+        self._connect_preview_signals()
 
-        # Connect all widgets for live preview updates
-        for inp in self.descriptor.get("inputs", []):
-            w = self.widgets.get(inp["id"])
+    def _connect_preview_signals(self):
+        for param in self.config.get("parameters", []):
+            w = self.widgets.get(param["name"])
             if w is None:
                 continue
             if isinstance(w, (QSpinBox, QDoubleSpinBox)):
@@ -365,40 +364,45 @@ class LauncherWindow(QMainWindow):
             elif isinstance(w, QLineEdit):
                 w.textChanged.connect(self._update_preview)
 
-    def _create_widget(self, inp: dict) -> QWidget | None:
-        ptype = inp.get("type", "String")
-        default = inp.get("default-value")
-        choices = inp.get("value-choices")
+    def _create_widget(self, param: dict) -> QWidget | None:
+        ptype = param.get("type", "textbox")
+        default = param.get("default")
 
-        if ptype == "Boolean":
+        if ptype == "checkbox":
             toggle = ToggleSwitch()
             toggle.setChecked(bool(default))
             return toggle
 
-        if choices:
+        options = param.get("options") or []
+        if ptype == "dropdown" or options:
             combo = QComboBox()
-            combo.addItems([str(c) for c in choices])
-            if default is not None and str(default) in [str(c) for c in choices]:
-                combo.setCurrentText(str(default))
+            for option in options:
+                combo.addItem(str(option.get("label", option.get("value"))), option.get("value"))
+            if default is not None:
+                idx = combo.findData(default)
+                if idx < 0:
+                    idx = combo.findText(str(default))
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
             return combo
 
-        if ptype == "Number":
-            if inp.get("integer", False):
-                spin = QSpinBox()
-                spin.setMinimum(int(inp.get("minimum", 0)))
-                spin.setMaximum(int(inp.get("maximum", 99999)))
-                if default is not None:
-                    spin.setValue(int(default))
-            else:
-                spin = QDoubleSpinBox()
-                spin.setDecimals(8)
-                spin.setMinimum(float(inp.get("minimum", 0)))
-                spin.setMaximum(float(inp.get("maximum", 99999)))
-                if default is not None:
-                    spin.setValue(float(default))
+        if ptype in ("integer", "int"):
+            spin = QSpinBox()
+            spin.setMinimum(int(param.get("minimum", 0)))
+            spin.setMaximum(int(param.get("maximum", 999999)))
+            if default is not None:
+                spin.setValue(int(default))
             return spin
 
-        # Fallback: plain text
+        if ptype == "float":
+            spin = QDoubleSpinBox()
+            spin.setDecimals(8)
+            spin.setMinimum(float(param.get("minimum", -999999.0)))
+            spin.setMaximum(float(param.get("maximum", 999999.0)))
+            if default is not None:
+                spin.setValue(float(default))
+            return spin
+
         line = QLineEdit()
         if default is not None:
             line.setText(str(default))
@@ -406,34 +410,31 @@ class LauncherWindow(QMainWindow):
 
     def _get_values(self) -> dict:
         values = {}
-        for inp in self.descriptor.get("inputs", []):
-            w = self.widgets.get(inp["id"])
+        for param in self.config.get("parameters", []):
+            w = self.widgets.get(param["name"])
             if w is None:
                 continue
             if isinstance(w, QCheckBox):
-                values[inp["id"]] = w.isChecked()
+                values[param["name"]] = w.isChecked()
             elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
-                values[inp["id"]] = w.value()
+                values[param["name"]] = w.value()
             elif isinstance(w, QComboBox):
-                values[inp["id"]] = w.currentText()
+                data = w.currentData()
+                values[param["name"]] = data if data is not None else w.currentText()
             elif isinstance(w, QLineEdit):
-                values[inp["id"]] = w.text()
+                values[param["name"]] = w.text()
         return values
 
     def _get_folders(self) -> dict:
         return {
             "infolder": self.folder_widgets["infolder"].text(),
             "outfolder": self.folder_widgets["outfolder"].text(),
-            "gtfolder": str(SCRIPT_DIR / "gtfolder"),
         }
 
     def _get_docker_options(self) -> dict:
-        return {
-            "use_gpus": self.use_gpus_checkbox.isChecked(),
-        }
+        return {"use_gpus": self.use_gpus_checkbox.isChecked()}
 
     def _browse_folder(self, line_edit: QLineEdit):
-        """Open a folder picker and update the given QLineEdit."""
         current = line_edit.text()
         start = current if Path(current).is_dir() else str(SCRIPT_DIR)
         folder = QFileDialog.getExistingDirectory(self, "Select Folder", start)
@@ -442,47 +443,40 @@ class LauncherWindow(QMainWindow):
 
     def _update_preview(self):
         cmd = build_docker_command(
-            self.descriptor,
+            self.config,
             self._get_values(),
             self._get_folders(),
             self._get_docker_options(),
         )
         self.cmd_preview.setPlainText(" ".join(cmd))
 
-    def _save_settings(self):
-        """Persist current widget values and folders to .last_settings.json."""
-        data = {
+    def _settings_payload(self) -> dict:
+        return {
             "values": self._get_values(),
             "folders": self._get_folders(),
             "docker_options": self._get_docker_options(),
         }
+
+    def _save_settings(self):
         try:
             with open(LAST_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(self._settings_payload(), f, indent=2)
         except OSError:
             pass
 
     def _apply_settings(self, data: dict):
-        """Apply a settings dict (values + folders) to the widgets."""
-        # Restore folders
         for key, line in self.folder_widgets.items():
             saved = data.get("folders", {}).get(key)
             if saved is not None:
                 line.setText(str(saved))
 
-        # Restore Docker runtime options. Missing value defaults to GPU enabled
-        # so older settings files keep the previous launcher behavior.
         docker_options = data.get("docker_options", {})
-        if "use_gpus" in docker_options:
-            self.use_gpus_checkbox.setChecked(bool(docker_options["use_gpus"]))
-        else:
-            self.use_gpus_checkbox.setChecked(True)
+        self.use_gpus_checkbox.setChecked(bool(docker_options.get("use_gpus", True)))
 
-        # Restore parameter values
         saved_vals = data.get("values", {})
-        for inp in self.descriptor.get("inputs", []):
-            w = self.widgets.get(inp["id"])
-            val = saved_vals.get(inp["id"])
+        for param in self.config.get("parameters", []):
+            w = self.widgets.get(param["name"])
+            val = saved_vals.get(param["name"])
             if w is None or val is None:
                 continue
             if isinstance(w, QCheckBox):
@@ -492,14 +486,15 @@ class LauncherWindow(QMainWindow):
             elif isinstance(w, QSpinBox):
                 w.setValue(int(val))
             elif isinstance(w, QComboBox):
-                idx = w.findText(str(val))
+                idx = w.findData(val)
+                if idx < 0:
+                    idx = w.findText(str(val))
                 if idx >= 0:
                     w.setCurrentIndex(idx)
             elif isinstance(w, QLineEdit):
                 w.setText(str(val))
 
     def _on_restore(self):
-        """Load settings from .last_settings.json into the widgets."""
         try:
             with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -508,23 +503,15 @@ class LauncherWindow(QMainWindow):
         self._apply_settings(data)
 
     def _on_save_settings(self):
-        """Save current settings to a user-chosen JSON file."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Settings", str(SCRIPT_DIR / "settings.json"),
+            self, "Save Settings", str(SCRIPT_DIR / "launcher_settings.json"),
             "JSON files (*.json);;All files (*)",
         )
-        if not path:
-            return
-        data = {
-            "values": self._get_values(),
-            "folders": self._get_folders(),
-            "docker_options": self._get_docker_options(),
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._settings_payload(), f, indent=2)
 
     def _on_load_settings(self):
-        """Load settings from a user-chosen JSON file."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Settings", str(SCRIPT_DIR),
             "JSON files (*.json);;All files (*)",
@@ -541,7 +528,7 @@ class LauncherWindow(QMainWindow):
     def _on_run(self):
         self._save_settings()
         cmd = build_docker_command(
-            self.descriptor,
+            self.config,
             self._get_values(),
             self._get_folders(),
             self._get_docker_options(),
@@ -552,8 +539,6 @@ class LauncherWindow(QMainWindow):
         print("=" * 70 + "\n")
 
         self.close()
-
-        # Run the docker command in the current console (inherits stdin/stdout)
         subprocess.run(cmd)
 
 

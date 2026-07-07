@@ -1,0 +1,4 @@
+# Optional dependencies for strict Bilayers LinkML schema validation.
+
+linkml
+bilayers-schema @ git+https://github.com/bilayer-containers/bilayers-schema.git@3b6659cc8444e9587fa1a099c69c69e91ec96485

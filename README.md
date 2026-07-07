@@ -14,16 +14,15 @@
 
 ## Overview
 
-CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible workflow that deconvolves widefield and confocal fluorescence microscopy images. It reads OME-TIFF / OME-Zarr metadata where available, auto-generates a physically accurate PSF from the optical parameters, and applies native GPU-capable deconvolution methods.
+CIDeconvolve is a Bilayers / BIOMERO-compatible workflow that deconvolves widefield and confocal fluorescence microscopy images. It reads OME-TIFF / OME-Zarr metadata where available, auto-generates a physically accurate PSF from the optical parameters, and applies native GPU-capable deconvolution methods.
 
 **Three user-facing entry points:**
 
 | Entry point | Purpose |
 |---|---|
 | `gui_deconvolve_ci.py` | Full standalone interactive GUI — open files, configure parameters, run deconvolution, inspect results side-by-side |
-| `launcher_bilayers.py` | Docker launcher GUI backed by `bilayers.yaml` |
-| `launcher_biaflows.py` | Legacy Docker launcher GUI backed by `descriptor.json` |
-| `wrapper.py` | BIAFLOWS / BIOMERO CLI entrypoint for batch and HPC use |
+| `launcher.py` | Docker launcher GUI backed by Bilayers `config.yaml` |
+| `wrapper.py` | Bilayers / BIOMERO CLI entrypoint for batch and HPC use |
 
 ---
 
@@ -79,7 +78,7 @@ The title bar shows the detected PyTorch version and GPU (e.g. `CI Deconvolve �
 
 #### GUI-only command-line flags
 
-These flags are understood only by `gui_deconvolve_ci.py` and are **not** part of `descriptor.json` or `wrapper.py`.
+These flags are understood only by `gui_deconvolve_ci.py` and are **not** part of `config.yaml` or `wrapper.py`.
 
 | Flag | Effect |
 |---|---|
@@ -300,7 +299,6 @@ pip install -r requirements_gui.txt
 python wrapper.py \
     --infolder ./infolder \
     --outfolder ./outfolder \
-    --gtfolder ./gtfolder \
     --method ci_rl --iterations 40
 ```
 
@@ -317,7 +315,7 @@ See [metrics.md](docs/metrics.md) for metric formulas and interpretation.
 
 ### Parameters
 
-The public CLI parameters are defined in `descriptor.json` and exposed via `wrapper.py`:
+The public CLI parameters are defined in `config.yaml` and exposed via `wrapper.py`:
 
 #### Core parameters
 
@@ -392,7 +390,7 @@ OME-TIFF output.
 
 ```bash
 python wrapper.py \
-    --infolder ./infolder --outfolder ./outfolder --gtfolder ./gtfolder \
+    --infolder ./infolder --outfolder ./outfolder \
     --method ci_rl --iterations 50 \
     --output_format ome-zarr --streaming always
 ```
@@ -405,8 +403,7 @@ streaming implementation keeps the full Z extent per tile to avoid axial
 boundary artefacts.
 
 `--streaming auto` enables this path when the estimated full source array
-exceeds `--streaming_threshold_gb`.  Choosing `--output_format ome-zarr` also
-uses the streaming writer directly.  Streaming output currently writes full Z
+exceeds `--streaming_threshold_gb`.  Streaming output currently writes full Z
 data, so use `--projection none` with OME-Zarr streaming.
 
 ---
@@ -419,7 +416,31 @@ data, so use `--projection none` with OME-Zarr streaming.
 docker build -t w_cideconvolve:v1.5.0 -t w_cideconvolve:latest .
 ```
 
-The Dockerfile builds on the **NVIDIA CUDA 12.6 runtime** base image with Python 3.11 — no Java, no conda, no compilation step.
+On Windows you can use:
+
+```powershell
+.\builddocker.cmd
+```
+
+To also build the optional Bilayers Gradio or Jupyter images:
+
+```powershell
+.\builddocker_gradio.cmd
+.\builddocker_jupyter.cmd
+```
+
+This creates the standard headless tags plus separate interface tags:
+
+```text
+w_cideconvolve:<version>
+w_cideconvolve:latest
+w_cideconvolve:<version>-gradio
+w_cideconvolve:latest-gradio
+w_cideconvolve:<version>-jupyter
+w_cideconvolve:latest-jupyter
+```
+
+The headless Dockerfile builds on Python 3.11 — no Java, no conda, no compilation step. Interface images are intentionally separate and larger because they add the Bilayers interface generator and the relevant UI runtime.
 
 **Prerequisites:**
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) for GPU pass-through
@@ -431,9 +452,8 @@ The Dockerfile builds on the **NVIDIA CUDA 12.6 runtime** base image with Python
 docker run --rm --gpus all \
     -v /path/to/input:/data/in \
     -v /path/to/output:/data/out \
-    -v /tmp/gt:/data/gt \
     cellularimagingcf/w_cideconvolve \
-    --infolder /data/in --outfolder /data/out --gtfolder /data/gt \
+    --infolder /data/in --outfolder /data/out \
     --method ci_rl --iterations 40
 ```
 
@@ -441,15 +461,59 @@ Omit `--gpus all` to force CPU-only execution.
 
 By default, image metadata (NA, wavelengths, pixel sizes, microscope type, pinhole, refractive indices) is used where present; CLI values are fallbacks.  Pass `--overrule_image_metadata True` to force the CLI values.
 
+### Bilayers Gradio image
+
+The optional Gradio image follows the Bilayers convention of a separate interface-specific tag. It starts a web UI by default:
+
+```bash
+docker run --rm --gpus all -p 7878:7878 cellularimagingcf/w_cideconvolve:<version>-gradio
+```
+
+Open `http://localhost:7878`. Gradio uploads are copied into the container and outputs can be downloaded from the UI, so a volume mount is optional. For large data or persistent output storage, mount the same folders used by the headless workflow:
+
+```bash
+docker run --rm --gpus all -p 7878:7878 \
+    -v /path/to/input:/data/in \
+    -v /path/to/output:/data/out \
+    cellularimagingcf/w_cideconvolve:<version>-gradio
+```
+
+### Bilayers Jupyter image
+
+The optional Jupyter image follows the same Bilayers interface-tag convention. Jupyter needs a volume mount when you want notebooks, inputs, or outputs to persist outside the container:
+
+```bash
+docker run --rm --gpus all -p 8888:8888 \
+    -v /path/to/input:/data/in \
+    -v /path/to/output:/data/out \
+    cellularimagingcf/w_cideconvolve:<version>-jupyter
+```
+
+Open `http://localhost:8888`. The generated notebook is available in the Jupyter file browser as `cideconvolve_bilayers.ipynb`.
+
+### Bilayers config validation
+
+The local helper validates `config.yaml` without requiring the full Bilayers toolchain:
+
+```bash
+python bilayers_cli.py validate
+```
+
+For upstream LinkML schema validation, install the optional validation dependencies and run strict mode:
+
+```bash
+pip install -r requirements_bilayers_validation.txt
+python bilayers_cli.py validate --strict
+```
+
 ### Docker benchmark mode
 
 ```bash
 docker run --rm --gpus all \
     -v /path/to/input:/data/in \
     -v /path/to/output:/data/out \
-    -v /tmp/gt:/data/gt \
     cellularimagingcf/w_cideconvolve \
-    --infolder /data/in --outfolder /data/out --gtfolder /data/gt \
+    --infolder /data/in --outfolder /data/out \
     --benchmark True --bench_crop True --compute_metrics True
 ```
 
@@ -473,7 +537,7 @@ docker run --rm --gpus all \
    job_gres=gpu:2g.24gb
    ```
 
-2. BIOMERO reads **`descriptor.json`** from the container to discover input parameters (method, iterations, device, PSF settings, benchmark options, etc.) and presents them in the OMERO web UI.
+2. BIOMERO reads **`config.yaml`** to discover input parameters (method, iterations, device, PSF settings, benchmark options, etc.) and presents them in the OMERO web UI.
 
 3. On submission, BIOMERO pulls the Singularity image from Docker Hub, transfers the selected images, and executes the workflow on the cluster.
 
@@ -485,19 +549,19 @@ docker run --rm --gpus all \
 
 ---
 
-## Launcher — Docker GUI (`launcher_bilayers.py`)
+## Launcher — Docker GUI (`launcher.py`)
 
 ![Launcher](docs/screenshots/launcher.png)
 
-The Bilayers launcher provides a graphical interface that reads `bilayers.yaml` at runtime, builds a matching parameter form, and generates / executes a `docker run` command — no command-line knowledge required.
+The Bilayers launcher provides a graphical interface that reads `config.yaml` at runtime, builds a matching parameter form, and generates / executes a `docker run` command — no command-line knowledge required.
 
 ```bash
-python launcher_bilayers.py
+python launcher.py
 ```
 
 ### Layout
 
-1. **Header** — workflow name from `bilayers.yaml`
+1. **Header** — workflow name from `config.yaml`
 2. **Data Folders** — input / output folder pickers with Browse… buttons
 3. **Docker Runtime** — GPU toggle (`--gpus all`, enabled by default)
 4. **Parameters** — two-column grid of all essential parameters with an expandable **Advanced** section for less-common settings
@@ -506,7 +570,7 @@ python launcher_bilayers.py
 
 ### Widget types
 
-| Descriptor type | Widget |
+| Bilayers type | Widget |
 |---|---|
 | Boolean | Pill toggle switch (grey / green) |
 | String with choices | `QComboBox` |
@@ -516,7 +580,7 @@ python launcher_bilayers.py
 
 ### Settings persistence
 
-Saved to `.last_settings.json` in the script directory (stores `values`, `folders`, `docker_options`).  **Restore Last Settings** reloads them on the next launch.
+Saved to `.last_launcher_settings.json` in the script directory (stores `values`, `folders`, `docker_options`).  **Restore Last Settings** reloads them on the next launch.
 
 ---
 
@@ -547,17 +611,21 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 |------|---------|
 | `gui_deconvolve_ci.py` | Standalone interactive deconvolution GUI |
 | `ci_dual_viewer.py` | Synchronized dual-pane XYZT / 3D viewer widget |
-| `launcher_bilayers.py` | Docker launcher GUI backed by `bilayers.yaml` |
-| `launcher_biaflows.py` | Legacy Docker launcher GUI backed by `descriptor.json` |
-| `wrapper.py` | BIAFLOWS / BIOMERO CLI entrypoint, benchmark runner, metrics |
+| `launcher.py` | Docker launcher GUI backed by Bilayers `config.yaml` |
+| `wrapper.py` | Bilayers / BIOMERO CLI entrypoint, benchmark runner, metrics |
 | `deconvolve.py` | High-level pipeline: image loading, metadata extraction, PSF sizing, dispatch |
 | `deconvolve_ci.py` | Core PyTorch engine: SHB-RL, RLTV, sparse-Hessian, PSF generation, tiling |
-| `descriptor.json` | BIAFLOWS / BIOMERO parameter descriptor (single source of truth) |
-| `biaflows_cli.py` | Local BIAFLOWS compatibility shim |
-| `Dockerfile` | Docker build (NVIDIA CUDA 12.6 runtime + Python 3.11) |
+| `config.yaml` | Bilayers / BIOMERO parameter configuration |
+| `bilayers_cli.py` | Bilayers CLI helper and wrapper argument parser |
+| `Dockerfile` | Headless Docker build for BIOMERO and batch workflows |
+| `Dockerfile.gradio` | Optional Bilayers Gradio Docker image built from the headless image |
+| `Dockerfile.jupyter` | Optional Bilayers Jupyter Docker image built from the headless image |
 | `requirements.txt` | Python dependencies (local install) |
 | `requirements_gui.txt` | Python dependencies for GUI features |
 | `requirements_docker.txt` | Python dependencies (Docker image) |
+| `requirements_gradio.txt` | Extra dependencies for the optional Gradio image |
+| `requirements_jupyter.txt` | Extra dependencies for the optional Jupyter image |
+| `requirements_bilayers_validation.txt` | Optional strict LinkML validation dependencies |
 | `version.txt` | Project version marker |
 
 ---
@@ -568,7 +636,6 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 - **TV Regularisation:** Dey, N. et al. (2006). "Richardson-Lucy Algorithm With Total Variation Regularization for 3D Confocal Microscope Deconvolution." *Microsc. Res. Tech.* **69**(4), 260–266.
 - **Content-Aware Image Restoration:** Weigert, M. et al. (2018). "Content-aware image restoration: pushing the limits of fluorescence microscopy." *Nat Methods* **15**, 1090–1097. [doi:10.1038/s41592-018-0216-7](https://doi.org/10.1038/s41592-018-0216-7)
 - **BIOMERO:** Luik, T. T., Rosas-Bertolini, R., Reits, E. A. J., Hoebe, R. A. & Krawczyk, P. M. (2024). "BIOMERO: A scalable and extensible image analysis framework." *Patterns* **5**(8), 101024. [doi:10.1016/j.patter.2024.101024](https://doi.org/10.1016/j.patter.2024.101024) · [GitHub](https://github.com/NL-BioImaging/biomero) · [Documentation](https://nl-bioimaging.github.io/biomero/)
-- **BIAFLOWS:** Rubens, U. et al. (2020). "BIAFLOWS: A Collaborative Framework to Reproducibly Deploy and Benchmark Bioimage Analysis Workflows." *Patterns* **1**(3), 100040. [doi:10.1016/j.patter.2020.100040](https://doi.org/10.1016/j.patter.2020.100040)
 - **Gibson-Lanni model:** Gibson, S. F. & Lanni, F. (1992). [doi:10.1364/JOSAA.9.000154](https://doi.org/10.1364/JOSAA.9.000154)
 - **PSF Generator:** Kirshner, H. et al. — [EPFL PSF Generator](https://bigwww.epfl.ch/algorithms/psfgenerator/)
 - **OMERO:** Allan, C. et al. (2012). "OMERO: flexible, model-driven data management for experimental biology." *Nat Methods* **9**, 245–253. [doi:10.1038/nmeth.1896](https://doi.org/10.1038/nmeth.1896)

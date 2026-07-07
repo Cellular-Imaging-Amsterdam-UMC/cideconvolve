@@ -1,7 +1,14 @@
 import json
+import sys
 from argparse import Namespace
+from pathlib import Path
 
 import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+CLI_SRC = ROOT / "src"
+if str(CLI_SRC) not in sys.path:
+    sys.path.insert(0, str(CLI_SRC))
 
 from ci_deconvolve import __version__
 from ci_deconvolve.cli import _apply_projection, _write_manifest
@@ -9,7 +16,7 @@ from core.ome_zarr_io import _result_to_tczyx, save_result_ome_zarr
 
 
 def test_version_matches_cli_contract():
-    assert __version__ == "0.2.0"
+    assert __version__ == (ROOT / "version.txt").read_text(encoding="utf-8").strip()
 
 
 def test_result_to_tczyx_preserves_time_series_3d():
@@ -60,7 +67,7 @@ def test_write_manifest(tmp_path):
 
     manifest = json.loads((tmp_path / "ci_deconvolve_manifest.json").read_text())
 
-    assert manifest["ci_deconvolve_version"] == "0.2.0"
+    assert manifest["ci_deconvolve_version"] == (ROOT / "version.txt").read_text(encoding="utf-8").strip()
     assert manifest["output_format"] == "ome-zarr"
     assert manifest["records"][0]["status"] == "success"
 
@@ -82,5 +89,5 @@ def test_ome_zarr_pyramid_scales_xy_pixel_sizes(tmp_path):
     datasets = attrs["multiscales"][0]["datasets"]
 
     assert [dataset["path"] for dataset in datasets] == ["0", "1", "2"]
-    assert datasets[0]["coordinateTransformations"][0]["scale"] == [1.0, 1.0, 0.5, 0.2, 0.1]
-    assert datasets[1]["coordinateTransformations"][0]["scale"] == [1.0, 1.0, 0.5, 0.4, 0.2]
+    assert datasets[0]["coordinateTransformations"][0]["scale"] == [1.0, 0.5, 0.2, 0.1]
+    assert datasets[1]["coordinateTransformations"][0]["scale"] == [1.0, 0.5, 0.4, 0.2]

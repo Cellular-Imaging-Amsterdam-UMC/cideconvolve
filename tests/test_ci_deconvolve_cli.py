@@ -186,7 +186,7 @@ def test_save_result_ome_zarr_smoke(tmp_path):
 
     path = tmp_path / "out.ome.zarr"
     result = {
-        "channels": [np.ones((1, 8, 9), dtype=np.float32)],
+        "channels": [np.arange(72, dtype=np.float32).reshape(1, 8, 9)],
         "metadata": {
             "pixel_size_x": 0.12,
             "pixel_size_y": 0.12,
@@ -219,6 +219,9 @@ def test_save_result_ome_zarr_smoke(tmp_path):
     ]
     assert attrs["omero"]["channels"][0]["label"] == "CH1"
     assert attrs["omero"]["channels"][0]["color"] == "FF0000"
+    assert attrs["omero"]["channels"][0]["window"]["min"] == 0.0
+    assert attrs["omero"]["channels"][0]["window"]["max"] == 71.0
+    assert attrs["omero"]["channels"][0]["window"]["end"] > 1.0
     assert attrs["_creator"]["physical_pixel_sizes_um"] == {"x": 0.12, "y": 0.12, "z": 0.5}
     assert attrs["cideconvolve"]["streaming"] is False
 

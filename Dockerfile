@@ -1,13 +1,12 @@
 # ===========================================================================
-# CIDeconvolve — BIAFLOWS-compatible GPU-enabled Docker image
+# CIDeconvolve — Bilayers-compatible GPU-enabled Docker image
 # ===========================================================================
 # Base: Python slim. GPU support comes from the CUDA-enabled PyTorch wheel
 # plus the host NVIDIA driver mounted by NVIDIA Container Toolkit.
 #
-# BIAFLOWS convention: images in /data/in, results in /data/out,
-# ground truth in /data/gt.  The entrypoint is wrapper.py which
-# parses --infolder / --outfolder / --gtfolder and descriptor.json
-# parameters, then delegates to deconvolve.py.
+# Bilayers convention: images in /data/in and results in /data/out.
+# The entrypoint is wrapper.py, which parses parameters from config.yaml
+# and then delegates to deconvolve.py.
 # ===========================================================================
 
 FROM python:3.11-slim-bookworm
@@ -33,15 +32,14 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install --no-compile -r requirements_docker.txt
 
 # --- Application code ---
+COPY cideconvolve_io/ /app/cideconvolve_io/
 COPY core/ /app/core/
-COPY biaflows_cli.py /app/biaflows_cli.py
 COPY wrapper.py /app/wrapper.py
-COPY descriptor.json /app/descriptor.json
 COPY bilayers_cli.py /app/bilayers_cli.py
-COPY bilayers.yaml /app/bilayers.yaml
+COPY config.yaml /app/config.yaml
 
-# --- BIAFLOWS data directories ---
-RUN mkdir -p /data/in /data/out /data/gt
+# --- Bilayers data directories ---
+RUN mkdir -p /data/in /data/out
 
 # Expose NVIDIA GPU
 ENV NVIDIA_VISIBLE_DEVICES=all

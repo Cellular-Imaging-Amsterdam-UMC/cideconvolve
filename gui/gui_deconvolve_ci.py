@@ -5222,37 +5222,18 @@ def _deconvolve_channel_stacks(
 
 
 def _write_ome_tiff(data: np.ndarray, path: str, metadata: dict) -> None:
-    from core.streaming import TiledOmeTiffSink
+    from cideconvolve_io.ome_tiff_io import write_tczyx_ome_tiff
 
-    arr = np.asarray(data, dtype=np.float32)
-    if arr.ndim != 5:
-        raise ValueError(f"Expected TCZYX data for OME-TIFF export, got {arr.shape}")
     meta = dict(metadata or {})
-    meta.setdefault("channel_names", _current_channel_names(meta, arr.shape[1]))
-    sink = TiledOmeTiffSink(
+    arr = np.asarray(data, dtype=np.float32)
+    meta.setdefault("channel_names", _current_channel_names(meta, arr.shape[1] if arr.ndim == 5 else 0))
+    write_tczyx_ome_tiff(
+        arr,
         path,
-        shape=tuple(int(v) for v in arr.shape),
         metadata=meta,
         levels=1,
         compression="lzw",
     )
-    try:
-        for t in range(arr.shape[0]):
-            for c in range(arr.shape[1]):
-                sink.write_tile(
-                    t=t,
-                    c=c,
-                    z=slice(0, arr.shape[2]),
-                    y=slice(0, arr.shape[3]),
-                    x=slice(0, arr.shape[4]),
-                    data=arr[t, c],
-                )
-        sink.build_pyramids()
-        sink.validate()
-        sink.close()
-    except Exception:
-        sink.abort()
-        raise
 
 
 def _write_ome_zarr(data: np.ndarray, path: str | Path, metadata: dict) -> None:

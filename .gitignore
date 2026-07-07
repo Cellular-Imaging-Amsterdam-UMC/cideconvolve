@@ -68,3 +68,7 @@ standalone/
 
 # Local BIOMERO / Slurm debug logs
 slurm_logs/
+
+# Local launcher settings
+.last_launcher_settings.json
+launcher_settings.json

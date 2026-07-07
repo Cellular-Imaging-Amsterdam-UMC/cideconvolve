@@ -9,6 +9,10 @@ set "IMAGE_NAME=w_cideconvolve"
 
 REM Read version from version.txt
 set /p VERSION=<"%REPO_ROOT%\version.txt"
+if not defined VERSION (
+    echo ERROR: version.txt is empty or missing
+    exit /b 1
+)
 
 pushd "%REPO_ROOT%" >nul
 if errorlevel 1 (
@@ -16,7 +20,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Building headless %IMAGE_NAME%:%VERSION% and %IMAGE_NAME%:latest
 docker build -t %IMAGE_NAME%:%VERSION% -t %IMAGE_NAME%:latest %* .
+if errorlevel 1 (
+    popd >nul
+    endlocal & exit /b 1
+)
+
+echo Building Jupyter %IMAGE_NAME%:%VERSION%-jupyter and %IMAGE_NAME%:latest-jupyter
+docker build ^
+    -f Dockerfile.jupyter ^
+    --build-arg BASE_IMAGE=%IMAGE_NAME%:%VERSION% ^
+    -t %IMAGE_NAME%:%VERSION%-jupyter ^
+    -t %IMAGE_NAME%:latest-jupyter ^
+    %* .
 set "EXITCODE=%ERRORLEVEL%"
 
 popd >nul

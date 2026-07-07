@@ -1,16 +1,15 @@
 ﻿"""
-wrapper.py - BIAFLOWS-compatible entrypoint for CIDeconvolve.
+wrapper.py - Bilayers-compatible entrypoint for CIDeconvolve.
 
-Parses BIAFLOWS job parameters (--infolder, --outfolder, --gtfolder, etc.)
-via biaflows_cli, then processes each input image through the CI
-deconvolution pipeline in deconvolve.py and writes results to the output
-folder.
+Parses Bilayers workflow parameters from config.yaml, then processes each
+input image through the CI deconvolution pipeline in deconvolve.py and writes
+results to the output folder.
 
 Usage (inside Docker):
-    python wrapper.py --infolder /data/in --outfolder /data/out --gtfolder /data/gt --local
+    python wrapper.py --infolder /data/in --outfolder /data/out --local
 
 Usage (local):
-    python wrapper.py --infolder ./infolder --outfolder ./outfolder --gtfolder ./gtfolder --local --iterations "40" --method ci_rl
+    python wrapper.py --infolder ./infolder --outfolder ./outfolder --local --iterations "40" --method ci_rl
 """
 import csv
 import logging
@@ -32,11 +31,9 @@ logging.basicConfig(
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from biaflows_cli import (
-    CLASS_SPTCNT,
-    BiaflowsJob,
-    get_discipline,
-    prepare_data,
+from bilayers_cli import (
+    BilayersJob,
+    prepare_bilayers_data,
     resolve_workflow_parameters,
 )
 
@@ -1399,8 +1396,8 @@ def _run_streaming_regular_image(
 
 
 def main(argv):
-    with BiaflowsJob.from_cli(argv) as bj:
-        run_params = resolve_workflow_parameters(getattr(bj, "parameters", None))
+    with BilayersJob.from_cli(argv) as job:
+        run_params = resolve_workflow_parameters(getattr(job, "parameters", None))
         niter_list = run_params.niter_list
         method = run_params.method
         device_param = run_params.device_param
@@ -1457,12 +1454,12 @@ def main(argv):
         two_d_wf_bg_scale = run_params.two_d_wf_bg_scale
 
         print("=" * 70)
-        print("CIDeconvolve - BIAFLOWS Workflow")
+        print("CIDeconvolve - Bilayers Workflow")
         print("=" * 70)
         _print_runtime_environment()
         print("\nRun configuration")
-        print(f"  Input dir    : {bj.input_dir}")
-        print(f"  Output dir   : {bj.output_dir}")
+        print(f"  Input dir    : {job.input_dir}")
+        print(f"  Output dir   : {job.output_dir}")
         print(f"  Method       : {method}")
         print(f"  Iterations   : {', '.join(str(n) for n in niter_list)}")
         print(f"  Device       : {device_param}")
@@ -1494,15 +1491,13 @@ def main(argv):
             print(f"  Pinhole      : {_format_float_list(pinhole_airy)} AU")
             print(f"  Pixel size   : XY={px_xy_nm:g} nm  Z={px_z_nm:g} nm")
         else:
-            print("  Metadata params: descriptor values used only where image metadata is missing")
+            print("  Metadata params: Bilayers values used only where image metadata is missing")
         if benchmark:
             print(f"  Benchmark    : ON (crop={bench_crop})")
         print(f"  Image metrics: {'ON' if compute_metrics else 'OFF'}")
 
         # Prepare data directories and collect input images
-        in_imgs, _, in_path, _, out_path, tmp_path = prepare_data(
-            get_discipline(bj, default=CLASS_SPTCNT), bj, is_2d=False, **bj.flags
-        )
+        in_imgs, in_path, out_path, tmp_path = prepare_bilayers_data(job)
 
         if not in_imgs:
             print("CIDeconvolve workflow failed: no input images found.")
@@ -2547,7 +2542,7 @@ def _run_benchmark(
     tmp_dir = out_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Derive iteration tag and label from descriptor iterations
+    # Derive iteration tag and label from Bilayers iteration settings
     if len(set(niter_list)) == 1:
         nit_tag = str(niter_list[0])
         nit_label = str(niter_list[0])

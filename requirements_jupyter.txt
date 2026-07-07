@@ -1,0 +1,7 @@
+# Additional dependencies for the optional Bilayers Jupyter image.
+# The headless Docker image intentionally does not install these.
+
+notebook>=7,<8
+jupyterlab>=4,<5
+bilayers[jupyter] @ git+https://github.com/bilayer-containers/bilayers.git@a33af22732c81f1ac6f0d2f3e3bce4b26116b317
+bilayers-schema @ git+https://github.com/bilayer-containers/bilayers-schema.git@3b6659cc8444e9587fa1a099c69c69e91ec96485

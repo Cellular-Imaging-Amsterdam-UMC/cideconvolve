@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ci-deconvolve"
-version = "0.2.1"
+dynamic = ["version"]
 description = "Focused command-line CI-RL deconvolution for OME-TIFF and OME-Zarr images."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -39,8 +39,11 @@ dev = ["pytest", "build", "twine"]
 ci_deconvolve = "ci_deconvolve.cli:main"
 
 [tool.setuptools]
-packages = ["ci_deconvolve", "core"]
-package-dir = { "ci_deconvolve" = "src/ci_deconvolve", "core" = "src/core" }
+packages = ["ci_deconvolve", "core", "cideconvolve_io"]
+package-dir = { "ci_deconvolve" = "src/ci_deconvolve", "core" = "src/core", "cideconvolve_io" = "../cideconvolve_io" }
+
+[tool.setuptools.dynamic]
+version = { file = "version.txt" }
 
 [tool.ruff]
 line-length = 100

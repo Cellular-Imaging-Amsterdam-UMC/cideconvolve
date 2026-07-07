@@ -1,8 +1,8 @@
-from biaflows_cli import BiaflowsJob, resolve_workflow_parameters
+from bilayers_cli import BilayersJob, resolve_workflow_parameters
 
 
-def test_parameters_json_overrides_descriptor_defaults() -> None:
-    job = BiaflowsJob.from_cli([
+def test_parameters_json_overrides_bilayers_defaults() -> None:
+    job = BilayersJob.from_cli([
         "--parameters",
         '{"iterations":"7","method":"ci_rl_tv","benchmark":true}',
     ])
@@ -15,7 +15,7 @@ def test_parameters_json_overrides_descriptor_defaults() -> None:
 
 
 def test_explicit_cli_overrides_parameters_json() -> None:
-    job = BiaflowsJob.from_cli([
+    job = BilayersJob.from_cli([
         "--parameters",
         '{"iterations":"7","method":"ci_rl_tv","benchmark":true}',
         "--method",

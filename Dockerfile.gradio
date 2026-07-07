@@ -1,0 +1,42 @@
+# ===========================================================================
+# CIDeconvolve — optional Bilayers Gradio Docker image
+# ===========================================================================
+# Build this image after the headless image. It follows the Bilayers convention
+# of publishing a separate interface-specific tag, for example:
+#
+#   w_cideconvolve:v3.0.0-beta2-gradio
+#   w_cideconvolve:latest-gradio
+#
+# The base image remains the headless workflow image used by BIOMERO and batch
+# runs. This image starts the generated Gradio interface by default.
+# ===========================================================================
+
+ARG BASE_IMAGE=w_cideconvolve:latest
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# pip needs git for installing the current Bilayers package from GitHub.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements_gradio.txt /app/requirements_gradio.txt
+RUN python -m pip install --no-compile -r /app/requirements_gradio.txt
+
+COPY docker/prepare_bilayers_interface.py /app/docker/prepare_bilayers_interface.py
+RUN python /app/docker/prepare_bilayers_interface.py \
+        --config /app/config.yaml \
+        --workdir /app \
+        --interface gradio \
+        --output /app/gradio_app.py
+
+ENV GRADIO_SERVER_NAME=0.0.0.0
+ENV GRADIO_SERVER_PORT=7878
+ENV GRADIO_SHARE=false
+
+EXPOSE 7878
+
+ENTRYPOINT ["python", "/app/gradio_app.py"]

@@ -1,0 +1,6 @@
+# Additional dependencies for the optional Bilayers Gradio image.
+# The headless Docker image intentionally does not install these.
+
+gradio>=4.44,<6
+bilayers[gradio] @ git+https://github.com/bilayer-containers/bilayers.git@a33af22732c81f1ac6f0d2f3e3bce4b26116b317
+bilayers-schema @ git+https://github.com/bilayer-containers/bilayers-schema.git@3b6659cc8444e9587fa1a099c69c69e91ec96485

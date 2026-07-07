@@ -1,5 +1,5 @@
 # ===========================================================================
-# Dependencies for the local GUI (gui_deconvolve_ci.py + launcher_bilayers.py)
+# Dependencies for the local GUI (gui_deconvolve_ci.py + launcher.py)
 # Python 3.11 recommended!!
 # ===========================================================================
 

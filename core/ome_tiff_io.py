@@ -1,8 +1,8 @@
-"""Compatibility shim for shared CIDeconvolve streaming I/O helpers."""
+"""Compatibility shim for shared CIDeconvolve OME-TIFF helpers."""
 
 from __future__ import annotations
 
-from cideconvolve_io import streaming as _impl
+from cideconvolve_io import ome_tiff_io as _impl
 
 globals().update({
     name: getattr(_impl, name)
