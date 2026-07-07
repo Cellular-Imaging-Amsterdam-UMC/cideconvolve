@@ -70,5 +70,9 @@ standalone/
 slurm_logs/
 
 # Local launcher settings
+.last_settings.json
 .last_launcher_settings.json
+.last_bilayers_settings.json
 launcher_settings.json
+gui/.last_settings.json
+gui/.gui_deconvolve_state.json

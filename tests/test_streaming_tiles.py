@@ -210,6 +210,13 @@ def test_zarr_pyramid_sink_writes_multiscales_when_zarr_available(tmp_path: Path
     assert root.attrs["_creator"]["physical_pixel_sizes_um"]["x"] == 0.45499
     assert root.attrs["cideconvolve"]["physical_pixel_sizes_um"]["z"] == 1.25
     assert root.attrs["cideconvolve"]["metadata"]["pixel_size_x"] == 0.45499
+    ome_xml = (tmp_path / "out.ome.zarr" / "OME" / "METADATA.ome.xml").read_text(encoding="utf-8")
+    assert 'PhysicalSizeX="0.45499"' in ome_xml
+    assert 'PhysicalSizeY="0.45499"' in ome_xml
+    assert 'PhysicalSizeZ="1.25"' in ome_xml
+    assert 'SizeX="34"' in ome_xml
+    assert 'SizeY="32"' in ome_xml
+    assert 'SizeZ="1"' in ome_xml
     source = ZarrRegionSource(tmp_path / "out.ome.zarr")
     assert source.metadata["channels"][0]["color"] == (255, 0, 0)
     assert source.metadata["channels"][0]["window_start"] == 12.0

@@ -169,8 +169,10 @@ Commas and semicolons are both accepted.
 ### OME-Zarr Compatibility
 
 OME-Zarr output is written as OME-NGFF 0.4 on Zarr v2, with `.zgroup` and
-`.zattrs` metadata plus OMERO channel display metadata. This layout is intended
-to open in QuPath 0.7 and remain compatible with OMERO tooling.
+`.zattrs` metadata, OMERO channel display metadata, and
+`OME/METADATA.ome.xml` for Bio-Formats/QuPath readers that prefer OME-XML
+metadata. This layout is intended to open in QuPath 0.7 and remain compatible
+with OMERO tooling.
 
 ### 2D Widefield Options
 

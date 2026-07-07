@@ -5,8 +5,8 @@
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
-| **Version** | v2.2.0 |
-| **Container type** | Singularity (pulled from Docker Hub) |
+| **Version** | v3.0.0 |
+| **Container type** | Docker image; BIOMERO/HPC deployments can pull or convert it to Singularity / Apptainer |
 | **Methods** | `ci_rl` · `ci_rl_tv` · `ci_sparse_hessian` |
 | **Benchmark** | built-in with timing metrics CSV and MIP montages |
 
@@ -322,12 +322,12 @@ The public CLI parameters are defined in `config.yaml` and exposed via `wrapper.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--method` | `ci_rl` | `ci_rl`, `ci_rl_tv`, or `ci_sparse_hessian` |
-| `--iterations` | `150` | RL iterations; comma-separated for per-channel |
+| `--iterations` | `60` | RL iterations; comma-separated for per-channel |
 | `--convergence` | `auto` | Early stopping: `auto` or fixed iteration count: `fixed` |
 | `--rel_threshold` | `0.005` | Relative I-divergence change threshold for early stopping |
 | `--device` | `auto` | `auto`, `cpu`, or `cuda` |
 | `--projection` | `none` | Z-projection: `none`, `mip`, or `sum` |
-| `--output_format` | `ome-tiff` | `ome-tiff` for eager saves; `ome-zarr` forces streamed chunked output with pyramids |
+| `--output_format` | `ome-zarr` | `ome-tiff` for eager saves; `ome-zarr` writes chunked output with pyramids |
 | `--streaming` | `auto` | `auto`, `always`, or `never`; auto enables region reads above `--streaming_threshold_gb` |
 | `--streaming_threshold_gb` | `2.0` | Estimated full source-array size that triggers streaming auto mode |
 | `--scene` | `auto` | Optional BioIO scene index/name for multi-scene files |
@@ -359,9 +359,9 @@ The public CLI parameters are defined in `config.yaml` and exposed via `wrapper.
 | `--start` | `auto` | Initial estimate: `auto`, `flat`, `percentile_flat`, `observed`, `observed_bgsub`, `lowpass`, `lowpass_bgsub`, or `hybrid` |
 | `--background` | `auto` | Background subtraction: `auto`, numeric, or `0` to disable |
 | `--two_d_mode` | `auto` | 2D widefield mode: `auto` (widefield-aware PSF) or `legacy_2d` |
-| `--two_d_wf_aggressiveness` | `0.6` | PSF collapse aggressiveness for 2D widefield auto mode |
-| `--two_d_wf_bg_radius_um` | `2.0` | Background estimator radius in µm |
-| `--two_d_wf_bg_scale` | `0.75` | Background estimator scale factor |
+| `--two_d_wf_aggressiveness` | `Balanced` | PSF collapse aggressiveness preset for 2D widefield auto mode |
+| `--two_d_wf_bg_radius_um` | `0.5` | Background estimator radius in µm |
+| `--two_d_wf_bg_scale` | `1.0` | Background estimator scale factor |
 
 #### Sparse-Hessian
 
@@ -413,7 +413,7 @@ data, so use `--projection none` with OME-Zarr streaming.
 ### Building locally
 
 ```bash
-docker build -t w_cideconvolve:v1.5.0 -t w_cideconvolve:latest .
+docker build -t w_cideconvolve:<version> -t w_cideconvolve:latest .
 ```
 
 On Windows you can use:
@@ -592,7 +592,7 @@ When `--overrule_image_metadata false` (default), image metadata wins and CLI va
 
 Batch and streaming writers preserve metadata in the output:
 
-- **OME-Zarr:** OME-NGFF 0.4 multiscales on Zarr v2, with physical pixel-size coordinate transforms; OMERO channel labels, colors, active state, and contrast windows; CIDeconvolve/source metadata in the root `cideconvolve` attribute. This layout targets QuPath 0.7 and OMERO compatibility.
+- **OME-Zarr:** OME-NGFF 0.4 multiscales on Zarr v2, with physical pixel-size coordinate transforms; OMERO channel labels, colors, active state, and contrast windows; CIDeconvolve/source metadata in the root `cideconvolve` attribute; and `OME/METADATA.ome.xml` for Bio-Formats/QuPath readers that prefer OME-XML metadata. This layout targets QuPath 0.7 and OMERO compatibility.
 - **OME-TIFF:** OME-XML physical pixel sizes, channel names, channel colors, and emission wavelengths where available; full CIDeconvolve/source metadata in private TIFF tag `65000`.
 
 Confocal pinhole diameters in the metadata are converted to Airy disk units as:
@@ -613,6 +613,7 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 | `ci_dual_viewer.py` | Synchronized dual-pane XYZT / 3D viewer widget |
 | `launcher.py` | Docker launcher GUI backed by Bilayers `config.yaml` |
 | `wrapper.py` | Bilayers / BIOMERO CLI entrypoint, benchmark runner, metrics |
+| `cideconvolve_io/` | Shared OME-Zarr, OME-TIFF, metadata, and streaming I/O used by GUI, wrapper, Docker, and the focused CLI package |
 | `deconvolve.py` | High-level pipeline: image loading, metadata extraction, PSF sizing, dispatch |
 | `deconvolve_ci.py` | Core PyTorch engine: SHB-RL, RLTV, sparse-Hessian, PSF generation, tiling |
 | `config.yaml` | Bilayers / BIOMERO parameter configuration |
@@ -620,13 +621,14 @@ Use `--pinhole_airy 0` for the legacy point-detector confocal model.  Widefield 
 | `Dockerfile` | Headless Docker build for BIOMERO and batch workflows |
 | `Dockerfile.gradio` | Optional Bilayers Gradio Docker image built from the headless image |
 | `Dockerfile.jupyter` | Optional Bilayers Jupyter Docker image built from the headless image |
-| `requirements.txt` | Python dependencies (local install) |
 | `requirements_gui.txt` | Python dependencies for GUI features |
 | `requirements_docker.txt` | Python dependencies (Docker image) |
 | `requirements_gradio.txt` | Extra dependencies for the optional Gradio image |
 | `requirements_jupyter.txt` | Extra dependencies for the optional Jupyter image |
 | `requirements_bilayers_validation.txt` | Optional strict LinkML validation dependencies |
 | `version.txt` | Project version marker |
+
+`core/ome_zarr_io.py`, `core/ome_tiff_io.py`, and `core/streaming.py` are compatibility shims that re-export the shared implementations from `cideconvolve_io`. Keep new image writer changes in `cideconvolve_io` so GUI, wrapper, Docker, and `ci_deconvolve_cli` stay in sync.
 
 ---
 

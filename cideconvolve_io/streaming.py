@@ -970,6 +970,16 @@ class ZarrPyramidSink:
         payload["streaming"] = True
         self._root.attrs["_creator"] = payload
         self._root.attrs["cideconvolve"] = payload
+        if self.path is not None:
+            from .ome_zarr_io import _write_ome_xml_metadata
+
+            _write_ome_xml_metadata(
+                self.path,
+                self.metadata,
+                self.shape,
+                np.dtype("float32"),
+                str(self.metadata.get("name") or self.path.name),
+            )
 
     def build_pyramids(self) -> None:
         current = self._level0
