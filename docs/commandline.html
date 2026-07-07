@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Command line - CIDeconvolve</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+  <header class="site-header"><nav class="nav"><a class="brand" href="index.html"><span class="brand-mark">CI</span><span>CIDeconvolve</span></a><div class="nav-links"><a href="gui.html">GUI</a><a href="commandline.html">Command line</a><a href="docker.html">Docker</a><a href="omero.html">OMERO</a><a href="bilayers.html">Bilayers</a><a href="parameters.html">Parameters</a><a href="algorithm.html">Algorithm</a><a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></div></nav></header>
+  <main>
+    <section class="wrap page-title"><span class="eyebrow">Scripts and local automation</span><h1>Command line</h1><p>There are two useful command-line surfaces: the full Bilayers workflow wrapper and the focused PyPI CLI.</p></section>
+    <section class="wrap grid two">
+      <div class="card">
+        <h2>Workflow wrapper</h2>
+        <p>Use this when you want the same interface as Docker, Bilayers, and BIOMERO.</p>
+        <pre class="code-block"><code>python wrapper.py ^
+  --infolder ./infolder ^
+  --outfolder ./outfolder ^
+  --method ci_rl ^
+  --iterations 60 ^
+  --output_format ome-zarr</code></pre>
+      </div>
+      <div class="card">
+        <h2>Focused PyPI CLI</h2>
+        <p>Use this for lightweight local scripts that only need CI-RL on OME-TIFF or OME-Zarr inputs.</p>
+        <pre class="code-block"><code>pip install ci-deconvolve
+ci_deconvolve --input image.ome.tiff --output out ^
+  --iterations 40 ^
+  --output-format ome-tiff</code></pre>
+      </div>
+    </section>
+    <section class="wrap">
+      <div class="grid">
+        <div class="card"><h3>Metadata policy</h3><p>Image metadata wins by default. Command-line NA, wavelengths, pixel size, and refractive indices are fallbacks unless override flags are used.</p></div>
+        <div class="card"><h3>Batch folders</h3><p>The wrapper processes folders and writes deconvolved images, benchmark CSV files, montage images, and provenance metadata.</p></div>
+        <div class="card"><h3>Outputs</h3><p>OME-TIFF and OME-Zarr outputs preserve physical pixel sizes and channel metadata for QuPath, ImageJ/Fiji, and OMERO workflows.</p></div>
+      </div>
+    </section>
+  </main>
+  <footer class="site-footer"><a href="parameters.html">All parameters</a> · <a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve/tree/main/ci_deconvolve_cli">PyPI CLI source</a></footer>
+  <script src="assets/site.js"></script>
+</body>
+</html>
+

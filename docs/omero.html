@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>OMERO and BIOMERO - CIDeconvolve</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+  <header class="site-header"><nav class="nav"><a class="brand" href="index.html"><span class="brand-mark">CI</span><span>CIDeconvolve</span></a><div class="nav-links"><a href="gui.html">GUI</a><a href="commandline.html">Command line</a><a href="docker.html">Docker</a><a href="omero.html">OMERO</a><a href="bilayers.html">Bilayers</a><a href="parameters.html">Parameters</a><a href="algorithm.html">Algorithm</a><a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></div></nav></header>
+  <main>
+    <section class="wrap page-title"><span class="eyebrow">OMERO workflow execution</span><h1>BIOMERO and OMERO</h1><p>CIDeconvolve is designed to be launched from OMERO through BIOMERO, with Docker images pulled or converted to Singularity/Apptainer on the compute side.</p></section>
+    <section class="wrap">
+      <div class="steps">
+        <div class="step"><div><h3>Configure the workflow</h3><p>Point BIOMERO to this repository's <code>config.yaml</code> and expose <code>w_cideconvolve</code> in the Zarr workflow list.</p></div></div>
+        <div class="step"><div><h3>Prepare the image</h3><p>Use the published Docker tag or convert it to a local SIF for Slurm execution.</p></div></div>
+        <div class="step"><div><h3>Run from OMERO.web</h3><p>Select images, configure parameters, launch the Slurm workflow, and let BIOMERO upload results back to OMERO.</p></div></div>
+      </div>
+    </section>
+    <section class="wrap grid two">
+      <div class="card"><h3>Why OME-Zarr?</h3><p>Chunked pyramidal output is efficient for large microscopy data and preserves physical metadata, display windows, and provenance.</p></div>
+      <div class="card"><h3>Useful references</h3><p><a href="https://nl-bioimaging.github.io/biomero/">BIOMERO documentation</a><br><a href="https://github.com/NL-BioImaging/NL-BIOMERO">NL-BIOMERO local deployment</a></p></div>
+    </section>
+  </main>
+  <footer class="site-footer"><a href="parameters.html">Workflow parameters</a> · <a href="docker.html">Docker images</a></footer>
+  <script src="assets/site.js"></script>
+</body>
+</html>
+

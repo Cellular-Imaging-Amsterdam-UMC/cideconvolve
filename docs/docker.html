@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Docker - CIDeconvolve</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+  <header class="site-header"><nav class="nav"><a class="brand" href="index.html"><span class="brand-mark">CI</span><span>CIDeconvolve</span></a><div class="nav-links"><a href="gui.html">GUI</a><a href="commandline.html">Command line</a><a href="docker.html">Docker</a><a href="omero.html">OMERO</a><a href="bilayers.html">Bilayers</a><a href="parameters.html">Parameters</a><a href="algorithm.html">Algorithm</a><a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></div></nav></header>
+  <main>
+    <section class="wrap page-title"><span class="eyebrow">Reproducible containers</span><h1>Docker images</h1><p>The headless image is the workflow image. Optional Gradio and Jupyter images are built separately for interactive Bilayers-style use.</p></section>
+    <section class="wrap grid">
+      <div class="card"><h3>Headless</h3><pre class="code-block"><code>docker run --rm --gpus all ^
+  -v /input:/data/in ^
+  -v /output:/data/out ^
+  cellularimagingcf/w_cideconvolve:v3.0.0</code></pre></div>
+      <div class="card"><h3>Gradio</h3><pre class="code-block"><code>docker run --rm --gpus all -p 7878:7878 ^
+  cellularimagingcf/w_cideconvolve:v3.0.0-gradio</code></pre></div>
+      <div class="card"><h3>Jupyter</h3><pre class="code-block"><code>docker run --rm --gpus all -p 8888:8888 ^
+  -v /data:/data/in ^
+  cellularimagingcf/w_cideconvolve:v3.0.0-jupyter</code></pre></div>
+    </section>
+    <section class="wrap split">
+      <div>
+        <h2>Build locally</h2>
+        <pre class="code-block"><code>.\builddocker.cmd
+.\builddocker_gradio.cmd
+.\builddocker_jupyter.cmd</code></pre>
+        <p class="muted">Tags are read from <code>version.txt</code>. The default <code>latest</code> tag remains the headless workflow image.</p>
+      </div>
+      <div class="callout"><strong>GPU note:</strong> install NVIDIA Container Toolkit or enable GPU support in Docker Desktop. Omit <code>--gpus all</code> for CPU-only runs.</div>
+    </section>
+  </main>
+  <footer class="site-footer"><a href="bilayers.html">Bilayers launcher</a> · <a href="omero.html">OMERO/BIOMERO</a></footer>
+  <script src="assets/site.js"></script>
+</body>
+</html>
+

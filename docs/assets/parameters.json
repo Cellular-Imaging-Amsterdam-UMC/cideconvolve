@@ -1,0 +1,513 @@
+[
+  {
+    "group": "inputs",
+    "name": "infolder",
+    "label": "Input Images",
+    "type": "image",
+    "default": "directory",
+    "cli_tag": "--infolder",
+    "mode": "beginner",
+    "section_id": "inputs",
+    "description": "Input microscopy image folder for CIDeconvolve.",
+    "options": []
+  },
+  {
+    "group": "outputs",
+    "name": "output_dir",
+    "label": "Deconvolved Outputs",
+    "type": "image",
+    "default": "directory",
+    "cli_tag": "--outfolder",
+    "mode": "beginner",
+    "section_id": "outputs",
+    "description": "Output folder containing OME-TIFF, OME-Zarr, benchmark CSV, and montage results.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "method",
+    "label": "Deconvolution Method",
+    "type": "dropdown",
+    "default": "ci_rl",
+    "cli_tag": "--method",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Algorithm to use for deconvolution.",
+    "options": [
+      "ci_rl",
+      "ci_rl_tv",
+      "ci_sparse_hessian"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "iterations",
+    "label": "RL Iterations",
+    "type": "textbox",
+    "default": "60",
+    "cli_tag": "--iterations",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Number of iterations per channel, comma-separated. A single value applies to all channels.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "convergence",
+    "label": "Convergence Mode",
+    "type": "dropdown",
+    "default": "auto",
+    "cli_tag": "--convergence",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Early-stopping mode. Auto stops when relative change falls below the threshold; fixed runs all iterations.",
+    "options": [
+      "auto",
+      "fixed"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "rel_threshold",
+    "label": "Convergence Threshold",
+    "type": "float",
+    "default": 0.005,
+    "cli_tag": "--rel_threshold",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Relative change threshold for early stopping when convergence is auto.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "start",
+    "label": "Initial Estimate",
+    "type": "dropdown",
+    "default": "auto",
+    "cli_tag": "--start",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Initial estimate for iterative solvers.",
+    "options": [
+      "auto",
+      "flat",
+      "percentile_flat",
+      "observed",
+      "observed_bgsub",
+      "lowpass",
+      "lowpass_bgsub",
+      "hybrid"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "microscope_type",
+    "label": "Microscope Type",
+    "type": "dropdown",
+    "default": "confocal",
+    "cli_tag": "--microscope_type",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Microscope modality used for PSF generation.",
+    "options": [
+      "widefield",
+      "confocal"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "na",
+    "label": "Numerical Aperture",
+    "type": "float",
+    "default": 1.4,
+    "cli_tag": "--na",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Objective numerical aperture, used as a fallback or override for PSF generation.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "pinhole_airy",
+    "label": "Confocal Pinhole (AU)",
+    "type": "textbox",
+    "default": "1",
+    "cli_tag": "--pinhole_airy",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Confocal pinhole diameter in Airy disk units, comma-separated per channel. Use 0 for the legacy point-detector model.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "refractive_index",
+    "label": "Immersion Medium",
+    "type": "dropdown",
+    "default": "oil (1.515)",
+    "cli_tag": "--refractive_index",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Immersion medium refractive index preset.",
+    "options": [
+      "air (1.0003)",
+      "water (1.333)",
+      "oil (1.515)"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "sample_ri",
+    "label": "Sample / Mounting Medium",
+    "type": "dropdown",
+    "default": "prolong gold (1.47)",
+    "cli_tag": "--sample_ri",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Sample or mounting medium refractive index preset.",
+    "options": [
+      "water (1.333)",
+      "PBS (1.334)",
+      "culture medium (1.337)",
+      "vectashield (1.45)",
+      "prolong gold (1.47)",
+      "glycerol (1.474)",
+      "oil (1.515)",
+      "prolong glass (1.52)"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "excitation_wl",
+    "label": "Excitation Wavelengths (nm)",
+    "type": "textbox",
+    "default": "488",
+    "cli_tag": "--excitation_wl",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Excitation wavelengths in nanometers, comma-separated when the input has multiple channels.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "emission_wl",
+    "label": "Emission Wavelengths (nm)",
+    "type": "textbox",
+    "default": "520",
+    "cli_tag": "--emission_wl",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Emission wavelengths in nanometers, comma-separated when the input has multiple channels.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "pixel_size_xy",
+    "label": "Pixel Size XY (nm)",
+    "type": "float",
+    "default": 65.0,
+    "cli_tag": "--pixel_size_xy",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Lateral pixel size in nanometers.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "pixel_size_z",
+    "label": "Pixel Size Z (nm)",
+    "type": "float",
+    "default": 200.0,
+    "cli_tag": "--pixel_size_z",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Axial pixel size or Z step in nanometers.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "overrule_image_metadata",
+    "label": "Overrule Image Metadata",
+    "type": "checkbox",
+    "default": false,
+    "cli_tag": "--overrule_image_metadata",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Use the supplied metadata values even when image metadata is present.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "projection",
+    "label": "Z Projection",
+    "type": "dropdown",
+    "default": "none",
+    "cli_tag": "--projection",
+    "mode": "beginner",
+    "section_id": "essential",
+    "description": "Output a 2D Z projection instead of a full 3D stack. Ignored for 2D inputs.",
+    "options": [
+      "none",
+      "mip",
+      "sum"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "output_format",
+    "label": "Output Format",
+    "type": "dropdown",
+    "default": "ome-zarr",
+    "cli_tag": "--output_format",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Output container for deconvolved data.",
+    "options": [
+      "ome-tiff",
+      "ome-zarr"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "streaming",
+    "label": "Large-Image Streaming",
+    "type": "dropdown",
+    "default": "auto",
+    "cli_tag": "--streaming",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Use tile reads and direct OME-Zarr writes for large images.",
+    "options": [
+      "auto",
+      "always",
+      "never"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "streaming_threshold_gb",
+    "label": "Streaming Threshold GB",
+    "type": "float",
+    "default": 2.0,
+    "cli_tag": "--streaming_threshold_gb",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Estimated full source array size above which streaming auto mode is enabled.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "scene",
+    "label": "Image Scene",
+    "type": "textbox",
+    "default": "auto",
+    "cli_tag": "--scene",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Optional scene index or name for multi-scene images. Use auto for the default scene.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "hcs_field",
+    "label": "OME-Zarr HCS Field",
+    "type": "textbox",
+    "default": "auto",
+    "cli_tag": "--hcs_field",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Optional HCS field path such as A/1/0. Use auto for the first field.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "benchmark",
+    "label": "Benchmark Mode",
+    "type": "checkbox",
+    "default": false,
+    "cli_tag": "--benchmark",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Run benchmark mode on the first input image.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "bench_crop",
+    "label": "Benchmark Crop",
+    "type": "checkbox",
+    "default": false,
+    "cli_tag": "--bench_crop",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Center-crop benchmark input to speed up comparison runs.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "compute_metrics",
+    "label": "Compute Image Metrics",
+    "type": "checkbox",
+    "default": false,
+    "cli_tag": "--compute_metrics",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Compute optional deconvolution-effect image metrics.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "tv_lambda",
+    "label": "TV Lambda",
+    "type": "float",
+    "default": 0.0001,
+    "cli_tag": "--tv_lambda",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Total Variation regularization strength for ci_rl_tv.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "sparse_hessian_weight",
+    "label": "Sparse Hessian Weight",
+    "type": "float",
+    "default": 0.6,
+    "cli_tag": "--sparse_hessian_weight",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Hessian-vs-sparsity balance for ci_sparse_hessian.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "sparse_hessian_reg",
+    "label": "Sparse Hessian Reg",
+    "type": "float",
+    "default": 0.98,
+    "cli_tag": "--sparse_hessian_reg",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Data-vs-regularizer balance for ci_sparse_hessian.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "device",
+    "label": "Compute Device",
+    "type": "dropdown",
+    "default": "auto",
+    "cli_tag": "--device",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Force compute device. Auto uses CUDA if available, otherwise CPU.",
+    "options": [
+      "auto",
+      "cpu",
+      "cuda"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "background",
+    "label": "Background Subtraction",
+    "type": "textbox",
+    "default": "auto",
+    "cli_tag": "--background",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Background subtraction mode. Use auto, 0, or a numeric constant.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "offset",
+    "label": "Offset",
+    "type": "textbox",
+    "default": "auto",
+    "cli_tag": "--offset",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Positive offset added during processing and removed afterwards. Use auto, none, 0, or a numeric value.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "damping",
+    "label": "Damping",
+    "type": "textbox",
+    "default": "none",
+    "cli_tag": "--damping",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Noise-gated damping for ci_rl and ci_rl_tv. Use none, auto, or a numeric value.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "prefilter_sigma",
+    "label": "Prefilter Sigma",
+    "type": "float",
+    "default": 0.0,
+    "cli_tag": "--prefilter_sigma",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Sigma in pixels for Anscombe-domain Gaussian prefiltering. Use 0 to disable.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "two_d_mode",
+    "label": "2D Widefield Mode",
+    "type": "dropdown",
+    "default": "auto",
+    "cli_tag": "--two_d_mode",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "2D widefield deconvolution mode.",
+    "options": [
+      "auto"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "two_d_wf_aggressiveness",
+    "label": "2D WF Aggressiveness",
+    "type": "dropdown",
+    "default": "Balanced",
+    "cli_tag": "--two_d_wf_aggressiveness",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Aggressiveness of 2D widefield auto deconvolution.",
+    "options": [
+      "Very Conservative",
+      "Conservative",
+      "Balanced",
+      "Strong",
+      "Very Strong"
+    ]
+  },
+  {
+    "group": "parameters",
+    "name": "two_d_wf_bg_radius_um",
+    "label": "2D WF Background Radius (um)",
+    "type": "float",
+    "default": 0.5,
+    "cli_tag": "--two_d_wf_bg_radius_um",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Background estimator neighborhood radius in micrometers for 2D widefield auto mode.",
+    "options": []
+  },
+  {
+    "group": "parameters",
+    "name": "two_d_wf_bg_scale",
+    "label": "2D WF Background Scale",
+    "type": "float",
+    "default": 1.0,
+    "cli_tag": "--two_d_wf_bg_scale",
+    "mode": "advanced",
+    "section_id": "advanced",
+    "description": "Multiplier applied to the auto-estimated background in 2D widefield auto mode.",
+    "options": []
+  }
+]

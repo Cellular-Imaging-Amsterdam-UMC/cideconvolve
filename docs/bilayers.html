@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Bilayers - CIDeconvolve</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+  <header class="site-header"><nav class="nav"><a class="brand" href="index.html"><span class="brand-mark">CI</span><span>CIDeconvolve</span></a><div class="nav-links"><a href="gui.html">GUI</a><a href="commandline.html">Command line</a><a href="docker.html">Docker</a><a href="omero.html">OMERO</a><a href="bilayers.html">Bilayers</a><a href="parameters.html">Parameters</a><a href="algorithm.html">Algorithm</a><a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></div></nav></header>
+  <main>
+    <section class="wrap page-title"><span class="eyebrow">Standard workflow interface</span><h1>Bilayers integration</h1><p>The workflow interface is defined in <code>config.yaml</code>. The launcher, Docker commands, Gradio/Jupyter generation, and BIOMERO parameter forms all use this source.</p></section>
+    <section class="wrap split">
+      <div>
+        <h2>Validate and launch</h2>
+        <pre class="code-block"><code>python bilayers_cli.py validate
+python bilayers_cli.py generate --cli
+python launcher.py</code></pre>
+        <p class="muted">Strict LinkML validation is available with <code>pip install -r requirements_bilayers_validation.txt</code> and <code>python bilayers_cli.py validate --strict</code>.</p>
+      </div>
+      <div class="media-frame"><img src="screenshots/launcher.png" alt="CIDeconvolve Bilayers launcher"></div>
+    </section>
+    <section class="wrap grid">
+      <div class="card"><h3>Beginner parameters</h3><p>Essential optics and method choices are kept visible for day-to-day use.</p></div>
+      <div class="card"><h3>Advanced parameters</h3><p>Streaming, benchmark, expert 2D widefield, and solver tuning controls are grouped as advanced.</p></div>
+      <div class="card"><h3>Interface images</h3><p>Separate <code>-gradio</code> and <code>-jupyter</code> tags follow the Bilayers convention without changing the headless workflow image.</p></div>
+    </section>
+  </main>
+  <footer class="site-footer"><a href="parameters.html">Parameter manual</a> · <a href="docker.html">Docker usage</a></footer>
+  <script src="assets/site.js"></script>
+</body>
+</html>
+

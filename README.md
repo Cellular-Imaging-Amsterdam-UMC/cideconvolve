@@ -5,6 +5,7 @@
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
+| **Website** | https://cellular-imaging-amsterdam-umc.github.io/cideconvolve/ |
 | **Version** | v3.0.0 |
 | **Container type** | Docker image; BIOMERO/HPC deployments can pull or convert it to Singularity / Apptainer |
 | **Methods** | `ci_rl` · `ci_rl_tv` · `ci_sparse_hessian` |

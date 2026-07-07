@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Algorithm - CIDeconvolve</title><link rel="stylesheet" href="assets/site.css"></head>
+<body>
+  <header class="site-header"><nav class="nav"><a class="brand" href="index.html"><span class="brand-mark">CI</span><span>CIDeconvolve</span></a><div class="nav-links"><a href="gui.html">GUI</a><a href="commandline.html">Command line</a><a href="docker.html">Docker</a><a href="omero.html">OMERO</a><a href="bilayers.html">Bilayers</a><a href="parameters.html">Parameters</a><a href="algorithm.html">Algorithm</a><a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></div></nav></header>
+  <main>
+    <section class="wrap page-title"><span class="eyebrow">Under the hood</span><h1>Algorithm notes</h1><p>CIDeconvolve combines physical PSF generation, GPU FFT convolution, robust metadata handling, and several deconvolution objectives.</p></section>
+    <section class="wrap grid">
+      <div class="card"><h3>ci_rl</h3><p>Richardson-Lucy with Scaled Heavy Ball acceleration. It keeps the familiar RL update but adds momentum to reach useful results faster.</p></div>
+      <div class="card"><h3>ci_rl_tv</h3><p>SHB-RL plus Total Variation regularisation. It is useful when high iteration counts would otherwise amplify noise.</p></div>
+      <div class="card"><h3>ci_sparse_hessian</h3><p>A variational sparse-Hessian method for filament-like or sparse structures where thin details matter.</p></div>
+    </section>
+    <section class="wrap split">
+      <div>
+        <h2>PSF model</h2>
+        <p class="muted">The PSF path uses microscope type, emission/excitation wavelengths, NA, lateral/axial pixel size, immersion/sample refractive indices, coverslip settings, confocal pinhole, and optional pixel integration.</p>
+        <ul>
+          <li>Vectorial Richards-Wolf model for high NA settings.</li>
+          <li>Scalar model for lower NA settings.</li>
+          <li>Gibson-Lanni style optical path difference corrections.</li>
+          <li>2D widefield auto mode collapses a physically generated PSF for single-plane data.</li>
+        </ul>
+      </div>
+      <div class="media-frame"><video src="movies/RPE-1_Gamma_IR_2.4Gy_1_0.5_NIR_iterations.mp4" controls muted playsinline></video></div>
+    </section>
+    <section class="wrap grid two">
+      <div class="card"><h3>Streaming and tiling</h3><p>Large images are processed as halo-extended XY tiles. Only the core tile is written to output, then pyramid levels are built from level 0.</p></div>
+      <div class="card"><h3>Read more</h3><p>The full derivation and implementation notes live in <a href="DECONVOLVE_CI.MD">DECONVOLVE_CI.MD</a>. Benchmark metric details are in <a href="metrics.md">metrics.md</a>.</p></div>
+    </section>
+  </main>
+  <footer class="site-footer"><a href="parameters.html">Parameters</a> · <a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></footer>
+  <script src="assets/site.js"></script>
+</body>
+</html>
+

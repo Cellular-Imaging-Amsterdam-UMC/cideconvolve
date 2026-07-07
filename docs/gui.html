@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GUI - CIDeconvolve</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <header class="site-header"><nav class="nav"><a class="brand" href="index.html"><span class="brand-mark">CI</span><span>CIDeconvolve</span></a><div class="nav-links"><a href="gui.html">GUI</a><a href="commandline.html">Command line</a><a href="docker.html">Docker</a><a href="omero.html">OMERO</a><a href="bilayers.html">Bilayers</a><a href="parameters.html">Parameters</a><a href="algorithm.html">Algorithm</a><a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></div></nav></header>
+  <main>
+    <section class="wrap page-title">
+      <span class="eyebrow">Interactive desktop</span>
+      <h1>GUI manual</h1>
+      <p>Use the GUI for exploratory deconvolution, metadata inspection, parameter tuning, visual comparison, and batch export.</p>
+    </section>
+    <section class="wrap split">
+      <div>
+        <h2>Install and run</h2>
+        <pre class="code-block"><code>pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements_gui.txt
+python gui/gui_deconvolve_ci.py</code></pre>
+        <div class="callout"><strong>Optional:</strong> add <code>--movie</code> to expose iteration movie export and <code>--fitpsf</code> to expose experimental PSF fitting.</div>
+      </div>
+      <div class="media-frame"><img src="screenshots/gui_deconvolve_ci.png" alt="CIDeconvolve GUI"></div>
+    </section>
+    <section class="wrap">
+      <div class="grid">
+        <div class="card"><h3>Open images</h3><p>Load OME-TIFF, OME-Zarr, regular TIFF, ND2, CZI, LIF, Leica browser entries, and OMERO images where optional dependencies are installed.</p></div>
+        <div class="card"><h3>Tune and compare</h3><p>Use synchronized original/deconvolved panes, channel controls, Z/T navigation, projection modes, 3D rendering, scale bars, and per-channel display scaling.</p></div>
+        <div class="card"><h3>Export</h3><p>Save current timepoints, full T-series, projections, view PNGs, batch jobs, OME-TIFF, and OME-Zarr with physical metadata preserved.</p></div>
+      </div>
+    </section>
+    <section class="wrap split">
+      <div class="media-frame"><video src="movies/DNAcrop.ome_iterations.mp4" controls muted playsinline poster="screenshots/gui_deconvolve_ci.png"></video></div>
+      <div>
+        <h2>Iteration movies</h2>
+        <p class="muted">The GUI can record convergence as MP4 and optional GIF outputs. This is useful for tuning iteration counts and showing how SHB-RL evolves over time.</p>
+        <ul>
+          <li>Enable with <code>python gui/gui_deconvolve_ci.py --movie</code>.</li>
+          <li>Use convergence mode <code>auto</code> to stop once improvement stalls.</li>
+          <li>Use the run log and quality metrics to compare settings.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+  <footer class="site-footer"><a href="index.html">Home</a> · <a href="parameters.html">Parameter manual</a> · <a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></footer>
+  <script src="assets/site.js"></script>
+</body>
+</html>
+

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CIDeconvolve - GPU microscopy deconvolution</title>
+  <meta name="description" content="GPU-accelerated 3D and 2D deconvolution for widefield and confocal microscopy images.">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <header class="site-header">
+    <nav class="nav">
+      <a class="brand" href="index.html"><span class="brand-mark">CI</span><span>CIDeconvolve</span></a>
+      <div class="nav-links">
+        <a href="gui.html">GUI</a>
+        <a href="commandline.html">Command line</a>
+        <a href="docker.html">Docker</a>
+        <a href="omero.html">OMERO</a>
+        <a href="bilayers.html">Bilayers</a>
+        <a href="parameters.html">Parameters</a>
+        <a href="algorithm.html">Algorithm</a>
+        <a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main>
+    <section class="wrap hero">
+      <div>
+        <span class="eyebrow">GPU deconvolution for real microscopy data</span>
+        <h1>Sharper volumes. Less waiting.</h1>
+        <p class="hero-copy">CIDeconvolve turns OME-TIFF and OME-Zarr microscopy images into physically informed deconvolved outputs using SHB-accelerated Richardson-Lucy, TV regularisation, sparse-Hessian priors, and CUDA-backed PyTorch.</p>
+        <div class="actions">
+          <a class="button primary" href="gui.html">Start with the GUI</a>
+          <a class="button" href="docker.html">Run in Docker</a>
+          <a class="button" href="algorithm.html">See the algorithm</a>
+        </div>
+        <div class="stats">
+          <div class="stat"><strong>3D + 2D</strong><span>widefield and confocal</span></div>
+          <div class="stat"><strong>CUDA</strong><span>GPU acceleration</span></div>
+          <div class="stat"><strong>OME</strong><span>TIFF and Zarr metadata</span></div>
+          <div class="stat"><strong>BIOMERO</strong><span>workflow ready</span></div>
+        </div>
+      </div>
+      <div class="media-frame">
+        <video src="movies/WF-2D-3Ch-Actin.ome_iterations.mp4" autoplay muted loop playsinline poster="screenshots/gui_deconvolve_ci.png"></video>
+      </div>
+    </section>
+
+    <section class="wrap">
+      <div class="section-title">
+        <span class="eyebrow">Pick your way in</span>
+        <h2>One engine, many surfaces.</h2>
+        <p>Use the interactive GUI for exploration, the focused CLI for local scripts, Docker for reproducible workflows, or BIOMERO/Bilayers for OMERO-connected analysis.</p>
+      </div>
+      <div class="grid">
+        <a class="card" href="gui.html">
+          <h3>Interactive GUI</h3>
+          <p>Open local files, OME-Zarr, Leica, and OMERO images; tune parameters; compare original/deconvolved views; export OME-TIFF, OME-Zarr, PNG, and batch outputs.</p>
+          <div class="tag-list"><span class="tag">PyQt</span><span class="tag">preview</span><span class="tag">batch</span></div>
+        </a>
+        <a class="card" href="commandline.html">
+          <h3>Command line</h3>
+          <p>Run the Bilayers wrapper or the focused PyPI CLI in scripts. Metadata wins by default; command-line optics are fallbacks unless explicitly overruled.</p>
+          <div class="tag-list"><span class="tag">OME-TIFF</span><span class="tag">OME-Zarr</span><span class="tag">automation</span></div>
+        </a>
+        <a class="card" href="docker.html">
+          <h3>Docker images</h3>
+          <p>Headless workflow image for batch and BIOMERO, plus optional Bilayers Gradio and Jupyter interface images.</p>
+          <div class="tag-list"><span class="tag">headless</span><span class="tag">Gradio</span><span class="tag">Jupyter</span></div>
+        </a>
+      </div>
+    </section>
+
+    <section class="wrap split">
+      <div>
+        <div class="section-title">
+          <span class="eyebrow">What it writes</span>
+          <h2>Outputs that viewers understand.</h2>
+          <p>OME-Zarr outputs include NGFF multiscales, physical coordinate transforms, OMERO channel display settings, CIDeconvolve provenance, and OME-XML metadata for Bio-Formats/QuPath compatibility.</p>
+        </div>
+        <div class="grid two">
+          <div class="card"><h3>QuPath friendly</h3><p>Physical pixel sizes, channel names, colors, and contrast windows are preserved for inspection and downstream analysis.</p></div>
+          <div class="card"><h3>Large image ready</h3><p>Streaming mode reads halo-extended tiles and writes chunked pyramids without materialising huge tilescans in memory.</p></div>
+        </div>
+      </div>
+      <div class="media-frame"><img src="screenshots/gui_deconvolve_ci.png" alt="CIDeconvolve GUI screenshot"></div>
+    </section>
+  </main>
+
+  <footer class="site-footer">CIDeconvolve is MIT licensed. Source code and issues live on <a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a>.</footer>
+  <script src="assets/site.js"></script>
+</body>
+</html>
+
