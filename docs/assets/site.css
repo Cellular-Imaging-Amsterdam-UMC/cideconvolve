@@ -111,15 +111,15 @@ main { min-height: 75vh; }
 h1 {
   margin: 0 0 1rem;
   max-width: 18ch;
-  font-size: clamp(2.25rem, 5vw, 3.7rem);
-  line-height: 1.05;
+  font-size: clamp(1.35rem, 2.5vw, 1.9rem);
+  line-height: 1.18;
   letter-spacing: 0;
   font-weight: 650;
 }
 
 h2 {
-  font-size: clamp(1.55rem, 3vw, 2.25rem);
-  line-height: 1.18;
+  font-size: clamp(1.15rem, 1.8vw, 1.45rem);
+  line-height: 1.28;
   font-weight: 620;
 }
 
