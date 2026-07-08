@@ -55,8 +55,12 @@ from core.deconvolve import (
 )
 from core.ome_zarr_io import save_result_ome_zarr
 from core.streaming import (
+    ProjectionPyramidSink,
+    TiledOmeTiffSink,
+    TimepointSubsetRegionSource,
     ZarrPyramidSink,
     deconvolve_streaming,
+    normalise_timepoint_indices,
     open_region_source,
     save_streaming_provenance,
     should_stream_source,
@@ -1036,6 +1040,8 @@ def _projection_output_suffix(projection: str) -> str:
         return "_mip-proj"
     if projection == "sum":
         return "_sum-proj"
+    if projection == "mean":
+        return "_mean-proj"
     return ""
 
 
@@ -1057,7 +1063,6 @@ def _run_plate_zarr(
     pixel_size_z,
     overrule_metadata: bool,
     tv_lambda: float,
-    damping,
     sparse_hessian_weight: float,
     sparse_hessian_reg: float,
     background,
@@ -1165,7 +1170,7 @@ def _run_plate_zarr(
 
             result = deconvolve(
                 img, psf, method=method,
-                niter=ch_niter, background=background, damping=damping, offset=offset,
+                niter=ch_niter, background=background, offset=offset,
                 prefilter_sigma=prefilter_sigma, start=start,
                 convergence=convergence, rel_threshold=rel_threshold,
                 check_every=check_every, device=device,
@@ -1219,7 +1224,6 @@ def _run_streaming_regular_image(
     pixel_size_z,
     overrule_metadata: bool,
     tv_lambda: float,
-    damping,
     sparse_hessian_weight: float,
     sparse_hessian_reg: float,
     background,
@@ -1241,11 +1245,14 @@ def _run_streaming_regular_image(
     two_d_wf_bg_radius_um: float,
     two_d_wf_bg_scale: float,
     tile_limits: tuple[int, int],
-    scene=None,
+    output_format: str = "ome-zarr",
+    output_dtype: str = "float32",
+    projection: str = "none",
+    timepoints: list[int] | None = None,
     hcs_field=None,
 ) -> Path:
-    """Stream a regular image to OME-Zarr, reading only halo-extended tiles."""
-    source = open_region_source(img_path, scene=scene, hcs_field=hcs_field)
+    """Stream a regular image, reading only halo-extended tiles."""
+    source = open_region_source(img_path, hcs_field=hcs_field)
     source.metadata = _apply_cli_metadata_to_source(
         source.metadata,
         na=na,
@@ -1259,6 +1266,8 @@ def _run_streaming_regular_image(
         pixel_size_z=pixel_size_z,
         overrule_metadata=overrule_metadata,
     )
+    if timepoints is not None:
+        source = TimepointSubsetRegionSource(source, timepoints)
     _print_region_source_details(img_path.name, img_path, source)
     tile_xy = int(tile_limits[0])
     if tile_xy <= 0:
@@ -1269,14 +1278,50 @@ def _run_streaming_regular_image(
             device=device,
     )
     tile_limits = (tile_xy, int(tile_limits[1]))
-    out_zarr = Path(out_path) / f"{stem}_decon.ome.zarr"
-    _remove_existing_path(out_zarr)
-    sink = ZarrPyramidSink(
-        out_zarr,
-        shape=source.shape,
-        metadata=source.metadata,
-        zarr_format=OUTPUT_ZARR_FORMAT,
-        resume=True,
+    output_format_key = str(output_format or "ome-zarr").strip().lower().replace("_", "-")
+    projection_key = str(projection or "none").strip().lower()
+    project_output = source.shape[2] > 1 and projection_key in {"mip", "max", "sum", "mean"}
+    suffix = _projection_output_suffix(projection_key) if project_output else ""
+    if output_format_key in ("ome-tiff", "tiff", "tif"):
+        out_file = Path(out_path) / f"{stem}_decon{suffix}.ome.tiff"
+        sink_shape = (source.shape[0], source.shape[1], 1 if project_output else source.shape[2], source.shape[3], source.shape[4])
+        sink_metadata = dict(source.metadata)
+        if project_output:
+            sink_metadata["size_z"] = 1
+            sink_metadata["default_z"] = 0
+            sink_metadata["projection"] = projection_key
+        _remove_existing_path(out_file)
+        base_sink = TiledOmeTiffSink(
+            out_file,
+            shape=sink_shape,
+            metadata=sink_metadata,
+            tile_yx=(512, 512),
+            levels=None,
+            predictor=str(output_dtype or "float32").strip().lower() == "uint16",
+            output_dtype=output_dtype,
+            write_private_metadata=False,
+        )
+    else:
+        out_file = Path(out_path) / f"{stem}_decon{suffix}.ome.zarr"
+        sink_shape = (source.shape[0], source.shape[1], 1 if project_output else source.shape[2], source.shape[3], source.shape[4])
+        sink_metadata = dict(source.metadata)
+        if project_output:
+            sink_metadata["size_z"] = 1
+            sink_metadata["default_z"] = 0
+            sink_metadata["projection"] = projection_key
+        _remove_existing_path(out_file)
+        base_sink = ZarrPyramidSink(
+            out_file,
+            shape=sink_shape,
+            metadata=sink_metadata,
+            zarr_format=OUTPUT_ZARR_FORMAT,
+            resume=True,
+            output_dtype=output_dtype,
+        )
+    sink = (
+        ProjectionPyramidSink(base_sink, source_shape=source.shape, mode=projection_key)
+        if project_output
+        else base_sink
     )
 
     psf_cache: dict[int, np.ndarray] = {}
@@ -1323,7 +1368,6 @@ def _run_streaming_regular_image(
             method=method,
             niter=ch_niter,
             background=background,
-            damping=damping,
             offset=offset,
             prefilter_sigma=prefilter_sigma,
             start=start,
@@ -1354,13 +1398,14 @@ def _run_streaming_regular_image(
                 f"core={payload.get('core')}"
             )
         elif event == "pyramid_start":
-            print("    Building OME-Zarr pyramid levels...")
+            print("    Finalizing streamed output...")
 
     print("\n  Streaming deconvolution")
     print(f"    Source     : {source.source_id}")
     print(f"    Shape      : T={source.shape[0]} C={source.shape[1]} Z={source.shape[2]} Y={source.shape[3]} X={source.shape[4]}")
     print(f"    Tile limits: XY={tile_limits[0]} px  Z={tile_limits[1]} slices (Z streaming reserved)")
-    print(f"    Output     : {out_zarr.name}")
+    print(f"    Output     : {out_file.name}")
+    print(f"    Projection : {projection_key if project_output else 'stack'}")
     t0 = time.time()
     summary = deconvolve_streaming(
         source,
@@ -1373,13 +1418,17 @@ def _run_streaming_regular_image(
         build_pyramids=True,
     )
     provenance = save_streaming_provenance(
-        out_zarr.with_suffix(out_zarr.suffix + ".provenance.json"),
+        out_file.with_suffix(out_file.suffix + ".provenance.json"),
         source=source,
         sink=sink,
         params={
             "method": method,
             "iterations": niter_list,
             "tile_limits": tile_limits,
+            "output_format": output_format_key,
+            "output_dtype": str(output_dtype or "float32"),
+            "projection": projection_key if project_output else "stack",
+            "timepoints": timepoints,
             "convergence": convergence,
             "rel_threshold": rel_threshold,
             "background": background,
@@ -1392,7 +1441,7 @@ def _run_streaming_regular_image(
     print(f"    Completed  : {summary['tiles_completed']}/{summary['tiles_total']} tile writes")
     print(f"    Time       : {_format_duration(time.time() - t0)}")
     print(f"    Provenance : {provenance.name}")
-    return out_zarr
+    return out_file
 
 
 def main(argv):
@@ -1413,7 +1462,6 @@ def main(argv):
         ex_value = run_params.ex_value
         pinhole_airy = run_params.pinhole_airy
         tv_lambda = run_params.tv_lambda
-        damping = run_params.damping
         background = run_params.background
         offset = run_params.offset
         prefilter_sigma = run_params.prefilter_sigma
@@ -1443,10 +1491,13 @@ def main(argv):
         bench_crop = run_params.bench_crop
         compute_metrics = run_params.compute_metrics
         output_format = run_params.output_format
+        output_dtype = run_params.output_dtype
         streaming_mode = run_params.streaming_mode
         tile_limits = run_params.tile_limits
         streaming_threshold_gb = run_params.streaming_threshold_gb
-        scene = run_params.scene
+        t_start = run_params.t_start
+        t_stop = run_params.t_stop
+        t_step = run_params.t_step
         hcs_field = run_params.hcs_field
         two_d_mode = run_params.two_d_mode
         two_d_wf_aggressiveness = run_params.two_d_wf_aggressiveness
@@ -1465,13 +1516,13 @@ def main(argv):
         print(f"  Device       : {device_param}")
         print(f"  Projection   : {projection}")
         print(f"  Output format: {output_format}")
+        print(f"  Output dtype : {output_dtype}")
         tile_text = "auto" if int(tile_limits[0]) <= 0 else f"{tile_limits[0]} px"
         print(f"  Streaming    : {streaming_mode} (threshold={streaming_threshold_gb:g} GB, tile={tile_text})")
+        print(f"  T range      : start={t_start}, stop={'last' if int(t_stop) <= 0 else t_stop}, step={t_step}")
         print(f"  Metadata     : {'overrule image metadata' if overrule_metadata else 'use image metadata'}")
         if method == "ci_rl_tv":
             print(f"  TV lambda    : {tv_lambda}")
-        if method in ("ci_rl", "ci_rl_tv"):
-            print(f"  Damping      : {damping}")
         if method == "ci_sparse_hessian":
             print(f"  Sparse weight: {sparse_hessian_weight}")
             print(f"  Sparse reg   : {sparse_hessian_reg}")
@@ -1526,7 +1577,6 @@ def main(argv):
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
                     tv_lambda=tv_lambda,
-                    damping=damping,
                     sparse_hessian_weight=sparse_hessian_weight,
                     sparse_hessian_reg=sparse_hessian_reg,
                     background=background,
@@ -1590,7 +1640,6 @@ def main(argv):
                     pixel_size_xy=px_xy_override,
                     pixel_size_z=px_z_override,
                     tv_lambda=tv_lambda,
-                    damping=damping,
                     sparse_hessian_weight=sparse_hessian_weight,
                     sparse_hessian_reg=sparse_hessian_reg,
                     background=background,
@@ -1631,33 +1680,63 @@ def main(argv):
 
             try:
                 use_streaming = False
-                if projection != "none" and output_format == "ome-zarr":
-                    raise ValueError("OME-Zarr output currently writes full Z data; set projection=none.")
+                selected_timepoints: list[int] | None = None
                 if streaming_mode not in ("auto", "always", "never"):
                     raise ValueError("--streaming must be auto, always, or never")
+                if int(t_start) != 1 or int(t_stop) > 0 or int(t_step) != 1:
+                    probe_source = open_region_source(img_path, hcs_field=hcs_field)
+                    selected_timepoints = normalise_timepoint_indices(
+                        probe_source.shape[0],
+                        start=t_start,
+                        stop=(None if int(t_stop) <= 0 else t_stop),
+                        step=t_step,
+                        one_based=True,
+                    )
+                    if selected_timepoints != list(range(probe_source.shape[0])):
+                        use_streaming = True
+                        print(
+                            "  Streaming enabled for selected T frames: "
+                            + ", ".join(str(t + 1) for t in selected_timepoints)
+                        )
                 if streaming_mode == "always":
                     use_streaming = True
                 elif streaming_mode == "auto":
                     try:
-                        probe_source = open_region_source(img_path, scene=scene, hcs_field=hcs_field)
+                        probe_source = open_region_source(img_path, hcs_field=hcs_field)
                         use_streaming = should_stream_source(
                             probe_source.shape,
                             threshold_gb=streaming_threshold_gb,
                         )
-                        if use_streaming:
-                            print(
-                                "  Streaming auto-enabled: source shape "
-                                f"{probe_source.shape} exceeds {streaming_threshold_gb:g} GB threshold."
+                        if selected_timepoints is None:
+                            selected_timepoints = normalise_timepoint_indices(
+                                probe_source.shape[0],
+                                start=t_start,
+                                stop=(None if int(t_stop) <= 0 else t_stop),
+                                step=t_step,
+                                one_based=True,
                             )
+                        if selected_timepoints != list(range(probe_source.shape[0])):
+                            use_streaming = True
+                        if use_streaming:
+                            if should_stream_source(probe_source.shape, threshold_gb=streaming_threshold_gb):
+                                print(
+                                    "  Streaming auto-enabled: source shape "
+                                    f"{probe_source.shape} exceeds {streaming_threshold_gb:g} GB threshold."
+                                )
                     except Exception as probe_exc:
                         print(f"  Streaming probe unavailable; using eager load ({probe_exc})")
 
                 if use_streaming:
-                    if projection != "none":
-                        raise ValueError("Streaming output currently writes full Z data; set projection=none.")
-                    if output_format not in ("ome-zarr", "zarr"):
-                        print("  Large image detected; switching output format to OME-Zarr for streamed float output.")
-                    out_zarr = _run_streaming_regular_image(
+                    if selected_timepoints is None:
+                        probe_source = open_region_source(img_path, hcs_field=hcs_field)
+                        selected_timepoints = normalise_timepoint_indices(
+                            probe_source.shape[0],
+                            start=t_start,
+                            stop=(None if int(t_stop) <= 0 else t_stop),
+                            step=t_step,
+                            one_based=True,
+                        )
+                    out_streamed = _run_streaming_regular_image(
                         img_path,
                         out_path,
                         stem=_stem(img_resource.filename),
@@ -1675,7 +1754,6 @@ def main(argv):
                         pixel_size_z=px_z_override,
                         overrule_metadata=overrule_metadata,
                         tv_lambda=tv_lambda,
-                        damping=damping,
                         sparse_hessian_weight=sparse_hessian_weight,
                         sparse_hessian_reg=sparse_hessian_reg,
                         background=background,
@@ -1697,10 +1775,13 @@ def main(argv):
                         two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
                         two_d_wf_bg_scale=two_d_wf_bg_scale,
                         tile_limits=tile_limits,
-                        scene=scene,
+                        output_format=output_format,
+                        output_dtype=output_dtype,
+                        projection=projection,
+                        timepoints=selected_timepoints,
                         hcs_field=hcs_field,
                     )
-                    print(f"  Output path : {out_zarr}")
+                    print(f"  Output path : {out_streamed}")
                     elapsed = time.time() - t0
                     print("\n  Timing summary")
                     print(f"    Total      : {_format_duration(elapsed)}")
@@ -1744,7 +1825,6 @@ def main(argv):
                 if method == "ci_rl_tv":
                     print(f"    TV lambda  : {tv_lambda}")
                 if method in ("ci_rl", "ci_rl_tv"):
-                    print(f"    Damping    : {damping}")
                     print(f"    2D WF mode : {two_d_mode} "
                           f"(aggr={two_d_wf_aggressiveness}, "
                           f"bg radius={two_d_wf_bg_radius_um} um, "
@@ -1799,7 +1879,6 @@ def main(argv):
                             method=method,
                             niter=ch_niter,
                             background=background,
-                            damping=damping,
                             offset=offset,
                             prefilter_sigma=prefilter_sigma,
                             start=start,
@@ -1867,17 +1946,17 @@ def main(argv):
                             proj_result["source_channels"] = [
                                 ch.astype(np.float32).sum(axis=0) for ch in result["source_channels"]
                             ]
-                    save_result(proj_result, str(tmp_file))
+                    save_result(proj_result, str(tmp_file), output_dtype=output_dtype)
                     print(f"  Saved {projection.upper()}: {out_name}")
                 else:
                     if output_format == "ome-zarr":
                         out_name = f"{stem}_decon.ome.zarr"
                         tmp_file = tmp_work / out_name
-                        save_result_ome_zarr(result, tmp_file)
+                        save_result_ome_zarr(result, tmp_file, output_dtype=output_dtype)
                     else:
                         out_name = f"{stem}_decon.ome.tiff"
                         tmp_file = tmp_work / out_name
-                        save_result(result, str(tmp_file))
+                        save_result(result, str(tmp_file), output_dtype=output_dtype)
                     print(f"  Saved: {out_name}")
                 save_time = time.time() - t_save
 
@@ -2513,7 +2592,6 @@ def _run_benchmark(
     pixel_size_z,
     overrule_metadata,
     tv_lambda,
-    damping,
     sparse_hessian_weight,
     sparse_hessian_reg,
     background,
@@ -2678,7 +2756,6 @@ def _run_benchmark(
                 method=m,
                 niter=niter_list,
                 tv_lambda=tv_lambda if m == "ci_rl_tv" else 0.0,
-                damping=damping if m in ("ci_rl", "ci_rl_tv") else 0.0,
                 sparse_hessian_weight=sparse_hessian_weight if m == "ci_sparse_hessian" else 0.6,
                 sparse_hessian_reg=sparse_hessian_reg if m == "ci_sparse_hessian" else 0.98,
                 **common_kw,

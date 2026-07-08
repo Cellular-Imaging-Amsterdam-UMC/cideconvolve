@@ -53,6 +53,7 @@ bin/
 
 # Private build / push scripts
 run.cmd
+!tools/leica_nyquist_finder/run.cmd
 pushdocker.cmd
 release_github.cmd
 *.ps1

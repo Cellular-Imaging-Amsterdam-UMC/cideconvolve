@@ -48,7 +48,7 @@ async function renderParameters() {
         <tbody>
           ${rows.map((p) => `
             <tr>
-              <td><strong>${text(p.label)}</strong><br><span class="muted">${text(p.name)}</span></td>
+              <td><span class="param-name">${text(p.label)}</span><br><span class="muted">${text(p.name)}</span></td>
               <td><code>${text(p.cli_tag)}</code></td>
               <td><code>${text(p.default)}</code></td>
               <td>${text(p.type)}${p.options && p.options.length ? `<br><span class="muted">${text(p.options)}</span>` : ""}</td>
@@ -69,4 +69,3 @@ renderParameters().catch((err) => {
   const mount = document.querySelector("[data-parameters]");
   if (mount) mount.innerHTML = `<p class="callout">Could not load parameter manual: ${err}</p>`;
 });
-

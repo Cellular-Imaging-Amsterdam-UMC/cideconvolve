@@ -1,35 +1,120 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Algorithm - CIDeconvolve</title><link rel="stylesheet" href="assets/site.css"></head>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Algorithm - CIDeconvolve</title>
+  <link rel="stylesheet" href="assets/site.css">
+</head>
 <body>
   <header class="site-header"><nav class="nav"><a class="brand" href="index.html"><span class="brand-mark">CI</span><span>CIDeconvolve</span></a><div class="nav-links"><a href="gui.html">GUI</a><a href="commandline.html">Command line</a><a href="docker.html">Docker</a><a href="omero.html">OMERO</a><a href="bilayers.html">Bilayers</a><a href="parameters.html">Parameters</a><a href="algorithm.html">Algorithm</a><a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></div></nav></header>
   <main>
-    <section class="wrap page-title"><span class="eyebrow">Under the hood</span><h1>Algorithm notes</h1><p>CIDeconvolve combines physical PSF generation, GPU FFT convolution, robust metadata handling, and several deconvolution objectives.</p></section>
-    <section class="wrap grid">
-      <div class="card"><h3>ci_rl</h3><p>Richardson-Lucy with Scaled Heavy Ball acceleration. It keeps the familiar RL update but adds momentum to reach useful results faster.</p></div>
-      <div class="card"><h3>ci_rl_tv</h3><p>SHB-RL plus Total Variation regularisation. It is useful when high iteration counts would otherwise amplify noise.</p></div>
-      <div class="card"><h3>ci_sparse_hessian</h3><p>A variational sparse-Hessian method for filament-like or sparse structures where thin details matter.</p></div>
+    <section class="wrap page-title">
+      <span class="eyebrow">Algorithm notes</span>
+      <h1>How CIDeconvolve processes an image</h1>
+      <p>CIDeconvolve combines a physical point spread function, FFT-based convolution, Richardson-Lucy style updates, optional regularisation, and OME-aware writing. This page summarizes the implementation in a form meant for users and workflow maintainers.</p>
     </section>
-    <section class="wrap split">
-      <div>
-        <h2>PSF model</h2>
-        <p class="muted">The PSF path uses microscope type, emission/excitation wavelengths, NA, lateral/axial pixel size, immersion/sample refractive indices, coverslip settings, confocal pinhole, and optional pixel integration.</p>
-        <ul>
-          <li>Vectorial Richards-Wolf model for high NA settings.</li>
-          <li>Scalar model for lower NA settings.</li>
-          <li>Gibson-Lanni style optical path difference corrections.</li>
-          <li>2D widefield auto mode collapses a physically generated PSF for single-plane data.</li>
-        </ul>
+
+    <section class="wrap content">
+      <h2>Processing overview</h2>
+      <p>The input image is read as channels, Z planes, timepoints, and XY pixels. Metadata is used whenever possible for pixel spacing, emission and excitation wavelengths, numerical aperture, refractive index, microscope type, and confocal pinhole. Parameters entered in the GUI, CLI, or workflow wrapper act as fallbacks or explicit overrides depending on the selected option.</p>
+      <div class="steps">
+        <div class="step"><div><h3>Read image and metadata</h3><p>OME-TIFF, OME-Zarr, regular TIFF and optional microscopy readers are normalized into the internal axis order used by the solver.</p></div></div>
+        <div class="step"><div><h3>Build the PSF</h3><p>A physical PSF is generated from the microscope settings and voxel spacing. For 2D widefield data, the automatically selected mode uses a physically generated PSF adapted to single-plane processing.</p></div></div>
+        <div class="step"><div><h3>Deconvolve each channel</h3><p>The selected algorithm runs on GPU when available, with CPU fallback. Large images can be split into overlapping tiles.</p></div></div>
+        <div class="step"><div><h3>Write OME output</h3><p>Results are saved as OME-TIFF or OME-Zarr with physical metadata, channel display information, pyramids where supported, and CIDeconvolve provenance.</p></div></div>
       </div>
-      <div class="media-frame"><video src="movies/RPE-1_Gamma_IR_2.4Gy_1_0.5_NIR_iterations.mp4" controls muted playsinline></video></div>
-    </section>
-    <section class="wrap grid two">
-      <div class="card"><h3>Streaming and tiling</h3><p>Large images are processed as halo-extended XY tiles. Only the core tile is written to output, then pyramid levels are built from level 0.</p></div>
-      <div class="card"><h3>Read more</h3><p>The full derivation and implementation notes live in <a href="DECONVOLVE_CI.MD">DECONVOLVE_CI.MD</a>. Benchmark metric details are in <a href="metrics.md">metrics.md</a>.</p></div>
+
+      <h2>Point spread function</h2>
+      <p>The PSF describes how an ideal point of light is blurred by the microscope. CIDeconvolve generates it from the available optical settings rather than requiring a measured bead PSF for routine use.</p>
+      <div class="grid two">
+        <div class="card">
+          <h3>Microscope parameters</h3>
+          <p>The PSF uses microscope type, NA, emission and excitation wavelengths, lateral and axial pixel size, immersion and sample refractive index, coverslip information, and confocal pinhole size when relevant.</p>
+        </div>
+        <div class="card">
+          <h3>Model choice</h3>
+          <p>High-NA settings use a vectorial Richards-Wolf style model. Lower-NA settings can use a scalar model. Optical path difference corrections follow the Gibson-Lanni family of microscope PSF models.</p>
+        </div>
+      </div>
+
+      <h2>Deconvolution methods</h2>
+      <p>The solver works in the Fourier domain. Convolution with the PSF is represented by multiplication with the optical transfer function, so each iteration can reuse efficient FFT operations.</p>
+
+      <h3>Accelerated Richardson-Lucy: <code>ci_rl</code></h3>
+      <p>The default method is Richardson-Lucy deconvolution with Scaled Heavy Ball momentum. The update remains multiplicative and positive like classical RL, but an extrapolated estimate is used before the forward projection.</p>
+      <pre class="formula"><code>p_k = x_k + alpha_k * (x_k - x_{k-1})
+y   = H p_k
+r   = observed / max(y, epsilon)
+x   = p_k * H^T r * boundary_weight</code></pre>
+      <p>The momentum factor starts conservatively and increases with iteration number. In practice this usually reaches a useful reconstruction with fewer iterations than plain Richardson-Lucy while keeping the same FFT cost per iteration.</p>
+
+      <h3>Total variation regularisation: <code>ci_rl_tv</code></h3>
+      <p>This method adds a total variation correction after the accelerated RL update. TV regularisation discourages noisy pixel-to-pixel oscillations while preserving edges. For anisotropic 3D data, axial derivatives are scaled by the ratio between lateral and axial pixel spacing so that Z is not treated as if it had the same sampling as XY.</p>
+
+      <h3>Sparse Hessian regularisation: <code>ci_sparse_hessian</code></h3>
+      <p>The sparse-Hessian method combines a data term from the PSF forward model with a prior that penalizes second-order structure. It is useful for sparse or filament-like samples where preserving thin structures is important.</p>
+      <pre class="formula"><code>loss = reg * poisson_data_term(Hx, observed)
+     + (1 - reg) * sparse_hessian_prior(x)</code></pre>
+      <p><code>sparse_hessian_reg</code> controls the balance between data fidelity and regularisation. <code>sparse_hessian_weight</code> controls the balance inside the prior.</p>
+
+      <h2>Stability and preprocessing</h2>
+      <p>Several small implementation details help the iterative solver behave well on real fluorescence data.</p>
+      <div class="grid two">
+        <div class="card">
+          <h3>Background floor</h3>
+          <p>The automatic background estimate uses robust low-intensity statistics. It acts as a positivity floor and as a safe denominator for ratio calculations.</p>
+        </div>
+        <div class="card">
+          <h3>Initial estimate</h3>
+          <p>The automatic start mode chooses between flat, observed, background-subtracted, low-pass, and hybrid initial estimates based on microscope type and robust image statistics.</p>
+        </div>
+        <div class="card">
+          <h3>Offset and prefilter</h3>
+          <p>An automatic processing offset can stabilize very low-valued pixels. Optional prefiltering smooths in an Anscombe-like domain before deconvolution to reduce non-Poisson detector noise.</p>
+        </div>
+        <div class="card">
+          <h3>Boundary correction</h3>
+          <p>Bertero-style boundary weights compensate for incomplete PSF support near image edges, reducing edge artefacts compared with uncorrected zero padding.</p>
+        </div>
+      </div>
+
+      <h2>Convergence</h2>
+      <p>Fixed mode runs the requested number of iterations. Automatic convergence monitors the I-divergence between the observed image and the current forward projection. When relative improvement becomes smaller than the configured threshold, the solver stops early.</p>
+      <pre class="formula"><code>I = mean(observed * log(observed / prediction) - observed + prediction)</code></pre>
+
+      <h2>Large images and time series</h2>
+      <p>Large-image streaming processes one region at a time instead of materialising the whole result in memory. XY tiles are read with halo overlap so that deconvolution has context beyond the tile edge. Only the central tile core is written into the output. For OME-TIFF and OME-Zarr, pyramid levels are generated from the written level 0 data so the result remains usable in viewers that expect multiscale images.</p>
+      <p>For time series, the GUI and wrappers can save a selected T range and skip frames. This makes test exports practical before running a full acquisition.</p>
+
+      <h2>Output data type</h2>
+      <p>Float32 output preserves the numerical solver result directly. UInt16 output is available for smaller files and viewer compatibility. When converting to UInt16, the result is scaled from robust intensity limits instead of simply clipping high floating-point values.</p>
+
+      <h2>Diagnostic metrics</h2>
+      <p>Metrics are optional and are intended as diagnostics, not as a ground-truth quality score. For large images the calculation uses a deterministic sample, keeping at most 32 Z planes and 512 pixels in Y and X. Each sampled channel is normalized to the range 0 to 1 before metrics are calculated.</p>
+      <div class="grid two">
+        <div class="card"><h3>Detail energy</h3><p>Measures how much Fourier power lies in higher spatial frequencies. A moderate increase often reflects sharper structures; very large increases can also indicate ringing or noise.</p></div>
+        <div class="card"><h3>Bright detail energy</h3><p>Applies the frequency measurement mainly to the brightest signal regions, which is often more informative for fluorescence images with dark background.</p></div>
+        <div class="card"><h3>Edge strength</h3><p>Uses average gradient magnitude to summarize sharper local transitions. It should be read together with the visual result.</p></div>
+        <div class="card"><h3>Signal sparsity and robust range</h3><p>Sparsity describes how concentrated the signal is. Robust range reports the 0.5 to 99.5 percentile spread, giving context for intensity redistribution.</p></div>
+      </div>
+      <div class="note-panel"><p>Useful metric patterns are usually modest increases in detail energy, bright detail energy, and signal sparsity, with robust range used as context. Visual inspection and sample knowledge remain essential.</p></div>
+
+      <h2>References</h2>
+      <p>The implementation draws on standard microscopy deconvolution literature and established open-source implementations.</p>
+      <ul>
+        <li>Richardson, W. H. (1972). Bayesian-based iterative method of image restoration.</li>
+        <li>Lucy, L. B. (1974). An iterative technique for the rectification of observed distributions.</li>
+        <li>Wang, C. and Miller, E. L. (2014). Scaled Heavy-Ball acceleration for Richardson-Lucy deconvolution.</li>
+        <li>Dey, N. et al. (2006). Richardson-Lucy deconvolution with total variation regularisation for 3D confocal microscopy.</li>
+        <li>Bertero, M. and Boccacci, P. (2005). Boundary effect correction in image deconvolution.</li>
+        <li>Gibson, S. F. and Lanni, F. (1991). Experimental test of an analytical model of aberration in optical microscopy.</li>
+        <li>Richards, B. and Wolf, E. (1959). Electromagnetic diffraction in optical systems.</li>
+        <li>Koho, S. et al. (2019). Fourier ring correlation in fluorescence microscopy restoration.</li>
+      </ul>
     </section>
   </main>
   <footer class="site-footer"><a href="parameters.html">Parameters</a> · <a href="https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve">GitHub</a></footer>
   <script src="assets/site.js"></script>
 </body>
 </html>
-

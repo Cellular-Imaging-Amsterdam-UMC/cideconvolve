@@ -464,7 +464,11 @@ def _pyramid_levels(data: np.ndarray, mode: str) -> list[np.ndarray]:
         current = _downsample_xy_mean(current)
         if current.shape[3] < 1 or current.shape[4] < 1:
             break
-        levels.append(current.astype(np.float32, copy=False))
+        if data.dtype == np.dtype("uint16"):
+            current = np.clip(np.rint(current), 0, 65535).astype(np.uint16)
+        else:
+            current = current.astype(np.float32, copy=False)
+        levels.append(current)
     return levels
 
 
@@ -537,6 +541,7 @@ def save_result_ome_zarr(
     *,
     overwrite: bool = True,
     pyramid: str = "auto",
+    output_dtype: str = "float32",
 ) -> Path:
     """Write a deconvolution result as OME-Zarr v0.4 / Zarr v2.
 
@@ -564,6 +569,18 @@ def save_result_ome_zarr(
 
     data = _result_to_tczyx(result)
     metadata = dict(result.get("metadata") or {})
+    if str(output_dtype or "float32").strip().lower() in {"uint16", "ushort", "u16"}:
+        from .streaming import (
+            _encode_block_to_uint16,
+            _metadata_with_uint16_encoding,
+            _uint16_encoding_from_array,
+        )
+
+        encoding = _uint16_encoding_from_array(data)
+        metadata = _metadata_with_uint16_encoding(metadata, encoding)
+        data = _encode_block_to_uint16(data, encoding)
+    elif str(output_dtype or "float32").strip().lower() not in {"float", "float32", "single"}:
+        raise ValueError(f"Unsupported output dtype {output_dtype!r}; expected float32 or uint16")
     metadata = _metadata_with_display_windows(metadata, data)
     px_x = float(metadata.get("pixel_size_x") or 1.0)
     px_y = float(metadata.get("pixel_size_y") or px_x)

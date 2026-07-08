@@ -49,7 +49,6 @@ A quality-focused **sparse-Hessian / SPITFIRE-style** variational method.  Combi
 
 ### Stabilisation and PSF options
 
-- **Noise-gated damping** (`--damping`) — per-voxel correction attenuation in low-signal regions
 - **Positive offsetting** (`--offset`) — pre-shift before iteration to prevent division by zero
 - **Anscombe prefiltering** (`--prefilter_sigma`) — variance-stabilised Gaussian smoothing before deconvolution
 - **Initial estimate** (`--start auto|flat|percentile_flat|observed|observed_bgsub|lowpass|lowpass_bgsub|hybrid`)
@@ -84,12 +83,11 @@ These flags are understood only by `gui_deconvolve_ci.py` and are **not** part o
 | Flag | Effect |
 |---|---|
 | `--movie` | Reveals the **Iteration Movie** panel in Advanced Parameters for exporting per-iteration MP4 / GIF recordings. |
-| `--fitpsf` | Reveals the **Fit PSF** panel for experimental refractive-index fitting from the loaded image. |
 
-Example — enable movie export and Fit PSF:
+Example — enable movie export:
 
 ```bash
-python gui/gui_deconvolve_ci.py --movie --fitpsf
+python gui/gui_deconvolve_ci.py --movie
 ```
 
 ### Layout
@@ -97,7 +95,7 @@ python gui/gui_deconvolve_ci.py --movie --fitpsf
 | Area | What it contains |
 |---|---|
 | **Top workflow bar** | **Open…**, source **Recent**, run progress/status, **Save…**, **Save T-Series…**, **Settings…**, settings **Recent**, **Log**, **Help**, **Batch…**, and **Run Deconvolution** |
-| **Left controls** | Loaded-file summary, metadata warning/reset controls, method settings, 2D widefield controls, optics/PSF, refractive indices, advanced parameters, optional Fit PSF / movie controls, and run history |
+| **Left controls** | Loaded-file summary, metadata warning/reset controls, method settings, 2D widefield controls, optics/PSF, refractive indices, advanced parameters, optional movie controls, and run history |
 | **Right viewer** | Channel buttons, 2D/3D view modes, projection, display scaling, navigator, scale bar, Z/T sliders, and linked original/deconvolved panes |
 | **Status bar** | Cursor readout, messages, and live CPU/RAM/SWAP/GPU/VRAM/SPILL monitor |
 
@@ -153,15 +151,11 @@ Drag-and-drop uses the same loading path as the Open menu.  Large pyramidal OMER
 | RI sample | `1.47` | editable spin box |
 
 #### Advanced parameters (collapsible)
-- **Method Tuning** — TV lambda, damping mode/value, sparse-Hessian weight/reg, background mode/value, offset mode/value, prefilter sigma, convergence check interval, and device (`auto`, `cuda`, `cpu`).
+- **Method Tuning** — TV lambda, sparse-Hessian weight/reg, background mode/value, offset mode/value, prefilter sigma, convergence check interval, and device (`auto`, `cuda`, `cpu`).
 - **2D Widefield Expert** — background estimator radius (`0.50 µm`) and auto background scale (`1.00`) for 2D widefield auto mode.
 - **Coverslip / Depth** — actual/design coverslip thickness, design immersion thickness, and particle depth.
 - **PSF Advanced** — pixel integration toggle, sub-pixel count, and pupil sampling density.
 - **Iteration Movie** — shown only with `--movie`; exports MP4 and optional half-size GIF recordings of the iteration sequence.
-
-#### Optional Fit PSF panel
-
-When launched with `--fitpsf`, the GUI shows a **Fit PSF** panel with a fit-iteration count and **Fit PSF…** button.  It searches the sample refractive index using the currently selected viewer channels, with a rough scan followed by a fine scan.
 
 ### Dual-pane viewer (right panel)
 
@@ -252,7 +246,7 @@ Position_3_decon.ome.zarr
 
 For Leica sources, `save_child_name` is used as the table name and output filename base when available.
 
-Batch OME-TIFF output uses tiled BigTIFF internally, LZW lossless compression with floating-point predictor, and SubIFD pyramid levels when pyramids are enabled.  Batch OME-Zarr output is chunked and multiscale.  Existing outputs at the target path are overwritten.
+Batch OME-TIFF output uses streamed BigTIFF writing with LZW lossless compression.  OME-Zarr output is chunked and multiscale.  Existing outputs at the target path are overwritten.
 
 ### Image quality metrics
 
@@ -327,12 +321,15 @@ The public CLI parameters are defined in `config.yaml` and exposed via `wrapper.
 | `--convergence` | `auto` | Early stopping: `auto` or fixed iteration count: `fixed` |
 | `--rel_threshold` | `0.005` | Relative I-divergence change threshold for early stopping |
 | `--device` | `auto` | `auto`, `cpu`, or `cuda` |
-| `--projection` | `none` | Z-projection: `none`, `mip`, or `sum` |
-| `--output_format` | `ome-zarr` | `ome-tiff` for eager saves; `ome-zarr` writes chunked output with pyramids |
+| `--projection` | `none` | Z-projection: `none`, `mip`, `sum`, or `mean` |
+| `--output_format` | `ome-zarr` | `ome-tiff` or chunked multiscale `ome-zarr` |
+| `--output_dtype` | `float32` | `float32` for quantitative output, or globally scaled `uint16` to reduce size without clipping high values |
 | `--streaming` | `auto` | `auto`, `always`, or `never`; auto enables region reads above `--streaming_threshold_gb` |
 | `--streaming_threshold_gb` | `2.0` | Estimated full source-array size that triggers streaming auto mode |
-| `--scene` | `auto` | Optional BioIO scene index/name for multi-scene files |
-| `--hcs_field` | `auto` | Optional OME-Zarr HCS field path, for example `A/1/0` |
+| `--t_start` | `1` | First T frame to save, using 1-based inclusive indexing |
+| `--t_stop` | `0` | Last T frame to save, using 1-based inclusive indexing; `0` means final frame |
+| `--t_step` | `1` | Save every Nth T frame in the selected T range |
+| `--hcs_field` | `auto` | Optional OME-Zarr HCS field path for single-field reads, for example `A/1/0`; full HCS plate inputs ignore this and process every field |
 
 #### PSF / optics
 
@@ -354,7 +351,6 @@ The public CLI parameters are defined in `config.yaml` and exposed via `wrapper.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--tv_lambda` | `0.0001` | TV regularisation strength (for `ci_rl_tv`; typical 0.00005–0.001) |
-| `--damping` | `none` | Noise-gated damping: `none`, `auto`, or numeric |
 | `--offset` | `auto` | Positive processing offset: `auto`, `none`, or numeric |
 | `--prefilter_sigma` | `0.0` | Anscombe-domain Gaussian prefilter sigma in pixels |
 | `--start` | `auto` | Initial estimate: `auto`, `flat`, `percentile_flat`, `observed`, `observed_bgsub`, `lowpass`, `lowpass_bgsub`, or `hybrid` |
@@ -397,15 +393,21 @@ python wrapper.py \
 ```
 
 Streaming mode reads halo-extended XY regions, deconvolves each tile with the
-existing CI solver, writes the tile core directly to level 0, then builds XY
-pyramid levels in the output.  Tile size is selected automatically from the
-source shape, method, device, and available memory.  For 3D data the current
-streaming implementation keeps the full Z extent per tile to avoid axial
-boundary artefacts.
+existing CI solver, and writes the tile core directly to the output.  OME-Zarr
+and OME-TIFF exports build XY pyramid levels.  OME-TIFF exports are written as
+tiled BigTIFFs without private tags for QuPath/Bio-Formats compatibility;
+float32 TIFFs keep TIFF predictors off, while uint16 TIFFs use the standard
+integer predictor.  `--output_dtype uint16` maps the full float output range to
+`0..65535` and records the scale/offset in CIDeconvolve metadata so high values
+are not clipped.  Tile size is selected
+automatically from the source shape, method, device, and available memory.  For
+3D data the current streaming implementation keeps the full Z extent per tile
+to avoid axial boundary artefacts.
 
 `--streaming auto` enables this path when the estimated full source array
-exceeds `--streaming_threshold_gb`.  Streaming output currently writes full Z
-data, so use `--projection none` with OME-Zarr streaming.
+exceeds `--streaming_threshold_gb`, or when a T subset is requested.  Use
+`--projection mip`, `--projection sum`, or `--projection mean` to stream a
+Z-projected output instead of the full stack.
 
 ---
 

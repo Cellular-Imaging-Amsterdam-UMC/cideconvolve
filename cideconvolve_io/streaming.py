@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Protocol, Sequence
 
@@ -144,6 +146,136 @@ def _as_zyx_result(result: np.ndarray) -> np.ndarray:
 
 def _copy_metadata(metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
     return dict(metadata or {})
+
+
+def _normalise_output_dtype(dtype: Any = "float32") -> np.dtype:
+    text = str(dtype or "float32").strip().lower()
+    if text in {"float", "float32", "single"}:
+        return np.dtype("float32")
+    if text in {"uint16", "ushort", "u16"}:
+        return np.dtype("uint16")
+    raise ValueError(f"Unsupported output dtype {dtype!r}; expected float32 or uint16")
+
+
+def _iter_chunk_slices(shape: Sequence[int], chunks: Sequence[int]):
+    ranges = [range(0, int(size), max(1, int(chunk))) for size, chunk in zip(shape, chunks)]
+    for starts in product(*ranges):
+        yield tuple(
+            slice(start, min(start + max(1, int(chunk)), int(size)))
+            for start, size, chunk in zip(starts, shape, chunks)
+        )
+
+
+def _finite_min_max_chunked(arr: Any, chunks: Sequence[int] | None = None) -> tuple[float, float]:
+    shape = tuple(int(v) for v in arr.shape)
+    chunks = tuple(int(v) for v in (chunks or getattr(arr, "chunks", None) or (1, 1, 1, 512, 512)))
+    if len(chunks) != len(shape):
+        chunks = tuple(max(1, min(int(size), 512)) for size in shape)
+    min_value = math.inf
+    max_value = -math.inf
+    for slc in _iter_chunk_slices(shape, chunks):
+        block = np.asarray(arr[slc], dtype=np.float32)
+        if block.size == 0:
+            continue
+        finite = np.isfinite(block)
+        if not finite.any():
+            continue
+        values = block[finite]
+        min_value = min(min_value, float(values.min()))
+        max_value = max(max_value, float(values.max()))
+    if not math.isfinite(min_value) or not math.isfinite(max_value):
+        return 0.0, 0.0
+    return min_value, max_value
+
+
+def _uint16_encoding_from_array(arr: Any, chunks: Sequence[int] | None = None) -> dict[str, Any]:
+    min_value, max_value = _finite_min_max_chunked(arr, chunks)
+    offset = min_value if min_value < 0.0 else 0.0
+    span = max_value - offset
+    scale = float(span / 65535.0) if span > 0.0 else 1.0
+    return {
+        "source_dtype": "float32",
+        "encoded_dtype": "uint16",
+        "scale": scale,
+        "offset": float(offset),
+        "float_min": float(min_value),
+        "float_max": float(max_value),
+        "decode": "float = uint16 * scale + offset",
+        "no_high_value_clipping": True,
+    }
+
+
+def _metadata_with_uint16_encoding(metadata: dict[str, Any], encoding: dict[str, Any]) -> dict[str, Any]:
+    meta = dict(metadata or {})
+    meta["output_dtype"] = "uint16"
+    meta["uint16_scale"] = float(encoding["scale"])
+    meta["uint16_offset"] = float(encoding["offset"])
+    meta["uint16_float_min"] = float(encoding["float_min"])
+    meta["uint16_float_max"] = float(encoding["float_max"])
+    meta["uint16_decode"] = str(encoding["decode"])
+    meta["intensity_encoding"] = dict(encoding)
+    return meta
+
+
+def _encode_block_to_uint16(block: np.ndarray, encoding: dict[str, Any]) -> np.ndarray:
+    scale = float(encoding.get("scale") or 1.0)
+    offset = float(encoding.get("offset") or 0.0)
+    values = (np.asarray(block, dtype=np.float32) - np.float32(offset)) / np.float32(scale)
+    values = np.nan_to_num(values, nan=0.0, posinf=65535.0, neginf=0.0)
+    values = np.rint(values)
+    values = np.clip(values, 0.0, 65535.0)
+    return values.astype(np.uint16, copy=False)
+
+
+def _encode_array_to_uint16(src: Any, dst: Any, encoding: dict[str, Any], chunks: Sequence[int] | None = None) -> None:
+    shape = tuple(int(v) for v in src.shape)
+    chunks = tuple(int(v) for v in (chunks or getattr(src, "chunks", None) or (1, 1, 1, 512, 512)))
+    if len(chunks) != len(shape):
+        chunks = tuple(max(1, min(int(size), 512)) for size in shape)
+    for slc in _iter_chunk_slices(shape, chunks):
+        dst[slc] = _encode_block_to_uint16(np.asarray(src[slc], dtype=np.float32), encoding)
+
+
+def normalise_timepoint_indices(
+    size_t: int,
+    *,
+    start: Any = None,
+    stop: Any = None,
+    step: Any = 1,
+    one_based: bool = True,
+) -> list[int]:
+    """Return selected source timepoint indices as zero-based integers.
+
+    User-facing controls use one-based inclusive ranges.  Programmatic callers
+    can set ``one_based=False`` for zero-based inclusive ranges.
+    """
+    total = max(int(size_t or 1), 1)
+
+    def _coerce(value: Any, default: int) -> int:
+        if value in (None, "", "auto", "last"):
+            return default
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    raw_start = _coerce(start, 1 if one_based else 0)
+    raw_stop = _coerce(stop, total if one_based else total - 1)
+    raw_step = max(_coerce(step, 1), 1)
+    if one_based:
+        first = raw_start - 1
+        last = raw_stop - 1
+    else:
+        first = raw_start
+        last = raw_stop
+    first = max(0, min(first, total - 1))
+    last = max(0, min(last, total - 1))
+    if last < first:
+        raise ValueError(f"T stop ({raw_stop}) must be greater than or equal to T start ({raw_start})")
+    selected = list(range(first, last + 1, raw_step))
+    if not selected:
+        selected = [first]
+    return selected
 
 
 def _coerce_rgb(color: Any) -> tuple[int, int, int] | None:
@@ -287,6 +419,14 @@ def _metadata_description(metadata: dict[str, Any]) -> str:
         parts.append(f"SampleRI={metadata['sample_refractive_index']}")
     if metadata.get("microscope_type"):
         parts.append(f"Microscope={metadata['microscope_type']}")
+    if metadata.get("output_dtype") == "uint16" and metadata.get("uint16_scale") is not None:
+        parts.append(
+            "CIDeconvolve uint16 scaling: "
+            f"float = uint16 * {float(metadata.get('uint16_scale')):.9g} "
+            f"+ {float(metadata.get('uint16_offset') or 0.0):.9g}; "
+            f"float_min={float(metadata.get('uint16_float_min') or 0.0):.9g}; "
+            f"float_max={float(metadata.get('uint16_float_max') or 0.0):.9g}"
+        )
     defaulted = sorted(str(key) for key in (metadata.get("_defaulted_keys") or []))
     if defaulted:
         parts.append("CIDeconvolve metadata defaults: " + ", ".join(defaulted))
@@ -294,6 +434,53 @@ def _metadata_description(metadata: dict[str, Any]) -> str:
     if warnings:
         parts.append("CIDeconvolve metadata warnings: " + " | ".join(warnings))
     return "; ".join(parts)
+
+
+def _decode_scaled_uint16_if_needed(data: np.ndarray, metadata: dict[str, Any]) -> np.ndarray:
+    arr = np.asarray(data, dtype=np.float32)
+    encoding = metadata.get("intensity_encoding")
+    if isinstance(encoding, dict):
+        encoded_dtype = str(encoding.get("encoded_dtype") or "").lower()
+        scale = encoding.get("scale")
+        offset = encoding.get("offset", 0.0)
+    else:
+        encoded_dtype = str(metadata.get("output_dtype") or "").lower()
+        scale = metadata.get("uint16_scale")
+        offset = metadata.get("uint16_offset", 0.0)
+    if encoded_dtype != "uint16" or scale is None:
+        return arr
+    try:
+        scale_f = float(scale)
+        offset_f = float(offset or 0.0)
+    except (TypeError, ValueError):
+        return arr
+    if not math.isfinite(scale_f) or scale_f <= 0.0:
+        return arr
+    return arr * np.float32(scale_f) + np.float32(offset_f)
+
+
+def _merge_uint16_encoding_from_ome_xml(meta: dict[str, Any], ome_xml: str | None) -> None:
+    if not ome_xml or "CIDeconvolve uint16 scaling" not in ome_xml:
+        return
+    pattern = (
+        r"float\s*=\s*uint16\s*\*\s*([0-9eE+\-.]+)\s*\+\s*([0-9eE+\-.]+);"
+        r"\s*float_min=([0-9eE+\-.]+);\s*float_max=([0-9eE+\-.]+)"
+    )
+    match = re.search(pattern, ome_xml)
+    if not match:
+        return
+    scale, offset, float_min, float_max = (float(value) for value in match.groups())
+    encoding = {
+        "source_dtype": "float32",
+        "encoded_dtype": "uint16",
+        "scale": scale,
+        "offset": offset,
+        "float_min": float_min,
+        "float_max": float_max,
+        "decode": "float = uint16 * scale + offset",
+        "no_high_value_clipping": True,
+    }
+    meta.update(_metadata_with_uint16_encoding(meta, encoding))
 
 
 def _apply_basic_metadata_defaults(meta: dict[str, Any], shape: tuple[int, int, int, int, int]) -> dict[str, Any]:
@@ -447,15 +634,23 @@ class BioImageRegionSource:
                     meta[key] = value
         except Exception:
             pass
+        if self.path.suffix.lower() in {".tif", ".tiff"} or self.path.name.lower().endswith((".ome.tif", ".ome.tiff")):
+            try:
+                import tifffile
+
+                with tifffile.TiffFile(str(self.path)) as tif:
+                    _merge_uint16_encoding_from_ome_xml(meta, tif.ome_metadata)
+            except Exception:
+                pass
         self.metadata = _apply_basic_metadata_defaults(meta, self.shape)
 
     def read_region(self, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
         selector: dict[str, Any] = {"T": int(t), "C": int(c)}
         if hasattr(self._img, "get_image_dask_data"):
             arr = self._img.get_image_dask_data("ZYX", **selector)
-            return np.asarray(arr[z, y, x].compute(), dtype=np.float32)
+            return _decode_scaled_uint16_if_needed(np.asarray(arr[z, y, x].compute(), dtype=np.float32), self.metadata)
         arr = self._img.get_image_data("ZYX", **selector)
-        return np.asarray(arr[z, y, x], dtype=np.float32)
+        return _decode_scaled_uint16_if_needed(np.asarray(arr[z, y, x], dtype=np.float32), self.metadata)
 
 
 class ZarrRegionSource:
@@ -567,6 +762,11 @@ class ZarrRegionSource:
                     info["window_end"] = window.get("end")
                 channels.append(info)
             meta["channels"] = channels
+        for key in ("cideconvolve", "_creator"):
+            payload = attrs.get(key)
+            if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
+                meta.update(dict(payload["metadata"]))
+                break
         return meta
 
     def read_region(self, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
@@ -581,7 +781,7 @@ class ZarrRegionSource:
             data = self._array[y, x][np.newaxis, :, :]
         else:  # pragma: no cover - protected by _infer_layout
             raise ValueError(f"Unsupported layout {kind}")
-        return np.asarray(data, dtype=np.float32)
+        return _decode_scaled_uint16_if_needed(np.asarray(data, dtype=np.float32), self.metadata)
 
     def read_pyramid_level(self, level: int, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
         array = self._group[str(int(level))]
@@ -661,7 +861,7 @@ class OmeZarrRegionSource:
             data = self._array[y, x][np.newaxis, :, :]
         else:
             raise ValueError(f"Unsupported OME-Zarr layout {kind}")
-        return np.asarray(data.compute(), dtype=np.float32)
+        return _decode_scaled_uint16_if_needed(np.asarray(data.compute(), dtype=np.float32), self.metadata)
 
     def read_pyramid_level(self, level: int, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
         old_array = self._array
@@ -673,6 +873,46 @@ class OmeZarrRegionSource:
         finally:
             self._array = old_array
             self._layout = old_layout
+
+
+class TimepointSubsetRegionSource:
+    """Region-source wrapper that remaps output T to selected source T frames."""
+
+    def __init__(
+        self,
+        source: ImageRegionSource,
+        timepoints: Sequence[int],
+        *,
+        source_id: str | None = None,
+    ):
+        self.source = source
+        source_shape = tuple(int(v) for v in source.shape)
+        size_t = max(source_shape[0], 1)
+        selected = [max(0, min(int(t), size_t - 1)) for t in timepoints]
+        if not selected:
+            selected = list(range(size_t))
+        self.timepoints = selected
+        self.shape = (len(selected), *source_shape[1:])
+        self.metadata = _copy_metadata(getattr(source, "metadata", {}))
+        self.metadata["size_t"] = len(selected)
+        self.metadata["default_t"] = 0
+        self.metadata["source_timepoints_zero_based"] = list(selected)
+        self.metadata["source_timepoints_one_based"] = [int(t) + 1 for t in selected]
+        self.metadata["timepoint_selection"] = {
+            "source_indices_zero_based": list(selected),
+            "source_indices_one_based": [int(t) + 1 for t in selected],
+        }
+        self.source_id = source_id or f"{getattr(source, 'source_id', 'source')}[T={','.join(str(t) for t in selected)}]"
+
+    def _source_t(self, t: int) -> int:
+        index = max(0, min(int(t), len(self.timepoints) - 1))
+        return int(self.timepoints[index])
+
+    def read_region(self, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
+        return self.source.read_region(t=self._source_t(t), c=c, z=z, y=y, x=x)
+
+    def read_pyramid_level(self, level: int, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
+        return self.source.read_pyramid_level(level, t=self._source_t(t), c=c, z=z, y=y, x=x)
 
 
 def open_region_source(
@@ -746,6 +986,7 @@ class ZarrPyramidSink:
         levels: int | None = None,
         zarr_format: int = 2,
         resume: bool = True,
+        output_dtype: Any = "float32",
     ):
         import zarr
 
@@ -755,6 +996,10 @@ class ZarrPyramidSink:
         self.levels = int(levels) if levels is not None else _default_pyramid_levels(self.shape[-2:])
         self.zarr_format = int(zarr_format)
         self.resume = bool(resume)
+        self.output_dtype = _normalise_output_dtype(output_dtype)
+        self._storage_dtype = np.dtype("float32")
+        self._uint16_encoding: dict[str, Any] | None = None
+        self._converted_output_dtype = np.dtype("float32")
         self.path.mkdir(parents=True, exist_ok=True)
         self._manifest_path = self.path / ".cideconvolve_stream_manifest.json"
         self._completed = self._load_manifest()
@@ -786,29 +1031,48 @@ class ZarrPyramidSink:
         except Exception:
             return {}
 
-    def _require_array(self, name: str, shape: tuple[int, ...], chunks: tuple[int, ...]):
-        if name in self._root:
-            arr = self._root[name]
-            if tuple(arr.shape) != tuple(shape):
-                raise ValueError(f"Existing Zarr level {name} has shape {arr.shape}, expected {shape}")
-            return arr
+    def _create_array(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        chunks: tuple[int, ...],
+        dtype: Any,
+        *,
+        overwrite: bool = False,
+    ):
         if hasattr(self._root, "create_array"):
             return self._root.create_array(
                 name,
                 shape=shape,
                 chunks=chunks,
-                dtype="float32",
-                overwrite=False,
+                dtype=np.dtype(dtype),
+                overwrite=overwrite,
                 **self._compressor_kwargs,
             )
         return self._root.create_dataset(
             name,
             shape=shape,
             chunks=chunks,
-            dtype="float32",
-            overwrite=False,
+            dtype=np.dtype(dtype),
+            overwrite=overwrite,
             **self._compressor_kwargs,
         )
+
+    def _require_array(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        chunks: tuple[int, ...],
+        dtype: Any = "float32",
+    ):
+        if name in self._root:
+            arr = self._root[name]
+            if tuple(arr.shape) != tuple(shape):
+                raise ValueError(f"Existing Zarr level {name} has shape {arr.shape}, expected {shape}")
+            if np.dtype(arr.dtype) != np.dtype(dtype):
+                raise ValueError(f"Existing Zarr level {name} has dtype {arr.dtype}, expected {np.dtype(dtype)}")
+            return arr
+        return self._create_array(name, shape, chunks, dtype, overwrite=False)
 
     def _load_manifest(self) -> set[str]:
         if not self.resume or not self._manifest_path.exists():
@@ -977,7 +1241,7 @@ class ZarrPyramidSink:
                 self.path,
                 self.metadata,
                 self.shape,
-                np.dtype("float32"),
+                self._converted_output_dtype,
                 str(self.metadata.get("name") or self.path.name),
             )
 
@@ -998,7 +1262,7 @@ class ZarrPyramidSink:
                 min(512, shape[3]),
                 min(512, shape[4]),
             )
-            out = self._require_array(str(level), shape, chunks)
+            out = self._require_array(str(level), shape, chunks, "float32")
             _downsample_array_2x_xy(current, out)
             current = out
         self._write_metadata_stub()
@@ -1011,7 +1275,44 @@ class ZarrPyramidSink:
         if "multiscales" not in self._root.attrs:
             raise ValueError("OME-Zarr output is missing multiscales metadata")
 
+    def _delete_array(self, name: str) -> None:
+        try:
+            del self._root[name]
+        except Exception:
+            try:
+                self._root.store.delete_dir(name)  # type: ignore[attr-defined]
+            except Exception:
+                raise
+
+    def _rewrite_arrays_as_uint16(self) -> None:
+        if self._converted_output_dtype == np.dtype("uint16"):
+            return
+        level_names = sorted([str(name) for name in self._root.keys() if str(name).isdigit()], key=int)
+        if not level_names:
+            return
+        encoding = _uint16_encoding_from_array(self._root["0"], getattr(self._root["0"], "chunks", None))
+        self._uint16_encoding = encoding
+        self.metadata = _metadata_with_uint16_encoding(self.metadata, encoding)
+        for name in level_names:
+            src = self._root[name]
+            shape = tuple(int(v) for v in src.shape)
+            chunks = tuple(int(v) for v in getattr(src, "chunks", self._chunks))
+            tmp_name = f"__uint16_{name}"
+            if tmp_name in self._root:
+                self._delete_array(tmp_name)
+            tmp = self._create_array(tmp_name, shape, chunks, "uint16", overwrite=True)
+            _encode_array_to_uint16(src, tmp, encoding, chunks)
+            self._delete_array(name)
+            out = self._create_array(name, shape, chunks, "uint16", overwrite=True)
+            for slc in _iter_chunk_slices(shape, chunks):
+                out[slc] = tmp[slc]
+            self._delete_array(tmp_name)
+        self._level0 = self._root["0"]
+        self._converted_output_dtype = np.dtype("uint16")
+
     def close(self) -> None:
+        if self.output_dtype == np.dtype("uint16"):
+            self._rewrite_arrays_as_uint16()
         self._write_metadata_stub()
         self._save_manifest()
 
@@ -1031,17 +1332,24 @@ class TiledOmeTiffSink:
         *,
         shape: tuple[int, int, int, int, int],
         metadata: Optional[dict[str, Any]] = None,
-        tile_yx: tuple[int, int] = (512, 512),
+        tile_yx: tuple[int, int] | None = (512, 512),
         levels: int | None = None,
         compression: str | None = "lzw",
+        predictor: bool = True,
+        output_dtype: Any = "float32",
         temp_dir: str | Path | None = None,
+        write_private_metadata: bool = True,
     ):
         self.path = Path(path)
         self.shape = tuple(int(v) for v in shape)
         self.metadata = _apply_basic_metadata_defaults(_copy_metadata(metadata), self.shape)
-        self.tile_yx = (max(16, int(tile_yx[0])), max(16, int(tile_yx[1])))
+        self.tile_yx = None if tile_yx is None else (max(16, int(tile_yx[0])), max(16, int(tile_yx[1])))
         self.levels = int(levels) if levels is not None else _default_pyramid_levels(self.shape[-2:])
         self.compression = compression
+        self.predictor = bool(predictor)
+        self.output_dtype = _normalise_output_dtype(output_dtype)
+        self._uint16_encoding: dict[str, Any] | None = None
+        self.write_private_metadata = bool(write_private_metadata)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._tmp_root = Path(temp_dir) if temp_dir is not None else None
         self._tmpdir = Path(tempfile.mkdtemp(prefix="cideconv_tiff_", dir=str(self._tmp_root) if self._tmp_root else None))
@@ -1145,7 +1453,7 @@ class TiledOmeTiffSink:
             channel_meta["PinholeSizeUnit"] = pinhole_units
         return {
             "Name": str(self.metadata.get("name") or self.path.stem),
-            "axes": "TCZYX",
+            "axes": "TZCYX",
             "Description": _metadata_description(self.metadata),
             "PhysicalSizeX": px_x,
             "PhysicalSizeXUnit": "µm",
@@ -1159,6 +1467,25 @@ class TiledOmeTiffSink:
     def _description_metadata(self) -> str:
         return json.dumps(_cideconvolve_metadata_payload(self.metadata, self.shape), default=str)
 
+    def _arrays_for_tiff_write(self) -> tuple[Any, list[Any]]:
+        if self.output_dtype != np.dtype("uint16"):
+            return self._level0, list(self._pyramids)
+        encoding = _uint16_encoding_from_array(self._level0)
+        self._uint16_encoding = encoding
+        self.metadata = _metadata_with_uint16_encoding(self.metadata, encoding)
+        level0_path = self._tmpdir / "level0_uint16.dat"
+        level0 = np.memmap(level0_path, dtype="uint16", mode="w+", shape=self._level0.shape)
+        _encode_array_to_uint16(self._level0, level0, encoding)
+        level0.flush()
+        pyramids: list[np.memmap] = []
+        for index, pyramid in enumerate(self._pyramids, start=1):
+            path = self._tmpdir / f"level{index}_uint16.dat"
+            out = np.memmap(path, dtype="uint16", mode="w+", shape=pyramid.shape)
+            _encode_array_to_uint16(pyramid, out, encoding)
+            out.flush()
+            pyramids.append(out)
+        return level0, pyramids
+
     def _write_tiff_once(self, compression: str | None) -> None:
         try:
             import tifffile
@@ -1170,39 +1497,43 @@ class TiledOmeTiffSink:
         self._level0.flush()
         for pyramid in self._pyramids:
             pyramid.flush()
+        level0, pyramids = self._arrays_for_tiff_write()
 
-        tile = (
-            self._tile_dim(self.tile_yx[0], int(self.shape[-2])),
-            self._tile_dim(self.tile_yx[1], int(self.shape[-1])),
-        )
         write_kwargs = {
             "photometric": "minisblack",
-            "tile": tile,
             "metadata": self._ome_metadata(),
-            "extratags": [(65000, "s", 0, self._description_metadata(), True)],
         }
-        if self._pyramids:
-            write_kwargs["subifds"] = len(self._pyramids)
+        if self.write_private_metadata:
+            write_kwargs["extratags"] = [(65000, "s", 0, self._description_metadata(), True)]
+        if self.tile_yx is not None:
+            write_kwargs["tile"] = (
+                self._tile_dim(self.tile_yx[0], int(self.shape[-2])),
+                self._tile_dim(self.tile_yx[1], int(self.shape[-1])),
+            )
+        if pyramids:
+            write_kwargs["subifds"] = len(pyramids)
         if compression:
             write_kwargs["compression"] = compression
-            write_kwargs["predictor"] = True
+            if self.tile_yx is not None and self.predictor:
+                write_kwargs["predictor"] = True
 
         with tifffile.TiffWriter(str(self.path), bigtiff=True, ome=True) as tif:
-            tif.write(self._level0, **write_kwargs)
-            for pyramid in self._pyramids:
-                level_tile = (
-                    self._tile_dim(self.tile_yx[0], int(pyramid.shape[-2])),
-                    self._tile_dim(self.tile_yx[1], int(pyramid.shape[-1])),
-                )
+            tif.write(np.transpose(level0, (0, 2, 1, 3, 4)), **write_kwargs)
+            for pyramid in pyramids:
                 level_kwargs = {
                     "photometric": "minisblack",
-                    "tile": level_tile,
                     "subfiletype": 1,
                 }
+                if self.tile_yx is not None:
+                    level_kwargs["tile"] = (
+                        self._tile_dim(self.tile_yx[0], int(pyramid.shape[-2])),
+                        self._tile_dim(self.tile_yx[1], int(pyramid.shape[-1])),
+                    )
                 if compression:
                     level_kwargs["compression"] = compression
-                    level_kwargs["predictor"] = True
-                tif.write(pyramid, **level_kwargs)
+                    if self.tile_yx is not None and self.predictor:
+                        level_kwargs["predictor"] = True
+                tif.write(np.transpose(pyramid, (0, 2, 1, 3, 4)), **level_kwargs)
 
     def _write_tiff(self) -> None:
         try:

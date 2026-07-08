@@ -1035,7 +1035,6 @@ def deconvolve(
     # Richardson-Lucy parameters
     niter: int = 30,
     background: Union[int, str] = "auto",
-    damping: Union[str, float] = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
     start: str = "auto",
@@ -1067,8 +1066,6 @@ def deconvolve(
         Number of iterations / optimisation steps (default: 30).
     background : int or str
         Background subtraction (default: 'auto').
-    damping : str or float
-        Noise-gated damping for RL-family methods (default: 0 / disabled).
     start : str
         Initial estimate for iterative solvers: ``"auto"``, ``"flat"``,
         ``"percentile_flat"``, ``"observed"``, ``"observed_bgsub"``,
@@ -1115,7 +1112,6 @@ def deconvolve(
     return _deconvolve_ci_method(
         image, psf, niter=niter,
         method=method,
-        damping=damping,
         background=background, offset=offset,
         prefilter_sigma=prefilter_sigma, start=start,
         convergence=convergence, rel_threshold=rel_threshold,
@@ -1138,7 +1134,6 @@ def _deconvolve_ci_method(
     *,
     method: str = "ci_rl",
     niter: int = 50,
-    damping: Union[str, float] = 0.0,
     background: Union[int, str] = "auto",
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
@@ -1180,7 +1175,6 @@ def _deconvolve_ci_method(
         raise ValueError("The focused CLI package only supports method='ci_rl'.")
     result = ci_rl_deconvolve(
         tv_lambda=0.0,
-        damping=damping,
         microscope_type=microscope_type,
         two_d_mode=two_d_mode,
         two_d_wf_aggressiveness=two_d_wf_aggressiveness,
@@ -1225,7 +1219,6 @@ def deconvolve_image(
     # Deconvolution options
     niter: Union[int, list[int]] = 30,
     background: Union[int, str] = "auto",
-    damping: Union[str, float] = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
     start: str = "auto",
@@ -1353,7 +1346,7 @@ def deconvolve_image(
                 )
             result = deconvolve(
                 time_img, psf, method=method,
-                niter=ch_niter, background=background, damping=damping, offset=offset,
+                niter=ch_niter, background=background, offset=offset,
                 prefilter_sigma=prefilter_sigma, start=start,
                 convergence=convergence, rel_threshold=rel_threshold,
                 check_every=check_every, device=device,
@@ -1538,6 +1531,7 @@ def save_result(
     compress: bool = True,
     mip_only: bool = False,
     save_qc_mips: bool = True,
+    output_dtype: str = "float32",
 ) -> Path:
     """Save deconvolved images as OME-TIFF, preserving metadata.
 
@@ -1645,15 +1639,25 @@ def save_result(
         if description:
             ome_meta["Description"] = description
 
-        tifffile.imwrite(
-            str(output_path),
-            stack.astype(np.float32),
-            ome=True,
-            photometric="minisblack",
-            compression="zlib" if compress else None,
-            resolution=resolution,
-            resolutionunit=resolution_unit,
-            metadata=ome_meta,
+        from cideconvolve_io.ome_tiff_io import write_tczyx_ome_tiff
+
+        save_meta = dict(metadata)
+        save_meta.setdefault("channel_names", channel_names[:len(channels_data)])
+        if axes == "TCZYX":
+            tczyx = stack
+        elif axes == "TCYX":
+            tczyx = stack[:, :, np.newaxis, :, :]
+        elif axes == "CZYX":
+            tczyx = stack[np.newaxis, :, :, :, :]
+        else:
+            tczyx = stack[np.newaxis, :, np.newaxis, :, :]
+        write_tczyx_ome_tiff(
+            tczyx.astype(np.float32, copy=False),
+            output_path,
+            metadata=save_meta,
+            levels=None,
+            compression="lzw" if compress else None,
+            output_dtype=output_dtype,
         )
         logger.info("Saved deconvolved result to %s", output_path)
 

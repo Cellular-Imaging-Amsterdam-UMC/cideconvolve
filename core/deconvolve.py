@@ -624,43 +624,84 @@ def load_image(
                 meta.update(data["metadata"])
                 images.extend(data["images"])
             else:
-                from core.ome_zarr_io import open_ome_zarr_image_node, zarr_attrs
+                try:
+                    from core.ome_zarr_io import open_ome_zarr_image_node, zarr_attrs
 
-                image_path, node = open_ome_zarr_image_node(path)
-                arr = node.data[0]
-                shape = tuple(int(v) for v in arr.shape)
-                node_meta = dict(getattr(node, "metadata", {}) or {})
-                raw_attrs = zarr_attrs(image_path)
-                logger.info("Reading OME-Zarr image group: %s", image_path)
-                if len(shape) == 5:
-                    size_t, size_c, size_z, size_y, size_x = shape
+                    image_path, node = open_ome_zarr_image_node(path)
+                    arr = node.data[0]
+                    shape = tuple(int(v) for v in arr.shape)
+                    node_meta = dict(getattr(node, "metadata", {}) or {})
+                    raw_attrs = zarr_attrs(image_path)
+                    logger.info("Reading OME-Zarr image group: %s", image_path)
+                    if len(shape) == 5:
+                        size_t, size_c, size_z, size_y, size_x = shape
+                        for c in range(size_c):
+                            channel_data = arr[0, c].compute()
+                            images.append(np.asarray(channel_data, dtype=np.float32))
+                    elif len(shape) == 4:
+                        size_t = 1
+                        size_c, size_z, size_y, size_x = shape
+                        for c in range(size_c):
+                            channel_data = arr[c].compute()
+                            images.append(np.asarray(channel_data, dtype=np.float32))
+                    elif len(shape) == 3:
+                        size_t = 1
+                        size_c, size_y, size_x = shape
+                        size_z = 1
+                        for c in range(size_c):
+                            channel_data = arr[c].compute()
+                            images.append(np.asarray(channel_data, dtype=np.float32))
+                    elif len(shape) == 2:
+                        size_t, size_c, size_z = 1, 1, 1
+                        size_y, size_x = shape
+                        images.append(np.asarray(arr.compute(), dtype=np.float32))
+                    else:
+                        raise ValueError(f"Unsupported OME-Zarr array shape: {shape}")
+                    for key in ("cideconvolve", "_creator"):
+                        payload = raw_attrs.get(key) or node_meta.get(key)
+                        if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
+                            meta.update(dict(payload["metadata"]))
+                            break
+                    if node_meta.get("name"):
+                        meta["name"] = node_meta["name"]
+                    transforms = node_meta.get("coordinateTransformations") or []
+                    if transforms and isinstance(transforms[0], list):
+                        for transform in transforms[0]:
+                            if transform.get("type") != "scale":
+                                continue
+                            scale = transform.get("scale", [])
+                            if len(scale) == 5:
+                                meta["pixel_size_z"] = scale[2]
+                                meta["pixel_size_y"] = scale[3]
+                                meta["pixel_size_x"] = scale[4]
+                            elif len(scale) == 4:
+                                meta["pixel_size_z"] = scale[1]
+                                meta["pixel_size_y"] = scale[2]
+                                meta["pixel_size_x"] = scale[3]
+                            elif len(scale) == 3:
+                                meta["pixel_size_y"] = scale[1]
+                                meta["pixel_size_x"] = scale[2]
+                            break
+                except Exception as zarr_exc:
+                    logger.warning("ome-zarr reader unavailable for %s; using direct Zarr fallback: %s", path, zarr_exc)
+                    from core.streaming import ZarrRegionSource
+
+                    direct = ZarrRegionSource(path)
+                    size_t, size_c, size_z, size_y, size_x = direct.shape
+                    meta.update(dict(direct.metadata))
                     for c in range(size_c):
-                        channel_data = arr[0, c].compute()
-                        images.append(np.asarray(channel_data, dtype=np.float32))
-                elif len(shape) == 4:
-                    size_t = 1
-                    size_c, size_z, size_y, size_x = shape
-                    for c in range(size_c):
-                        channel_data = arr[c].compute()
-                        images.append(np.asarray(channel_data, dtype=np.float32))
-                elif len(shape) == 3:
-                    size_t = 1
-                    size_c, size_y, size_x = shape
-                    size_z = 1
-                    for c in range(size_c):
-                        channel_data = arr[c].compute()
-                        images.append(np.asarray(channel_data, dtype=np.float32))
-                elif len(shape) == 2:
-                    size_t, size_c, size_z = 1, 1, 1
-                    size_y, size_x = shape
-                    images.append(np.asarray(arr.compute(), dtype=np.float32))
-                else:
-                    raise ValueError(f"Unsupported OME-Zarr array shape: {shape}")
-                for key in ("cideconvolve", "_creator"):
-                    payload = raw_attrs.get(key) or node_meta.get(key)
-                    if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
-                        meta.update(dict(payload["metadata"]))
-                        break
+                        images.append(
+                            np.asarray(
+                                direct.read_region(
+                                    t=0,
+                                    c=c,
+                                    z=slice(0, size_z),
+                                    y=slice(0, size_y),
+                                    x=slice(0, size_x),
+                                ),
+                                dtype=np.float32,
+                            )
+                        )
                 meta.update({
                     "size_t": size_t,
                     "size_c": size_c,
@@ -669,26 +710,6 @@ def load_image(
                     "size_x": size_x,
                     "n_channels": size_c,
                 })
-                if node_meta.get("name"):
-                    meta["name"] = node_meta["name"]
-                transforms = node_meta.get("coordinateTransformations") or []
-                if transforms and isinstance(transforms[0], list):
-                    for transform in transforms[0]:
-                        if transform.get("type") != "scale":
-                            continue
-                        scale = transform.get("scale", [])
-                        if len(scale) == 5:
-                            meta["pixel_size_z"] = scale[2]
-                            meta["pixel_size_y"] = scale[3]
-                            meta["pixel_size_x"] = scale[4]
-                        elif len(scale) == 4:
-                            meta["pixel_size_z"] = scale[1]
-                            meta["pixel_size_y"] = scale[2]
-                            meta["pixel_size_x"] = scale[3]
-                        elif len(scale) == 3:
-                            meta["pixel_size_y"] = scale[1]
-                            meta["pixel_size_x"] = scale[2]
-                        break
 
         elif companion_path is not None and path.suffix == ".ome":
             # Find the associated TIFF files from the companion
@@ -1055,7 +1076,6 @@ def deconvolve(
     # Richardson-Lucy parameters
     niter: int = 30,
     background: Union[int, str] = "auto",
-    damping: Union[str, float] = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
     start: str = "auto",
@@ -1095,8 +1115,6 @@ def deconvolve(
         Number of iterations / optimisation steps (default: 30).
     background : int or str
         Background subtraction (default: 'auto').
-    damping : str or float
-        Noise-gated damping for RL-family methods (default: 0 / disabled).
     start : str
         Initial estimate for iterative solvers: ``"auto"``, ``"flat"``,
         ``"percentile_flat"``, ``"observed"``, ``"observed_bgsub"``,
@@ -1151,7 +1169,6 @@ def deconvolve(
         image, psf, niter=niter,
         method=method,
         tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
-        damping=damping if method in ("ci_rl", "ci_rl_tv") else 0.0,
         sparse_hessian_weight=sparse_hessian_weight,
         sparse_hessian_reg=sparse_hessian_reg,
         background=background, offset=offset,
@@ -1177,7 +1194,6 @@ def _deconvolve_ci_method(
     method: str = "ci_rl",
     niter: int = 50,
     tv_lambda: float = 0.0,
-    damping: Union[str, float] = 0.0,
     sparse_hessian_weight: float = 0.6,
     sparse_hessian_reg: float = 0.98,
     background: Union[int, str] = "auto",
@@ -1229,7 +1245,6 @@ def _deconvolve_ci_method(
     else:
         result = ci_rl_deconvolve(
             tv_lambda=tv_lambda,
-            damping=damping,
             microscope_type=microscope_type,
             two_d_mode=two_d_mode,
             two_d_wf_aggressiveness=two_d_wf_aggressiveness,
@@ -1274,7 +1289,6 @@ def deconvolve_image(
     # Deconvolution options
     niter: Union[int, list[int]] = 30,
     background: Union[int, str] = "auto",
-    damping: Union[str, float] = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
     start: str = "auto",
@@ -1385,7 +1399,7 @@ def deconvolve_image(
         # Deconvolve
         result = deconvolve(
             img, psf, method=method,
-            niter=ch_niter, background=background, damping=damping, offset=offset,
+            niter=ch_niter, background=background, offset=offset,
             prefilter_sigma=prefilter_sigma, start=start,
             convergence=convergence, rel_threshold=rel_threshold,
             check_every=check_every, device=device,
@@ -1571,6 +1585,8 @@ def save_result(
     *,
     compress: bool = True,
     mip_only: bool = False,
+    save_qc_mips: bool = True,
+    output_dtype: str = "float32",
 ) -> Path:
     """Save deconvolved images as OME-TIFF, preserving metadata.
 
@@ -1581,10 +1597,12 @@ def save_result(
     output_path : str or Path
         Output file path (.ome.tiff).
     compress : bool
-        Whether to apply zlib compression (default: True).
+        Whether to apply lossless compression (default: True).
     mip_only : bool
         If True, skip writing OME-TIFF files and only save MIP PNGs.
         Useful for benchmark mode where TIFFs are not needed.
+    save_qc_mips : bool
+        If True, write the auxiliary MIP OME-TIFF/PNG files.
 
     Returns
     -------
@@ -1668,15 +1686,21 @@ def save_result(
         if description:
             ome_meta["Description"] = description
 
-        tifffile.imwrite(
-            str(output_path),
-            stack.astype(np.float32),
-            ome=True,
-            photometric="minisblack",
-            compression="zlib" if compress else None,
-            resolution=resolution,
-            resolutionunit=resolution_unit,
-            metadata=ome_meta,
+        from cideconvolve_io.ome_tiff_io import write_tczyx_ome_tiff
+
+        save_meta = dict(metadata)
+        save_meta.setdefault("channel_names", channel_names[:len(channels_data)])
+        if stack.ndim == 4:
+            tczyx = stack[np.newaxis, :, :, :, :]
+        else:
+            tczyx = stack[np.newaxis, :, np.newaxis, :, :]
+        write_tczyx_ome_tiff(
+            tczyx.astype(np.float32, copy=False),
+            output_path,
+            metadata=save_meta,
+            levels=None,
+            compression="lzw" if compress else None,
+            output_dtype=output_dtype,
         )
         logger.info("Saved deconvolved result to %s", output_path)
 
@@ -1687,7 +1711,7 @@ def save_result(
     else:
         mip = stack  # Already (C, Y, X) — use as-is for montage
 
-    if mip is not None:
+    if save_qc_mips and mip is not None:
         mip_path = output_path.parent / ("mip_" + output_path.name)
         tifffile.imwrite(
             str(mip_path),
@@ -1720,7 +1744,7 @@ def save_result(
     # Save maximum intensity projection of the source image for 3D data
     # For 2D, save the source directly with mip_ prefix for montage
     source_channels = result.get("source_channels")
-    if source_channels:
+    if save_qc_mips and source_channels:
         src_mip_path = output_path.parent / "mip_source.ome.tiff"
         src_stack = np.stack(source_channels, axis=0)
         if axes == "CZYX":

@@ -296,18 +296,6 @@
   },
   {
     "group": "parameters",
-    "name": "scene",
-    "label": "Image Scene",
-    "type": "textbox",
-    "default": "auto",
-    "cli_tag": "--scene",
-    "mode": "advanced",
-    "section_id": "advanced",
-    "description": "Optional scene index or name for multi-scene images. Use auto for the default scene.",
-    "options": []
-  },
-  {
-    "group": "parameters",
     "name": "hcs_field",
     "label": "OME-Zarr HCS Field",
     "type": "textbox",
@@ -428,18 +416,6 @@
     "mode": "advanced",
     "section_id": "advanced",
     "description": "Positive offset added during processing and removed afterwards. Use auto, none, 0, or a numeric value.",
-    "options": []
-  },
-  {
-    "group": "parameters",
-    "name": "damping",
-    "label": "Damping",
-    "type": "textbox",
-    "default": "none",
-    "cli_tag": "--damping",
-    "mode": "advanced",
-    "section_id": "advanced",
-    "description": "Noise-gated damping for ci_rl and ci_rl_tv. Use none, auto, or a numeric value.",
     "options": []
   },
   {

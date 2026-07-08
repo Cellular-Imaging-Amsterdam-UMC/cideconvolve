@@ -195,35 +195,7 @@ non-Poisson detector noise.
 Hermitian symmetry of real-valued data to store only half the complex spectrum. This
 halves the memory cost of all frequency-domain buffers compared to sdeconv's `torch.fft.fftn`.
 
-### 8. Noise-Gated Damping
-**Source**: [Laasmaa et al. 2011](#ref11); [Conchello 1998](#ref12).
-
-**What it does**: Attenuates the RL update in background (noisy) regions while leaving
-bright structures untouched. The multiplicative correction factor is raised to a per-voxel
-power γ ∈ (0, 1]:
-
-```
-correction_damped = correction ^ γ(x)
-γ(x) = 1 − exp(−(x − bg) / (damping · σ))
-```
-
-Where:
-- `x` is the current estimate at each voxel
-- `bg` is the estimated background level
-- `σ` is the noise standard deviation (estimated via MAD of the lowest 25% of voxels)
-- `damping` is the user-controlled strength parameter
-
-Pixels near the background floor are heavily damped (γ → 0, correction → 1, i.e. no
-change) while bright signal regions get the full RL update (γ → 1). The noise σ is
-estimated once using a robust MAD estimator: σ ≈ 1.4826 · median(|x − median(x)|)
-computed on the lowest quartile of voxels.
-
-**Modes**:
-- `damping=0` — disabled (default)
-- `damping="auto"` — automatic strength of 3.0
-- `damping=<float>` — manual strength (typical range: 1.0–10.0)
-
-### 9. XY Tiling (Large Image Support)
+### 8. XY Tiling (Large Image Support)
 **What it does**: Splits large images into overlapping XY tiles that are
 deconvolved independently and stitched back together. This makes it possible to
 process images that would not fit in GPU memory as a single volume.
@@ -374,7 +346,6 @@ historical center-slice-only 2D PSF approximation.
 | `psf` | ndarray | required | Point Spread Function (same dimensionality as image) |
 | `niter` | int | 50 | Maximum number of iterations |
 | `tv_lambda` | float | 0.0 | TV regularization strength (0 = disabled) |
-| `damping` | str/float | 0.0 | Noise-gated damping: `0` (disabled), `"auto"` (strength 3.0), or float > 0 |
 | `offset` | str/float | "auto" | Positive processing offset: `"auto"` (=5), float, or 0 |
 | `prefilter_sigma` | float | 0.0 | Anscombe-domain Gaussian prefilter sigma in pixels |
 | `start` | str | "auto" | Initial estimate: `"auto"`, `"flat"`, `"percentile_flat"`, `"observed"`, `"observed_bgsub"`, `"lowpass"`, `"lowpass_bgsub"`, or `"hybrid"` |
@@ -502,7 +473,6 @@ The return dictionary has the same structure as `ci_rl_deconvolve`, but the
 20. <a id="ref20"></a>Bertero, M., Boccacci, P., Desiderà, G. & Vicidomini, G. (2009). "Image deblurring with Poisson data: from cells to galaxies." *Inverse Problems* 25(12):123006.\
     [doi:10.1088/0266-5611/25/12/123006](https://doi.org/10.1088/0266-5611/25/12/123006)
 
-21. <a id="ref21"></a>Kirshner, H., Aguet, F., Sage, D. & Unser, M. (2013). "3-D PSF fitting for fluorescence microscopy: implementation and localization application." *Journal of Microscopy* 249(1):13–25.\
     [doi:10.1111/j.1365-2818.2012.03675.x](https://doi.org/10.1111/j.1365-2818.2012.03675.x)
 
 22. <a id="ref22"></a>Vonesch, C. & Unser, M. (2008). "A fast thresholded Landweber algorithm for wavelet-regularized multidimensional deconvolution." *IEEE Transactions on Image Processing* 17(4):539–549.\
@@ -545,8 +515,6 @@ deconvolve_ci.py
 │   ├── _prepare_otf()             — PSF → OTF with padding
 │   ├── _bertero_weights()         — boundary correction
 │   ├── _axis_scales()             — anisotropy-aware derivative scaling
-│   ├── _estimate_noise_sigma()    — MAD-based noise σ (lowest 25%)
-│   ├── _damping_map()             — per-voxel γ for noise-gated damping
 │   ├── _anscombe_prefilter()      — variance-stabilising prefilter
 │   ├── _resolve_tiling()          — tiling mode → tile count
 │   ├── _ci_deconvolve_tiled()     — tiled deconvolution dispatcher

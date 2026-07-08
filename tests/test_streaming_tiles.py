@@ -11,6 +11,7 @@ from core.streaming import (
     InMemoryPyramidSink,
     InMemoryRegionSource,
     ProjectionPyramidSink,
+    TimepointSubsetRegionSource,
     ZarrRegionSource,
     ZarrPyramidSink,
     compute_tile_regions,
@@ -126,6 +127,40 @@ def test_projection_sink_saves_z_projection_only() -> None:
     np.testing.assert_allclose(inner.data[0, 0, 0], 3.0)
 
 
+def test_timepoint_subset_source_remaps_t_axis() -> None:
+    first = np.zeros((1, 8, 9), dtype=np.float32)
+    second = np.full((1, 8, 9), 2.0, dtype=np.float32)
+    third = np.full((1, 8, 9), 5.0, dtype=np.float32)
+
+    class MultiTSource(InMemoryRegionSource):
+        def __init__(self):
+            super().__init__([first], {"size_t": 3})
+            self._frames = [first, second, third]
+            self.shape = (3, 1, 1, 8, 9)
+            self.metadata["size_t"] = 3
+
+        def read_region(self, *, t, c, z, y, x):
+            return self._frames[int(t)][z, y, x]
+
+    subset = TimepointSubsetRegionSource(MultiTSource(), [1, 2])
+    sink = InMemoryPyramidSink(subset.shape, subset.metadata)
+
+    deconvolve_streaming(
+        subset,
+        sink,
+        psf_for_channel=lambda _c: _identity_psf_3d(),
+        deconvolve_tile=lambda tile, _psf, _c: tile,
+        tile_yx=(8, 9),
+        halo_yx=(0, 0),
+        build_pyramids=False,
+    )
+
+    assert sink.data.shape == (2, 1, 1, 8, 9)
+    np.testing.assert_allclose(sink.data[0, 0, 0], 2.0)
+    np.testing.assert_allclose(sink.data[1, 0, 0], 5.0)
+    assert subset.metadata["source_timepoints_one_based"] == [2, 3]
+
+
 def test_streaming_tile_suggestion_uses_memory_budget_for_deep_stack() -> None:
     tile = suggest_streaming_tile_size(
         (1, 1, 84, 2048, 2048),
@@ -223,3 +258,31 @@ def test_zarr_pyramid_sink_writes_multiscales_when_zarr_available(tmp_path: Path
     assert source.metadata["channels"][0]["window_end"] == 345.0
     manifest = json.loads((tmp_path / "out.ome.zarr" / ".cideconvolve_stream_manifest.json").read_text())
     assert manifest["shape"] == list(shape)
+
+
+def test_zarr_pyramid_sink_writes_scaled_uint16_when_requested(tmp_path: Path) -> None:
+    pytest.importorskip("zarr")
+    shape = (1, 1, 1, 16, 18)
+    sink = ZarrPyramidSink(
+        tmp_path / "scaled.ome.zarr",
+        shape=shape,
+        metadata={"pixel_size_x": 0.5, "pixel_size_y": 0.5, "pixel_size_z": 1.0},
+        levels=2,
+        output_dtype="uint16",
+    )
+    tile = np.linspace(0, 100000.0, 16 * 18, dtype=np.float32).reshape(1, 16, 18)
+    sink.write_tile(t=0, c=0, z=slice(0, 1), y=slice(0, 16), x=slice(0, 18), data=tile)
+    sink.build_pyramids()
+    sink.validate()
+    sink.close()
+
+    import zarr
+
+    root = zarr.open(str(tmp_path / "scaled.ome.zarr"), mode="r")
+    assert root["0"].dtype == np.dtype("uint16")
+    assert int(root["0"][:].max()) == 65535
+    assert root["1"].dtype == np.dtype("uint16")
+    assert root.attrs["cideconvolve"]["metadata"]["output_dtype"] == "uint16"
+    assert root.attrs["cideconvolve"]["metadata"]["uint16_float_max"] == 100000.0
+    ome_xml = (tmp_path / "scaled.ome.zarr" / "OME" / "METADATA.ome.xml").read_text(encoding="utf-8")
+    assert 'Type="uint16"' in ome_xml

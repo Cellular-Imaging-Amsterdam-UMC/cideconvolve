@@ -24,21 +24,23 @@ EXPECTED_PARAMETER_ORDER = [
     "pixel_size_z",
     "overrule_image_metadata",
     "projection",
+    "device",
+    "tv_lambda",
+    "sparse_hessian_reg",
+    "sparse_hessian_weight",
     "output_format",
+    "output_dtype",
     "streaming",
     "streaming_threshold_gb",
-    "scene",
+    "t_start",
+    "t_stop",
+    "t_step",
     "hcs_field",
     "benchmark",
     "bench_crop",
     "compute_metrics",
-    "tv_lambda",
-    "sparse_hessian_weight",
-    "sparse_hessian_reg",
-    "device",
     "background",
     "offset",
-    "damping",
     "prefilter_sigma",
     "two_d_mode",
     "two_d_wf_aggressiveness",
@@ -48,9 +50,12 @@ EXPECTED_PARAMETER_ORDER = [
 
 ADVANCED_PARAMETERS = {
     "output_format",
+    "output_dtype",
     "streaming",
     "streaming_threshold_gb",
-    "scene",
+    "t_start",
+    "t_stop",
+    "t_step",
     "hcs_field",
     "benchmark",
     "bench_crop",
@@ -61,7 +66,6 @@ ADVANCED_PARAMETERS = {
     "device",
     "background",
     "offset",
-    "damping",
     "prefilter_sigma",
     "two_d_mode",
     "two_d_wf_aggressiveness",
@@ -143,6 +147,7 @@ def test_bilayers_cli_helper_validates_and_generates_command() -> None:
     assert command.split().count("--outfolder") == 1
     assert "--method ci_rl" in command
     assert "--output_format ome-zarr" in command
+    assert "--output_dtype float32" in command
     assert "--two_d_wf_aggressiveness Balanced" in command
 
 

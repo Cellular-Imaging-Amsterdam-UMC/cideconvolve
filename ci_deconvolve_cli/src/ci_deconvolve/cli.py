@@ -123,6 +123,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output format. Default: ome-tiff.",
     )
     parser.add_argument(
+        "--output-dtype",
+        "--output_dtype",
+        choices=("float32", "uint16"),
+        default="float32",
+        help="Output pixel type. uint16 uses global scaling to avoid clipping high values.",
+    )
+    parser.add_argument(
         "--projection",
         choices=("none", "max-z"),
         default="none",
@@ -134,11 +141,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Write XY pyramid levels for OME-Zarr output. Default: auto.",
     )
+    parser.add_argument("--t-start", "--t_start", type=int, default=1, help="First T frame to save, 1-based inclusive.")
+    parser.add_argument("--t-stop", "--t_stop", type=int, default=0, help="Last T frame to save, 1-based inclusive. Use 0 for the final frame.")
+    parser.add_argument("--t-step", "--t_step", type=int, default=1, help="Save every Nth T frame in the selected range.")
     parser.add_argument("--iterations", type=_parse_int_list, default=[40])
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--background", default="auto")
     parser.add_argument("--offset", default="auto")
-    parser.add_argument("--damping", default="none")
     parser.add_argument("--prefilter-sigma", type=float, default=0.0)
     parser.add_argument(
         "--start",
@@ -248,6 +257,178 @@ def _apply_projection(result: dict, projection: str) -> dict:
     return projected
 
 
+def _apply_cli_metadata_to_source(metadata: dict, args: argparse.Namespace, size_c: int) -> dict:
+    meta = dict(metadata or {})
+
+    def _use(key: str, value) -> None:
+        if value is not None and (bool(args.overrule_metadata) or meta.get(key) in (None, "")):
+            meta[key] = value
+
+    _use("na", args.na)
+    _use("refractive_index", args.refractive_index)
+    _use("sample_refractive_index", args.sample_ri)
+    _use("microscope_type", args.microscope_type)
+    _use("pixel_size_x", args.pixel_size_xy)
+    _use("pixel_size_y", args.pixel_size_xy)
+    _use("pixel_size_z", args.pixel_size_z)
+
+    channels = [dict(ch) if isinstance(ch, dict) else {} for ch in meta.get("channels", [])]
+    if len(channels) < size_c:
+        channels.extend({} for _ in range(size_c - len(channels)))
+
+    def _list_value(raw: str | None) -> list[float] | None:
+        return _parse_float_list(raw)
+
+    def _value(values: list[float] | None, index: int):
+        if not values:
+            return None
+        return values[index] if index < len(values) else values[-1]
+
+    emissions = _list_value(args.emission_wl)
+    excitations = _list_value(args.excitation_wl)
+    pinholes = _list_value(args.pinhole_airy)
+    for index, channel in enumerate(channels[:size_c]):
+        for key, values in (
+            ("emission_wavelength", emissions),
+            ("excitation_wavelength", excitations),
+            ("pinhole_airy_units", pinholes),
+        ):
+            value = _value(values, index)
+            if value is not None and (bool(args.overrule_metadata) or channel.get(key) in (None, "")):
+                channel[key] = value
+    meta["channels"] = channels[:size_c]
+    names = list(meta.get("channel_names") or [])
+    names.extend(f"Ch{i}" for i in range(len(names), size_c))
+    meta["channel_names"] = names[:size_c]
+    return meta
+
+
+def _run_streaming_one(input_path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
+    import numpy as np
+
+    from core.deconvolve import deconvolve, generate_psf
+    from core.streaming import (
+        ProjectionPyramidSink,
+        TiledOmeTiffSink,
+        TimepointSubsetRegionSource,
+        ZarrPyramidSink,
+        deconvolve_streaming,
+        normalise_timepoint_indices,
+        open_region_source,
+        save_streaming_provenance,
+        suggest_streaming_tile_size,
+    )
+
+    source = open_region_source(input_path)
+    selected = normalise_timepoint_indices(
+        source.shape[0],
+        start=max(int(args.t_start), 1),
+        stop=(None if int(args.t_stop) <= 0 else int(args.t_stop)),
+        step=max(int(args.t_step), 1),
+        one_based=True,
+    )
+    source.metadata = _apply_cli_metadata_to_source(source.metadata, args, source.shape[1])
+    if selected != list(range(source.shape[0])):
+        source = TimepointSubsetRegionSource(source, selected)
+
+    out_path = _output_path(input_path, output_dir, args.output_format)
+    if out_path.exists():
+        if out_path.is_dir():
+            shutil.rmtree(out_path)
+        else:
+            out_path.unlink()
+
+    project_output = args.projection == "max-z" and source.shape[2] > 1
+    sink_shape = (source.shape[0], source.shape[1], 1 if project_output else source.shape[2], source.shape[3], source.shape[4])
+    sink_metadata = dict(source.metadata)
+    if project_output:
+        sink_metadata["size_z"] = 1
+        sink_metadata["default_z"] = 0
+        sink_metadata["projection"] = {"axis": "z", "method": "max"}
+
+    if args.output_format == "ome-zarr":
+        base_sink = ZarrPyramidSink(
+            out_path,
+            shape=sink_shape,
+            metadata=sink_metadata,
+            resume=False,
+            output_dtype=args.output_dtype,
+        )
+    else:
+        base_sink = TiledOmeTiffSink(
+            out_path,
+            shape=sink_shape,
+            metadata=sink_metadata,
+            tile_yx=(512, 512),
+            levels=None,
+            predictor=str(args.output_dtype or "float32").strip().lower() == "uint16",
+            output_dtype=args.output_dtype,
+            write_private_metadata=False,
+        )
+    sink = ProjectionPyramidSink(base_sink, source_shape=source.shape, mode="mip") if project_output else base_sink
+
+    psf_cache: dict[int, np.ndarray] = {}
+
+    def _psf_for_channel(channel: int) -> np.ndarray:
+        if channel not in psf_cache:
+            psf_cache[channel] = generate_psf(source.metadata, channel_idx=channel)
+        return psf_cache[channel]
+
+    def _deconvolve_tile(tile_img: np.ndarray, psf: np.ndarray, channel: int) -> np.ndarray:
+        effective_psf = psf
+        if tile_img.ndim == 2 and effective_psf.ndim == 3:
+            effective_psf = effective_psf[effective_psf.shape[0] // 2]
+        elif tile_img.ndim == 3 and effective_psf.ndim == 2:
+            effective_psf = effective_psf[np.newaxis, :, :]
+        niter = args.iterations[channel] if channel < len(args.iterations) else args.iterations[-1]
+        return deconvolve(
+            tile_img,
+            effective_psf,
+            method="ci_rl",
+            niter=niter,
+            background=_parse_float_or_auto(args.background),
+            offset=_parse_float_or_auto(args.offset),
+            prefilter_sigma=max(0.0, float(args.prefilter_sigma)),
+            start=args.start,
+            convergence=_normalise_convergence(args.convergence),
+            rel_threshold=max(1e-8, float(args.rel_threshold)),
+            check_every=max(1, int(args.check_every)),
+            device=None if args.device == "auto" else args.device,
+            pixel_size_xy=source.metadata.get("pixel_size_x"),
+            pixel_size_z=source.metadata.get("pixel_size_z"),
+            microscope_type=source.metadata.get("microscope_type", "widefield"),
+            two_d_mode=args.two_d_mode,
+            two_d_wf_aggressiveness=args.two_d_wf_aggressiveness,
+            two_d_wf_bg_radius_um=max(0.1, float(args.two_d_wf_bg_radius_um)),
+            two_d_wf_bg_scale=max(0.1, float(args.two_d_wf_bg_scale)),
+        )
+
+    tile_xy = suggest_streaming_tile_size(source.shape, method="ci_rl", device=None if args.device == "auto" else args.device)
+    summary = deconvolve_streaming(
+        source,
+        sink,
+        psf_for_channel=_psf_for_channel,
+        deconvolve_tile=_deconvolve_tile,
+        tile_yx=(tile_xy, tile_xy),
+        resume=False,
+        build_pyramids=True,
+    )
+    save_streaming_provenance(
+        out_path.with_suffix(out_path.suffix + ".provenance.json"),
+        source=source,
+        sink=sink,
+        params={
+            "projection": args.projection,
+            "timepoints_zero_based": selected,
+            "timepoints_one_based": [t + 1 for t in selected],
+            "tile_xy": tile_xy,
+            "output_dtype": args.output_dtype,
+        },
+        summary=summary,
+    )
+    return out_path
+
+
 def _format_metadata_value(value) -> str:
     if value is None:
         return "missing"
@@ -317,11 +498,28 @@ def _print_metadata_report(metadata: dict) -> None:
 def _run_one(input_path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
     from core.deconvolve import deconvolve_image, save_result
     from core.ome_zarr_io import is_hcs_plate, save_result_ome_zarr
+    from core.streaming import normalise_timepoint_indices, open_region_source
 
     if _is_ome_zarr(input_path) and is_hcs_plate(input_path):
         if args.output_format == "ome-tiff":
             raise ValueError("HCS plate OME-Zarr input cannot be written as one OME-TIFF output.")
         raise ValueError("HCS plate OME-Zarr output is not supported by the focused CLI yet.")
+
+    try:
+        probe = open_region_source(input_path)
+        selected_t = normalise_timepoint_indices(
+            probe.shape[0],
+            start=max(int(args.t_start), 1),
+            stop=(None if int(args.t_stop) <= 0 else int(args.t_stop)),
+            step=max(int(args.t_step), 1),
+            one_based=True,
+        )
+        if probe.shape[0] > 1 or selected_t != [0]:
+            return _run_streaming_one(input_path, output_dir, args)
+    except Exception as exc:
+        if int(args.t_start) != 1 or int(args.t_stop) > 0 or int(args.t_step) != 1:
+            raise
+        LOGGER.info("Streaming probe unavailable; using eager path: %s", exc)
 
     device = None if args.device == "auto" else args.device
     result = deconvolve_image(
@@ -339,7 +537,6 @@ def _run_one(input_path: Path, output_dir: Path, args: argparse.Namespace) -> Pa
         pixel_size_xy=args.pixel_size_xy,
         pixel_size_z=args.pixel_size_z,
         background=_parse_float_or_auto(args.background),
-        damping=_parse_float_or_auto(args.damping),
         offset=_parse_float_or_auto(args.offset),
         prefilter_sigma=max(0.0, float(args.prefilter_sigma)),
         start=args.start,
@@ -358,13 +555,13 @@ def _run_one(input_path: Path, output_dir: Path, args: argparse.Namespace) -> Pa
 
     out_path = _output_path(input_path, output_dir, args.output_format)
     if args.output_format == "ome-zarr":
-        return save_result_ome_zarr(result, out_path, pyramid=args.ome_zarr_pyramid)
+        return save_result_ome_zarr(result, out_path, pyramid=args.ome_zarr_pyramid, output_dtype=args.output_dtype)
 
     tmp_dir = output_dir / ".ci_deconvolve_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / out_path.name
     try:
-        save_result(result, tmp_path, save_qc_mips=bool(args.save_qc_mips))
+        save_result(result, tmp_path, save_qc_mips=bool(args.save_qc_mips), output_dtype=args.output_dtype)
         if out_path.exists():
             out_path.unlink()
         shutil.move(str(tmp_path), str(out_path))
@@ -416,6 +613,9 @@ def _write_manifest(output_dir: Path, records: list[dict], args: argparse.Namesp
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "output_format": args.output_format,
         "projection": args.projection,
+        "t_start": args.t_start,
+        "t_stop": args.t_stop,
+        "t_step": args.t_step,
         "iterations": args.iterations,
         "records": records,
     }
@@ -455,6 +655,7 @@ def run(argv: Iterable[str] | None = None) -> int:
     print(f"  output       : {output_dir}")
     print(f"  output format: {args.output_format}")
     print(f"  projection   : {args.projection}")
+    print(f"  T range      : start={args.t_start}, stop={'last' if int(args.t_stop) <= 0 else args.t_stop}, step={args.t_step}")
     print(f"  iterations   : {', '.join(str(v) for v in args.iterations)}")
 
     failures: list[tuple[Path, Exception]] = []

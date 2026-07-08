@@ -119,7 +119,11 @@ does not process plate fields.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--output-format ome-tiff\|ome-zarr` | `ome-tiff` | Writes `<stem>_decon.ome.tiff` or `<stem>_decon.ome.zarr`. |
+| `--output-dtype float32\|uint16` | `float32` | `uint16` uses one global scale for the output so high float values map to 65535 instead of being clipped. |
 | `--projection none\|max-z` | `none` | With `max-z`, writes a maximum-Z projection when the deconvolved result is 3D. 2D inputs are unchanged. |
+| `--t-start N` | `1` | First T frame to save, using 1-based inclusive indexing. |
+| `--t-stop N` | `0` | Last T frame to save, using 1-based inclusive indexing. `0` means final frame. |
+| `--t-step N` | `1` | Save every Nth T frame in the selected range. |
 | `--iterations N[,N...]` | `40` | CI-RL iteration count. A comma- or semicolon-separated list applies per channel, with the last value reused for extra channels. |
 | `--device auto\|cpu\|cuda` | `auto` | Compute device. `auto` lets PyTorch choose CUDA when available, otherwise CPU. |
 | `-v`, `--verbose` | off | Enable INFO logging from the CLI and core deconvolution code. |
@@ -130,7 +134,6 @@ does not process plate fields.
 | --- | --- | --- |
 | `--background VALUE\|auto` | `auto` | Background level used by the solver. `auto` estimates it from the image. Numeric values are accepted. |
 | `--offset VALUE\|auto\|none` | `auto` | Positive offset added before iteration and removed afterwards. Use `none`, `0`, or `0.0` to disable. |
-| `--damping VALUE\|auto\|none` | `none` | Noise-gated damping strength. Use `auto` for automatic damping, numeric values for manual damping, or `none`/`0` to disable. |
 | `--prefilter-sigma VALUE` | `0.0` | Optional Anscombe/low-pass prefilter sigma. `0.0` disables prefiltering. |
 | `--start MODE` | `auto` | Initial estimate mode. Choices: `auto`, `flat`, `percentile_flat`, `observed`, `observed_bgsub`, `lowpass`, `lowpass_bgsub`, `hybrid`. |
 | `--convergence auto\|fixed\|none` | `auto` | `auto` enables early stopping based on convergence. `fixed` and `none` both run the requested iteration count. |

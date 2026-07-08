@@ -1145,6 +1145,21 @@ def _format_bytes(mb: float) -> str:
     return f"{mb:.0f} MB"
 
 
+def _path_size_mb(path: Path) -> float:
+    try:
+        if path.is_dir():
+            total = 0
+            for child in path.rglob("*"):
+                if child.is_file():
+                    total += child.stat().st_size
+            return total / (1024 * 1024)
+        if path.exists():
+            return path.stat().st_size / (1024 * 1024)
+    except OSError:
+        pass
+    return 0.0
+
+
 def _format_duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
@@ -2959,7 +2974,7 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                     <ul>
                     <li><b>Strengths:</b> transparent physics-based behavior, good default for both widefield and confocal, and easy comparison to reconvolved raw data.</li>
                     <li><b>Watch for:</b> noise amplification at high iteration counts, edge artifacts with very small tiles, and wrong Z behavior when pixel Z or RI metadata is off.</li>
-                    <li><b>Typical tuning:</b> adjust iterations and convergence first, then background/offset/damping only if the log or preview shows a clear problem.</li>
+                    <li><b>Typical tuning:</b> adjust iterations and convergence first, then background, offset, or prefiltering only if the log or preview shows a clear problem.</li>
                     </ul>
                     <p>Use it for a conservative, explainable result. More detail: <a href="{GITHUB_DOCS_BASE_URL}/docs/DECONVOLVE_CI.MD">algorithm documentation</a>.</p>
                 """,
@@ -3012,12 +3027,11 @@ _HELP_TOPICS: list[dict[str, Any]] = [
             {
                 "id": "advanced-parameters",
                 "title": "Advanced Parameters",
-                "keywords": ["damping", "background", "offset", "prefilter", "tv", "sparse", "hessian", "dl residual strength"],
+                "keywords": ["background", "offset", "prefilter", "tv", "sparse", "hessian", "dl residual strength"],
                 "html": f"""
                     <h2>Advanced Parameters</h2>
                     <p>Advanced settings are useful, but they can also hide metadata problems. Change one family at a time and compare against a plain <code>ci_rl</code> run.</p>
                     <ul>
-                    <li><b>Damping</b> attenuates RL corrections in low-signal/noisy regions while preserving brighter structure. <code>auto</code> is a good trial when background noise is being over-sharpened; <code>0</code> or <code>none</code> disables it.</li>
                     <li><b>Background</b> defines the floor used for subtraction and stable division. <code>auto</code> estimates it from the image. Numeric values are useful when you know the camera/background level. A value that is too high removes weak signal.</li>
                     <li><b>Offset</b> adds a positive processing shift and removes it afterward. It reduces division-by-near-zero instability, but poor offset/background combinations can cause visible background shifts.</li>
                     <li><b>Prefilter sigma</b> applies Anscombe-domain Gaussian smoothing before deconvolution. Small values can calm noisy data; large values erase fine structure before the solver sees it.</li>
@@ -3056,8 +3070,8 @@ _HELP_TOPICS: list[dict[str, Any]] = [
                 "html": """
                     <h2>Export Formats</h2>
                     <ul>
-                    <li><b>Save as OME-TIFF</b> writes deconvolved image data with OME metadata and LZW compression.</li>
-                    <li><b>Save as OME-Zarr</b> writes chunked image data for large workflows with metadata where available.</li>
+                    <li><b>Current timepoint</b> opens save options for format, projection, and output dtype.</li>
+                    <li><b>Full T-series</b> opens save options for format, projection, output dtype, and T range/step.</li>
                     <li><b>Save views as PNG</b> writes the current original/deconvolved visual preview.</li>
                     <li><b>Save comparison as PNG</b> writes the active comparison mode with display overlays such as the scale bar.</li>
                     </ul>
@@ -5176,7 +5190,6 @@ def _deconvolve_channel_stacks(
                     ch_data,
                     psf,
                     tv_lambda=params["tv_lambda"],
-                    damping=params["damping"],
                     microscope_type=params["microscope_type"],
                     two_d_mode=params["two_d_mode"],
                     two_d_wf_aggressiveness=params["two_d_wf_aggressiveness"],
@@ -5221,7 +5234,7 @@ def _deconvolve_channel_stacks(
     return results
 
 
-def _write_ome_tiff(data: np.ndarray, path: str, metadata: dict) -> None:
+def _write_ome_tiff(data: np.ndarray, path: str, metadata: dict, output_dtype: str = "float32") -> None:
     from cideconvolve_io.ome_tiff_io import write_tczyx_ome_tiff
 
     meta = dict(metadata or {})
@@ -5231,12 +5244,13 @@ def _write_ome_tiff(data: np.ndarray, path: str, metadata: dict) -> None:
         arr,
         path,
         metadata=meta,
-        levels=1,
+        levels=None,
         compression="lzw",
+        output_dtype=output_dtype,
     )
 
 
-def _write_ome_zarr(data: np.ndarray, path: str | Path, metadata: dict) -> None:
+def _write_ome_zarr(data: np.ndarray, path: str | Path, metadata: dict, output_dtype: str = "float32") -> None:
     from core.streaming import ZarrPyramidSink
 
     arr = np.asarray(data, dtype=np.float32)
@@ -5249,6 +5263,7 @@ def _write_ome_zarr(data: np.ndarray, path: str | Path, metadata: dict) -> None:
         shape=tuple(int(v) for v in arr.shape),
         metadata=meta,
         resume=False,
+        output_dtype=output_dtype,
     )
     for t in range(arr.shape[0]):
         for c in range(arr.shape[1]):
@@ -5282,7 +5297,12 @@ class _SavePreviewWorker(QThread):
             if kind == "ome_tiff":
                 path = Path(str(self.job["path"]))
                 self.progress.emit(f"Saving OME-TIFF preview to {path}")
-                _write_ome_tiff(self.job["data"], path, dict(self.job.get("metadata") or {}))
+                _write_ome_tiff(
+                    self.job["data"],
+                    path,
+                    dict(self.job.get("metadata") or {}),
+                    str(self.job.get("output_dtype") or "float32"),
+                )
                 size_mb = path.stat().st_size / (1024 * 1024) if path.exists() else 0.0
                 self.finished.emit({
                     "ok": True,
@@ -5295,7 +5315,12 @@ class _SavePreviewWorker(QThread):
             if kind == "ome_zarr":
                 path = Path(str(self.job["path"]))
                 self.progress.emit(f"Saving OME-Zarr preview to {path}")
-                _write_ome_zarr(self.job["data"], path, dict(self.job.get("metadata") or {}))
+                _write_ome_zarr(
+                    self.job["data"],
+                    path,
+                    dict(self.job.get("metadata") or {}),
+                    str(self.job.get("output_dtype") or "float32"),
+                )
                 self.finished.emit({
                     "ok": True,
                     "kind": kind,
@@ -5384,7 +5409,6 @@ class _DeconvolveWorker(QThread):
             if self.params["method"] == "ci_rl_tv":
                 self.progress.emit(f"  TV lambda   : {self.params['tv_lambda']}")
             if self.params["method"] in ("ci_rl", "ci_rl_tv"):
-                self.progress.emit(f"  Damping     : {self.params['damping']}")
                 if self.params["microscope_type"] == "confocal":
                     self.progress.emit(
                         f"  Pinhole     : {_format_float_list(self.params['pinhole_airy_units'])} AU"
@@ -5457,247 +5481,8 @@ class _DeconvolveWorker(QThread):
             _release_cuda_memory(synchronize=True)
 
 
-class _FitPsfWorker(QThread):
-    """Search for best PSF parameters via short RL trials."""
-
-    # (trial_idx, total_trials, trial_params, i_div)
-    progress = pyqtSignal(int, int, object, float)
-    finished = pyqtSignal(object)  # dict result or Exception
-
-    def __init__(
-        self,
-        channels: list[np.ndarray],
-        base_params: dict,
-        niter_fit: int = 40,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.channels = channels
-        self.base_params = dict(base_params)
-        self.niter_fit = int(niter_fit)
-
-    def run(self):
-        try:
-            from core.deconvolve_ci import ci_fit_psf_params
-
-            n_channels = len(self.channels)
-            if n_channels == 0:
-                raise ValueError("No channels provided for PSF fitting.")
-
-            em_wl_list = self.base_params.get("emission_wavelengths", [520])
-            if not isinstance(em_wl_list, (list, tuple)):
-                em_wl_list = [em_wl_list]
-            ex_wl_list = self.base_params.get("excitation_wavelengths", [488])
-            if not isinstance(ex_wl_list, (list, tuple)):
-                ex_wl_list = [ex_wl_list]
-            pinhole_list = self.base_params.get("pinhole_airy_units", [1.0])
-            if not isinstance(pinhole_list, (list, tuple)):
-                pinhole_list = [pinhole_list]
-            coarse_ri_grid = [1.330, 1.358, 1.385, 1.410, 1.435, 1.460, 1.480, 1.500, 1.515]
-            fine_grid_count = 9
-            fine_half_width = 0.015
-            total_trials = n_channels * (len(coarse_ri_grid) + fine_grid_count)
-            score_label = "normalized residual + normalized roughness (coarse-to-fine RI scan)"
-
-            def _merge_logs(logs_per_channel: list[list[dict]]) -> list[dict]:
-                merged_by_key: dict[tuple[float, float], dict] = {}
-                for log_entries in logs_per_channel:
-                    for entry in log_entries:
-                        params = entry.get("params", {})
-                        ph = float(params.get("pinhole_airy_units", 1.0))
-                        ri = float(params.get("ri_sample", 1.33))
-                        key = (round(ph, 6), round(ri, 6))
-                        bucket = merged_by_key.setdefault(
-                            key,
-                            {
-                                "params": {
-                                    "pinhole_airy_units": ph,
-                                    "ri_sample": ri,
-                                },
-                                "residual": [],
-                                "roughness": [],
-                                "score": [],
-                                "i_div": [],
-                            },
-                        )
-                        for metric_key in ("residual", "roughness", "score", "i_div"):
-                            if metric_key in entry:
-                                bucket[metric_key].append(float(entry[metric_key]))
-
-                merged_log = []
-                for key in sorted(merged_by_key.keys(), key=lambda item: (item[0], item[1])):
-                    bucket = merged_by_key[key]
-                    merged_entry = {"params": bucket["params"]}
-                    for metric_key in ("residual", "roughness", "score", "i_div"):
-                        values = bucket.get(metric_key, [])
-                        if values:
-                            merged_entry[metric_key] = float(np.mean(values))
-                    merged_log.append(merged_entry)
-                return merged_log
-
-            def _run_stage(
-                ri_grid: list[float],
-                *,
-                trial_offset: int,
-                emit_progress: bool = True,
-            ) -> tuple[list[list[dict]], list[float], dict, str]:
-                stage_logs: list[list[dict]] = []
-                stage_baselines: list[float] = []
-                stage_grid_info: dict = {}
-                stage_score_label = score_label
-                stage_total = len(ri_grid)
-
-                for ci, ch_data in enumerate(self.channels):
-                    if self.isInterruptionRequested():
-                        raise RuntimeError("Stopped by user")
-                    em_wl = float(em_wl_list[ci] if ci < len(em_wl_list) else em_wl_list[-1])
-                    ex_wl = float(ex_wl_list[ci] if ci < len(ex_wl_list) else ex_wl_list[-1])
-                    ph = float(pinhole_list[ci] if ci < len(pinhole_list) else pinhole_list[-1])
-
-                    ch_base = dict(self.base_params)
-                    ch_base["emission_nm"] = em_wl
-                    ch_base["excitation_nm"] = ex_wl
-                    ch_base["pinhole_airy_units"] = ph
-
-                    def _cb(idx: int, total: int, params: dict, i_div: float,
-                            ci_=ci, offset_=trial_offset, stage_len=stage_total):
-                        global_idx = offset_ + ci_ * stage_len + idx
-                        self.progress.emit(global_idx, total_trials, params, i_div)
-
-                    result = ci_fit_psf_params(
-                        ch_data,
-                        ch_base,
-                        pinhole_grid=[ph],
-                        ri_sample_grid=list(ri_grid),
-                        niter_fit=self.niter_fit,
-                        callback=_cb if emit_progress else None,
-                        should_stop=self.isInterruptionRequested,
-                    )
-                    stage_logs.append(result["search_log"])
-                    stage_baselines.append(float(result.get("baseline_i_div", float("inf"))))
-                    stage_grid_info = result["grid"]
-                    stage_score_label = result.get("score_label", stage_score_label)
-
-                return stage_logs, stage_baselines, stage_grid_info, stage_score_label
-
-            coarse_logs, _, coarse_grid_info, coarse_score_label = _run_stage(
-                coarse_ri_grid,
-                trial_offset=0,
-            )
-            coarse_merged = _merge_logs(coarse_logs)
-            if not coarse_merged:
-                raise RuntimeError("No coarse RI search results were produced.")
-
-            coarse_best = min(coarse_merged, key=lambda e: e.get("i_div", float("inf")))
-            coarse_best_ri = float(coarse_best["params"].get("ri_sample", 1.47))
-            fine_lo = max(1.330, coarse_best_ri - fine_half_width)
-            fine_hi = min(1.515, coarse_best_ri + fine_half_width)
-            fine_ri_grid = [round(float(v), 4) for v in np.linspace(fine_lo, fine_hi, fine_grid_count)]
-
-            fine_logs, _, fine_grid_info, fine_score_label = _run_stage(
-                fine_ri_grid,
-                trial_offset=n_channels * len(coarse_ri_grid),
-            )
-            fine_merged = _merge_logs(fine_logs)
-            merged_log = _merge_logs([coarse_merged, fine_merged])
-            base_score_label = fine_score_label or coarse_score_label or "normalized residual + normalized roughness"
-            score_label = f"{base_score_label} (coarse-to-fine RI scan)"
-
-            orig_ri = float(self.base_params.get("ri_sample", 1.47))
-            baseline_logs, _, _, _ = _run_stage(
-                [orig_ri],
-                trial_offset=0,
-                emit_progress=False,
-            )
-            baseline_merged = _merge_logs(baseline_logs)
-            baseline_entry = baseline_merged[0] if baseline_merged else None
-
-            def _normalize_metric(values: list[float]) -> list[float]:
-                arr = np.asarray([float(v) for v in values], dtype=np.float64)
-                finite = np.isfinite(arr)
-                if not np.any(finite):
-                    return [float("inf")] * len(values)
-                vmin = float(np.min(arr[finite]))
-                vmax = float(np.max(arr[finite]))
-                if vmax <= vmin + 1e-12:
-                    return [0.0 if is_finite else float("inf") for is_finite in finite]
-                norm = (arr - vmin) / (vmax - vmin)
-                return [float(v) if is_finite else float("inf") for v, is_finite in zip(norm, finite)]
-
-            scored_entries = [dict(entry) for entry in merged_log]
-            if baseline_entry is not None:
-                scored_entries.append(dict(baseline_entry))
-
-            residual_norm = _normalize_metric([float(entry.get("residual", float("inf"))) for entry in scored_entries])
-            roughness_norm = _normalize_metric([float(entry.get("roughness", float("inf"))) for entry in scored_entries])
-            for entry, resid_n, rough_n in zip(scored_entries, residual_norm, roughness_norm):
-                score = resid_n + rough_n if np.isfinite(resid_n) and np.isfinite(rough_n) else float("inf")
-                entry["score"] = score
-                entry["i_div"] = score
-
-            if baseline_entry is not None:
-                baseline_scored = scored_entries[-1]
-                merged_log = scored_entries[:-1]
-            else:
-                baseline_scored = None
-                merged_log = scored_entries
-
-            ri_values = sorted({float(entry["params"].get("ri_sample", 1.33)) for entry in merged_log})
-            pinhole_values = sorted({float(entry["params"].get("pinhole_airy_units", 1.0)) for entry in merged_log})
-            grid_info = {
-                "pinhole": pinhole_values or coarse_grid_info.get("pinhole", fine_grid_info.get("pinhole", [])),
-                "ri_sample": ri_values or coarse_grid_info.get("ri_sample", fine_grid_info.get("ri_sample", [])),
-            }
-
-            # Find best from merged candidates and compare to the original parameters.
-            candidate_best = min(merged_log, key=lambda e: e["i_div"])
-            if baseline_scored is not None and baseline_scored["i_div"] <= candidate_best["i_div"]:
-                best = baseline_scored
-            else:
-                best = candidate_best
-
-            baseline_i_div = float(baseline_scored["i_div"]) if baseline_scored is not None else float("inf")
-            improvement_pct = (
-                max(0.0, (baseline_i_div - best["i_div"]) / baseline_i_div * 100.0)
-                if baseline_i_div > 0 and baseline_i_div != float("inf")
-                else 0.0
-            )
-
-            self.finished.emit({
-                "best_params": best["params"],
-                "best_i_div": best["i_div"],
-                "grid_best_params": candidate_best["params"],
-                "grid_best_i_div": candidate_best["i_div"],
-                "baseline_i_div": baseline_i_div,
-                "improvement_pct": improvement_pct,
-                "search_log": merged_log,
-                "grid": grid_info,
-                "score_label": score_label,
-            })
-        except Exception as exc:
-            if "Stopped by user" not in str(exc):
-                traceback.print_exc()
-            self.finished.emit(exc)
-        finally:
-            _release_cuda_memory(synchronize=True)
-
-
-def _guess_fit_zp_um(channels, pixel_size_z_nm):
-    """Guess emitter depth from the active stack depth for RI fitting."""
-    px_z_nm = float(pixel_size_z_nm)
-    if px_z_nm <= 0.0:
-        return None
-    z_sizes = [int(ch.shape[0]) for ch in channels if getattr(ch, "ndim", 0) == 3 and ch.shape[0] > 1]
-    if not z_sizes:
-        return None
-    nz = min(z_sizes)
-    stack_depth_um = max(nz - 1, 0) * px_z_nm / 1000.0
-    guess_um = max(stack_depth_um * 0.5, px_z_nm / 1000.0)
-    return guess_um, nz, stack_depth_um
-
-
 class _SaveTSeriesWorker(QThread):
-    """Export a full deconvolved T-series to OME-TIFF."""
+    """Export a deconvolved T-series to OME-TIFF or OME-Zarr."""
 
     finished = pyqtSignal(object)
     progress = pyqtSignal(str)
@@ -5708,6 +5493,11 @@ class _SaveTSeriesWorker(QThread):
         metadata: dict,
         params: dict,
         output_path: str,
+        output_kind: str = "ome_tiff",
+        projection_mode: str = "Stack",
+        timepoints: Optional[Sequence[int]] = None,
+        tile_size: int = 0,
+        output_dtype: str = "float32",
         parent=None,
     ):
         super().__init__(parent)
@@ -5715,60 +5505,210 @@ class _SaveTSeriesWorker(QThread):
         self.metadata = metadata
         self.params = params
         self.output_path = output_path
+        self.output_kind = output_kind
+        self.projection_mode = str(projection_mode or "Stack")
+        self.timepoints = [int(t) for t in timepoints] if timepoints is not None else None
+        self.tile_size = int(tile_size or 0)
+        self.output_dtype = "uint16" if str(output_dtype).lower() == "uint16" else "float32"
 
     def run(self):
-        stage_path = None
         try:
-            size_t = max(int(self.metadata.get("size_t", 1)), 1)
-            size_c = max(int(self.metadata.get("size_c", 1)), 1)
-            size_z = max(int(self.metadata.get("size_z", 1)), 1)
-            size_y = max(int(self.metadata.get("size_y", 1)), 1)
-            size_x = max(int(self.metadata.get("size_x", 1)), 1)
+            from core.streaming import TimepointSubsetRegionSource
 
-            fd, stage_path = tempfile.mkstemp(prefix="cideconvolve_", suffix=".dat")
-            os.close(fd)
-            staged = np.memmap(
-                stage_path,
-                dtype=np.float32,
-                mode="w+",
-                shape=(size_t, size_c, size_z, size_y, size_x),
+            region_source = _TimepointRegionSource(self.source, source_id="gui:t-series")
+            if self.timepoints is not None:
+                region_source = TimepointSubsetRegionSource(region_source, self.timepoints)
+            region_source.metadata.update(dict(self.metadata or {}))
+            region_source.metadata["size_t"] = region_source.shape[0]
+            region_source.metadata["size_c"] = region_source.shape[1]
+            region_source.metadata["size_z"] = region_source.shape[2]
+            region_source.metadata["size_y"] = region_source.shape[3]
+            region_source.metadata["size_x"] = region_source.shape[4]
+            processing = dict(region_source.metadata.get("cideconvolve_processing") or {})
+            processing.update({
+                "export": "deconvolved_t_series",
+                "tile_streaming": True,
+                "projection": self.projection_mode,
+                "source_timepoints_zero_based": self.timepoints,
+            })
+            region_source.metadata["cideconvolve_processing"] = processing
+
+            self.progress.emit("")
+            self.progress.emit("Streaming T-series export")
+            self.progress.emit(
+                f"  Shape       : T={region_source.shape[0]} C={region_source.shape[1]} "
+                f"Z={region_source.shape[2]} Y={region_source.shape[3]} X={region_source.shape[4]}"
             )
+            self.progress.emit(f"  Projection  : {self.projection_mode}")
+            self.progress.emit(f"  Output dtype: {self.output_dtype}")
+            self.progress.emit(f"  Output      : {self.output_path}")
 
-            for t_index in range(size_t):
-                if self.isInterruptionRequested():
-                    raise RuntimeError("Stopped by user")
-                self.progress.emit(f"Saving T-series — loading timepoint {t_index + 1}/{size_t}…")
-                channels = self.source.load_timepoint(
-                    t_index,
-                    progress_cb=lambda done, total, text: self.progress.emit(
-                        f"{text} ({done}/{total})"
-                    ),
-                )
-                self.progress.emit(f"Saving T-series — processing timepoint {t_index + 1}/{size_t}…")
-                results = _deconvolve_channel_stacks(
-                    channels,
-                    self.metadata,
-                    self.params,
-                    t_index,
-                    progress_cb=self.progress.emit,
-                    should_stop=self.isInterruptionRequested,
-                )
-                for c_index, result in enumerate(results):
-                    staged[t_index, c_index, :, :, :] = result
-                staged.flush()
+            def _progress(payload: dict) -> None:
+                event = payload.get("event")
+                if event == "message":
+                    self.progress.emit(str(payload.get("message", "")))
+                elif event == "tile_start":
+                    self.progress.emit(
+                        f"  Tile {int(payload.get('done', 0)) + 1}/{int(payload.get('total', 0))}: "
+                        f"T={int(payload.get('timepoint', 0)) + 1} "
+                        f"C={int(payload.get('channel', 0)) + 1} "
+                        f"{payload.get('core')}"
+                    )
+                elif event == "tile_done":
+                    done = int(payload.get("done", 0))
+                    total = int(payload.get("total", 0))
+                    if done == total or done % 10 == 0:
+                        self.progress.emit(f"    Done {done}/{total} tiles")
+                elif event == "pyramid_start":
+                    label = "OME-Zarr" if self.output_kind == "ome_zarr" else "OME-TIFF"
+                    self.progress.emit(f"  Building {label} pyramid levels...")
 
-            self.progress.emit("Writing OME-TIFF…")
-            _write_ome_tiff(staged, self.output_path, self.metadata)
-            self.finished.emit({"path": self.output_path})
+            result = _run_streaming_deconvolution_job(
+                region_source,
+                params=self.params,
+                output_path=self.output_path,
+                output_format="ome-zarr" if self.output_kind == "ome_zarr" else "ome-tiff",
+                tile_size=self.tile_size,
+                projection_mode=self.projection_mode,
+                output_dtype=self.output_dtype,
+                progress=_progress,
+                should_stop=self.isInterruptionRequested,
+            )
+            self.finished.emit({
+                "path": self.output_path,
+                "kind": self.output_kind,
+                "summary": result.get("summary"),
+                "provenance": result.get("provenance"),
+            })
         except Exception as exc:
-            traceback.print_exc()
+            if "Stopped by user" not in str(exc):
+                traceback.print_exc()
             self.finished.emit(exc)
-        finally:
-            if stage_path and os.path.exists(stage_path):
-                try:
-                    os.remove(stage_path)
-                except OSError:
-                    pass
+
+
+class _TSeriesSaveOptionsDialog(QDialog):
+    """Advanced options shown before saving a T-series."""
+
+    def __init__(self, size_t: int, *, parent=None):
+        super().__init__(parent)
+        self._size_t = max(int(size_t or 1), 1)
+        self.setWindowTitle("T-Series Save Options")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self._format_combo = QComboBox()
+        self._format_combo.addItems(["OME-TIFF", "OME-Zarr"])
+        form.addRow("Format", self._format_combo)
+
+        self._projection_combo = QComboBox()
+        self._projection_combo.addItems(["Stack", "MIP", "SUM", "Mean"])
+        self._projection_combo.setToolTip("Save the full Z stack or a Z projection for each selected timepoint.")
+        form.addRow("Projection", self._projection_combo)
+
+        self._dtype_combo = QComboBox()
+        self._dtype_combo.addItems(["float32", "uint16"])
+        self._dtype_combo.setToolTip("uint16 uses global scaling so high float values are not clipped.")
+        form.addRow("Output dtype", self._dtype_combo)
+
+        self._start_spin = QSpinBox()
+        self._start_spin.setRange(1, self._size_t)
+        self._start_spin.setValue(1)
+        form.addRow("T start", self._start_spin)
+
+        self._stop_spin = QSpinBox()
+        self._stop_spin.setRange(1, self._size_t)
+        self._stop_spin.setValue(self._size_t)
+        form.addRow("T stop", self._stop_spin)
+
+        self._step_spin = QSpinBox()
+        self._step_spin.setRange(1, self._size_t)
+        self._step_spin.setValue(1)
+        form.addRow("T step", self._step_spin)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        save = QPushButton("Save")
+        save.setDefault(True)
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self._accept_if_valid)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+    def _accept_if_valid(self) -> None:
+        if self._stop_spin.value() < self._start_spin.value():
+            QMessageBox.information(self, "Invalid T range", "T stop must be greater than or equal to T start.")
+            return
+        self.accept()
+
+    def projection_mode(self) -> str:
+        return str(self._projection_combo.currentText() or "Stack")
+
+    def output_kind(self) -> str:
+        text = str(self._format_combo.currentText() or "OME-TIFF").strip().lower()
+        return "ome_zarr" if "zarr" in text else "ome_tiff"
+
+    def output_dtype(self) -> str:
+        return str(self._dtype_combo.currentText() or "float32").lower()
+
+    def timepoints(self) -> list[int]:
+        return list(range(self._start_spin.value() - 1, self._stop_spin.value(), self._step_spin.value()))
+
+    def range_label(self) -> str:
+        if self._start_spin.value() == 1 and self._stop_spin.value() == self._size_t and self._step_spin.value() == 1:
+            return "TSERIES"
+        return f"T{self._start_spin.value():03d}-{self._stop_spin.value():03d}_step{self._step_spin.value()}"
+
+
+class _PreviewSaveOptionsDialog(QDialog):
+    """Small options prompt for current preview exports."""
+
+    def __init__(self, *, has_z: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Save Options")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self._format_combo = QComboBox()
+        self._format_combo.addItems(["OME-TIFF", "OME-Zarr"])
+        form.addRow("Format", self._format_combo)
+
+        self._projection_combo = QComboBox()
+        self._projection_combo.addItems(["Stack", "MIP", "SUM", "Mean"])
+        self._projection_combo.setToolTip("Save the full Z stack or a Z projection for the current timepoint.")
+        if not has_z:
+            self._projection_combo.setCurrentText("Stack")
+            self._projection_combo.setEnabled(False)
+        form.addRow("Projection", self._projection_combo)
+
+        self._dtype_combo = QComboBox()
+        self._dtype_combo.addItems(["float32", "uint16"])
+        self._dtype_combo.setToolTip("uint16 uses global scaling so high float values are not clipped.")
+        form.addRow("Output dtype", self._dtype_combo)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        save = QPushButton("Save")
+        save.setDefault(True)
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+    def projection_mode(self) -> str:
+        return str(self._projection_combo.currentText() or "Stack")
+
+    def output_kind(self) -> str:
+        text = str(self._format_combo.currentText() or "OME-TIFF").strip().lower()
+        return "ome_zarr" if "zarr" in text else "ome_tiff"
+
+    def output_dtype(self) -> str:
+        return str(self._dtype_combo.currentText() or "float32").lower()
 
 
 class _StreamingOmeroWorker(QThread):
@@ -5983,7 +5923,6 @@ class _StreamingOmeroWorker(QThread):
                         tile_img,
                         effective_psf,
                         tv_lambda=self.params["tv_lambda"] if self.params["method"] == "ci_rl_tv" else 0.0,
-                        damping=self.params["damping"],
                         microscope_type=self.params["microscope_type"],
                         two_d_mode=self.params["two_d_mode"],
                         two_d_wf_aggressiveness=self.params["two_d_wf_aggressiveness"],
@@ -6276,6 +6215,7 @@ def _run_streaming_deconvolution_job(
     output_format: str,
     tile_size: int,
     projection_mode: str = "Full stack",
+    output_dtype: str = "float32",
     progress: Optional[Callable[[dict], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> dict:
@@ -6301,7 +6241,7 @@ def _run_streaming_deconvolution_job(
 
     output_format_key = output_format.strip().lower()
     projection_key = str(projection_mode or "Full stack").strip().lower()
-    project_output = shape[2] > 1 and projection_key not in {"", "full stack", "full", "none"}
+    project_output = shape[2] > 1 and projection_key not in {"", "full stack", "full", "none", "stack", "org"}
     sink_shape = (shape[0], shape[1], 1 if project_output else shape[2], shape[3], shape[4])
     sink_metadata = dict(region_source.metadata)
     if project_output:
@@ -6335,6 +6275,10 @@ def _run_streaming_deconvolution_job(
                 shape=sink_shape,
                 metadata=sink_metadata,
                 tile_yx=(512, 512),
+                levels=None,
+                predictor=str(output_dtype or "float32").strip().lower() == "uint16",
+                output_dtype=output_dtype,
+                write_private_metadata=False,
             )
         else:
             base_sink = ZarrPyramidSink(
@@ -6342,6 +6286,7 @@ def _run_streaming_deconvolution_job(
                 shape=sink_shape,
                 metadata=sink_metadata,
                 resume=False,
+                output_dtype=output_dtype,
             )
         return (
             ProjectionPyramidSink(base_sink, source_shape=shape, mode=projection_key)
@@ -6491,7 +6436,6 @@ def _run_streaming_deconvolution_job(
                 tile_img,
                 effective_psf,
                 tv_lambda=params["tv_lambda"] if params["method"] == "ci_rl_tv" else 0.0,
-                damping=params["damping"],
                 microscope_type=params["microscope_type"],
                 two_d_mode=params["two_d_mode"],
                 two_d_wf_aggressiveness=params["two_d_wf_aggressiveness"],
@@ -6535,6 +6479,7 @@ def _run_streaming_deconvolution_job(
                     "iterations": params.get("niter_list"),
                     "tile_size": attempt_tile_size,
                     "output_format": output_format,
+                    "output_dtype": str(output_dtype or "float32"),
                     "projection": projection_key if project_output else "full_stack",
                 },
                 summary=summary,
@@ -7467,7 +7412,7 @@ def _detect_gpu_info() -> str:
 
 
 class DeconvolveCIWindow(QMainWindow):
-    def __init__(self, *, movie_available: bool = False, fitpsf_available: bool = False):
+    def __init__(self, *, movie_available: bool = False):
         super().__init__()
         gpu_info = _detect_gpu_info()
         self.setWindowTitle(f"CI Deconvolve — {gpu_info}")
@@ -7492,8 +7437,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._initial_load_context: Optional[dict[str, Any]] = None
         self._save_worker: Optional[_SaveTSeriesWorker] = None
         self._preview_save_worker: Optional[_SavePreviewWorker] = None
-        self._fit_psf_worker: Optional[_FitPsfWorker] = None
-        self._fit_psf_started_at: Optional[float] = None
         self._monitor: Optional[_ResourceMonitor] = None
         self._log_dialog: Optional[_LogDialog] = None
         self._help_dialog: Optional[_HelpDialog] = None
@@ -7506,7 +7449,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._last_live_update_s: float = 0.0
         self._last_final_iteration_payload: Optional[dict] = None
         self._movie_available = bool(movie_available)
-        self._fitpsf_available = bool(fitpsf_available)
         self._log_emitter = _GuiLogEmitter(self)
         self._log_handler = _QtLogHandler(self._log_emitter)
         self._log_emitter.line.connect(self._log_from_logging)
@@ -7744,21 +7686,6 @@ class DeconvolveCIWindow(QMainWindow):
         aml.addRow("TV lambda:", self._sp_tv_lambda)
         self._tv_lambda_label = aml.labelForField(self._sp_tv_lambda)  # type: ignore
 
-        self._damping_combo = NoWheelComboBox()
-        self._damping_combo.addItems(["none", "auto", "manual"])
-        self._damping_combo.currentTextChanged.connect(self._on_damping_changed)
-        aml.addRow("Damping:", self._damping_combo)
-        self._damping_label = aml.labelForField(self._damping_combo)  # type: ignore
-
-        self._sp_damping = NoWheelDoubleSpinBox()
-        self._sp_damping.setRange(0.0, 100.0)
-        self._sp_damping.setDecimals(2)
-        self._sp_damping.setSingleStep(0.1)
-        self._sp_damping.setValue(3.0)
-        self._sp_damping.setEnabled(False)
-        aml.addRow("Damping value:", self._sp_damping)
-        self._damping_value_label = aml.labelForField(self._sp_damping)  # type: ignore
-
         self._sp_sparse_weight = NoWheelDoubleSpinBox()
         self._sp_sparse_weight.setRange(0.0, 1.0)
         self._sp_sparse_weight.setDecimals(4)
@@ -7956,35 +7883,6 @@ class DeconvolveCIWindow(QMainWindow):
 
         ctrl_layout.addWidget(ri_group)
 
-        # --- Fit PSF controls ---
-        fit_psf_group = QGroupBox("Fit PSF")
-        fit_psf_layout = QFormLayout()
-        fit_psf_group.setLayout(fit_psf_layout)
-
-        self._sp_fit_niter = NoWheelSpinBox()
-        self._sp_fit_niter.setRange(5, 200)
-        self._sp_fit_niter.setValue(40)
-        self._sp_fit_niter.setToolTip(
-            "Number of RL iterations per trial.\n"
-            "More iterations give a more reliable RI-sample result but take longer.\n"
-            "Fewer than ~25 iterations may bias the result toward compact (high-RI) PSFs "
-            "because narrower PSFs converge faster in early iterations."
-        )
-        fit_psf_layout.addRow("Fit iterations:", self._sp_fit_niter)
-
-        self._btn_fit_psf = QPushButton("Fit PSF\u2026")
-        self._btn_fit_psf.setToolTip(
-            "Search for the best sample RI with a rough scan followed by a fine scan.\n"
-            "Uses only the channels currently selected in the viewer.\n\n"
-            "Note: use \u226525 iterations so that RI-sample sensitivity is accurate; "
-            "fewer iterations bias toward compact PSFs (no spherical aberration)."
-        )
-        self._btn_fit_psf.setEnabled(False)
-        self._btn_fit_psf.clicked.connect(self._on_fit_psf)
-        fit_psf_layout.addRow(self._btn_fit_psf)
-
-        ctrl_layout.addWidget(fit_psf_group)
-        fit_psf_group.setVisible(self._fitpsf_available)
         cov_group = QGroupBox("Coverslip / Depth")
         cl = QFormLayout()
         cov_group.setLayout(cl)
@@ -8169,18 +8067,6 @@ class DeconvolveCIWindow(QMainWindow):
             self._sp_tv_lambda,
             "Strength of total-variation regularization for `ci_rl_tv`. Increase it to suppress "
             "noise and ringing; reduce it if fine structure starts looking over-smoothed.",
-        )
-        _set_field_tooltip(
-            aml,
-            self._damping_combo,
-            "Noise-gated damping for RL-family methods. `auto` picks a practical default, "
-            "`manual` lets you tune the value directly, and `none` disables damping.",
-        )
-        _set_field_tooltip(
-            aml,
-            self._sp_damping,
-            "Manual damping strength. Higher values make updates more conservative in noisy, "
-            "near-background regions; lower values make RL more aggressive.",
         )
         _set_field_tooltip(
             wf2d_essential_layout,
@@ -8503,22 +8389,17 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._btn_save.setEnabled(False)
         save_menu = QMenu(self._btn_save)
-        save_menu.addSection("Full")
-        self._act_save_ome_tiff = save_menu.addAction("Current timepoint as OME-TIFF\u2026", self._on_save)
-        self._act_save_ome_zarr = save_menu.addAction("Current timepoint as OME-Zarr\u2026", self._on_save_zarr)
-        self._act_save_t_series = save_menu.addAction("Full T-series as OME-TIFF\u2026", self._on_save_t_series)
+        save_menu.addSection("Deconvolved")
+        self._act_save_current = save_menu.addAction("Current timepoint\u2026", self._on_save)
         save_menu.addSeparator()
-        save_menu.addSection("Projection")
-        self._act_save_ome_tiff_mip = save_menu.addAction("MIP as OME-TIFF\u2026", lambda: self._on_save_projection("ome_tiff", "MIP"))
-        self._act_save_ome_tiff_sum = save_menu.addAction("SUM as OME-TIFF\u2026", lambda: self._on_save_projection("ome_tiff", "SUM"))
-        self._act_save_ome_zarr_mip = save_menu.addAction("MIP as OME-Zarr\u2026", lambda: self._on_save_projection("ome_zarr", "MIP"))
-        self._act_save_ome_zarr_sum = save_menu.addAction("SUM as OME-Zarr\u2026", lambda: self._on_save_projection("ome_zarr", "SUM"))
+        save_menu.addSection("Full T-Series")
+        self._act_save_t_series = save_menu.addAction("Full T-series\u2026", self._on_save_t_series)
         save_menu.addSeparator()
         save_menu.addSection("Preview")
         self._act_save_views = save_menu.addAction("Viewer panes as PNG\u2026", self._on_save_view)
         self._act_save_comparison = save_menu.addAction("Comparison view as PNG\u2026", self._on_save_comparison_view)
         save_menu.addSeparator()
-        self._act_save_original_zarr = save_menu.addAction("Save Org to ZARR\u2026", self._on_save_original_zarr)
+        self._act_save_original_zarr = save_menu.addAction("Save Original to OME-Zarr\u2026", self._on_save_original_zarr)
         self._btn_save.setMenu(save_menu)
         export_layout.addWidget(self._btn_save)
 
@@ -9329,8 +9210,6 @@ class DeconvolveCIWindow(QMainWindow):
                 self._sp_tv_lambda.setValue(0.0001)
         for label, widget in (
             (self._tv_lambda_label, self._sp_tv_lambda),
-            (self._damping_label, self._damping_combo),
-            (self._damping_value_label, self._sp_damping),
             (self._sparse_weight_label, self._sp_sparse_weight),
             (self._sparse_reg_label, self._sp_sparse_reg),
         ):
@@ -9342,12 +9221,6 @@ class DeconvolveCIWindow(QMainWindow):
             self._tv_lambda_label.setVisible(is_tv)
         self._sp_tv_lambda.setVisible(is_tv)
 
-        if self._damping_label is not None:
-            self._damping_label.setVisible(is_rl_family)
-        self._damping_combo.setVisible(is_rl_family)
-        if self._damping_value_label is not None:
-            self._damping_value_label.setVisible(is_rl_family)
-        self._sp_damping.setVisible(is_rl_family)
         self._two_d_wf_essential_group.setVisible(is_rl_family)
         self._two_d_wf_group.setVisible(is_rl_family)
 
@@ -9358,7 +9231,6 @@ class DeconvolveCIWindow(QMainWindow):
             self._sparse_reg_label.setVisible(is_sparse)
         self._sp_sparse_reg.setVisible(is_sparse)
 
-        self._on_damping_changed(self._damping_combo.currentText())
         self._refresh_two_d_wf_expert_state()
 
     def _on_bg_changed(self, text: str):
@@ -9366,10 +9238,6 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _on_offset_changed(self, text: str):
         self._sp_offset.setEnabled(text == "manual")
-
-    def _on_damping_changed(self, text: str):
-        rl_family = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv")
-        self._sp_damping.setEnabled(rl_family and text == "manual")
 
     def _on_conv_changed(self, text: str):
         auto = text == "auto"
@@ -9514,15 +9382,12 @@ class DeconvolveCIWindow(QMainWindow):
         has_time = self._has_time_series()
         has_z = self._has_3d_source()
         full_label = "Current timepoint" if has_time else ("Full stack" if has_z else "Image")
-        action = getattr(self, "_act_save_ome_tiff", None)
+        action = getattr(self, "_act_save_current", None)
         if action is not None:
-            action.setText(f"{full_label} as OME-TIFF...")
-        action = getattr(self, "_act_save_ome_zarr", None)
-        if action is not None:
-            action.setText(f"{full_label} as OME-Zarr...")
+            action.setText(f"{full_label}...")
         action = getattr(self, "_act_save_t_series", None)
         if action is not None:
-            action.setText("Full T-series as OME-TIFF..." if has_time else "Full T-series as OME-TIFF")
+            action.setText("Full T-series..." if has_time else "Full T-series")
 
     def _update_operation_controls(self) -> None:
         if not hasattr(self, "_btn_run"):
@@ -9536,40 +9401,24 @@ class DeconvolveCIWindow(QMainWindow):
         can_save_preview = has_preview and state == "Idle"
         can_save_t_series = has_input and state == "Idle" and self._has_time_series() and not streamed_pyramid
         can_save_original_zarr = bool(self._input_source is not None) and state == "Idle"
-        can_save_projection = can_save_preview and self._has_3d_source()
         worker_running = self._worker is not None and self._worker.isRunning()
-        fit_worker_running = self._fit_psf_worker is not None and self._fit_psf_worker.isRunning()
         self._btn_run.setEnabled(
             (has_input and state == "Idle")
             or (state in ("Deconvolving", "Streaming") and worker_running)
-        )
-        self._btn_fit_psf.setEnabled(
-            (has_input and state == "Idle" and not streamed_pyramid)
-            or (state == "Deconvolving" and fit_worker_running)
         )
         self._btn_save_series.setVisible(False)
         self._btn_save_series.setEnabled(can_save_t_series)
         self._btn_save.setEnabled(can_save_preview or can_save_t_series or can_save_original_zarr)
 
-        for action_name in ("_act_save_ome_tiff", "_act_save_ome_zarr"):
-            action = getattr(self, action_name, None)
-            if action is not None:
-                action.setEnabled(can_save_preview)
+        action = getattr(self, "_act_save_current", None)
+        if action is not None:
+            action.setEnabled(can_save_preview)
         action = getattr(self, "_act_save_t_series", None)
         if action is not None:
             action.setEnabled(can_save_t_series)
         action = getattr(self, "_act_save_original_zarr", None)
         if action is not None:
             action.setEnabled(can_save_original_zarr)
-        for action_name in (
-            "_act_save_ome_tiff_mip",
-            "_act_save_ome_tiff_sum",
-            "_act_save_ome_zarr_mip",
-            "_act_save_ome_zarr_sum",
-        ):
-            action = getattr(self, action_name, None)
-            if action is not None:
-                action.setEnabled(can_save_projection)
         for action_name in ("_act_save_views", "_act_save_comparison"):
             action = getattr(self, action_name, None)
             if action is not None:
@@ -9922,7 +9771,6 @@ class DeconvolveCIWindow(QMainWindow):
             f"{display_name}\n{n_ch} ch, T={size_t}, Z={size_z}, YX={size_y}×{size_x}"
         )
         self._btn_run.setEnabled(False)
-        self._btn_fit_psf.setEnabled(False)
         self._btn_save_series.setEnabled(False)
         self._btn_save_series.setVisible(False)
         self._btn_save.setEnabled(False)
@@ -10083,13 +9931,6 @@ class DeconvolveCIWindow(QMainWindow):
         if not niter_list:
             niter_list = [50]
 
-        damping_text = self._damping_combo.currentText()
-        damping: str | float = "auto"
-        if damping_text == "none":
-            damping = 0.0
-        elif damping_text == "manual":
-            damping = self._sp_damping.value()
-
         movie_enabled = (
             self._movie_available
             and hasattr(self, "_cb_movie")
@@ -10119,7 +9960,6 @@ class DeconvolveCIWindow(QMainWindow):
             "movie": movie,
             "niter_list": niter_list,
             "tv_lambda": self._sp_tv_lambda.value(),
-            "damping": damping,
             "two_d_mode": "auto",
             "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText().strip().lower(),
             "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
@@ -10175,7 +10015,6 @@ class DeconvolveCIWindow(QMainWindow):
             "iterations": list(params.get("niter_list") or []),
             "background": params.get("background"),
             "offset": params.get("offset"),
-            "damping": params.get("damping"),
             "tv_lambda": params.get("tv_lambda"),
             "sparse_hessian_weight": params.get("sparse_hessian_weight"),
             "sparse_hessian_reg": params.get("sparse_hessian_reg"),
@@ -10548,307 +10387,6 @@ class DeconvolveCIWindow(QMainWindow):
             self._log_dialog.push_iteration(payload)
 
     # -----------------------------------------------------------------------
-    # PSF fitting
-    # -----------------------------------------------------------------------
-
-    def _on_fit_psf(self):
-        if not self._input_channels:
-            self._log("No image loaded — cannot fit PSF.")
-            return
-        if self._is_streamed_omero_pyramid_source():
-            QMessageBox.information(
-                self,
-                "Large OMERO image",
-                "PSF fitting is disabled for OMERO pyramid overview data. "
-                "Use a small crop/ROI or a non-pyramidal source for fitting.",
-            )
-            return
-        if self._fit_psf_worker is not None and self._fit_psf_worker.isRunning():
-            self._fit_psf_worker.requestInterruption()
-            self._btn_fit_psf.setEnabled(False)
-            self._btn_fit_psf.setText("Stopping…")
-            self._log("PSF fit stop requested by user.")
-            self._status.showMessage("Stopping PSF fit …", 0)
-            return
-        if self._worker is not None and self._worker.isRunning():
-            QMessageBox.information(
-                self,
-                "Deconvolution running",
-                "Please wait for the current deconvolution to finish before fitting PSF.",
-            )
-            return
-
-        # Determine which channels to use — RI fitting requires exactly ONE channel.
-        active_indices = self._viewer._active_channel_indices() if hasattr(self._viewer, "_active_channel_indices") else []
-        if not active_indices:
-            active_indices = list(range(len(self._input_channels)))
-        if len(active_indices) > 1:
-            QMessageBox.warning(
-                self,
-                "Select One Channel",
-                "RI fitting is performed on a single channel.\n\n"
-                "Please enable exactly one channel in the viewer, then try again.",
-            )
-            return
-        channels = [self._input_channels[i] for i in active_indices if i < len(self._input_channels)]
-        if not channels:
-            self._log("No channels available for PSF fitting.")
-            return
-
-        params = self._collect_params()
-
-        # Build per-channel emission/excitation lists for the selected channels
-        em_all = params.get("emission_wavelengths", [520]) or [520]
-        ex_all = params.get("excitation_wavelengths", [488]) or [488]
-        ph_all = params.get("pinhole_airy_units", [1.0]) or [1.0]
-        em_sel = [em_all[i] if i < len(em_all) else em_all[-1] for i in active_indices]
-        ex_sel = [ex_all[i] if i < len(ex_all) else ex_all[-1] for i in active_indices]
-        ph_sel = [ph_all[i] if i < len(ph_all) else ph_all[-1] for i in active_indices]
-
-        fit_params = dict(params)
-        fit_params["emission_wavelengths"] = em_sel
-        fit_params["excitation_wavelengths"] = ex_sel
-        fit_params["pinhole_airy_units"] = ph_sel
-
-        is_2d = channels[0].ndim == 2 if channels else False
-
-        guessed_z_p = None
-        if not is_2d and float(params.get("z_p", 0.0)) <= 0.0:
-            guessed_z_p = _guess_fit_zp_um(channels, params.get("pixel_size_z_nm", 0.0))
-            if guessed_z_p is not None:
-                guessed_z_p_um, _, _ = guessed_z_p
-                fit_params["z_p"] = guessed_z_p_um * 1000.0
-                self._sp_zp.setValue(guessed_z_p_um)
-
-        self._btn_fit_psf.setEnabled(True)
-        self._btn_fit_psf.setText("Stop Fit PSF")
-        self._btn_fit_psf.setStyleSheet(
-            "QPushButton { background-color: #e53935; color: white; "
-            "font-weight: bold; }"
-        )
-        self._set_operation_state("Deconvolving", message="Fitting PSF...")
-        self._sp_fit_niter.setEnabled(False)
-        self._fit_psf_started_at = time.time()
-        niter_fit = self._sp_fit_niter.value()
-        self._log("")
-        self._log("PSF Fitting")
-        n_ch = len(channels)
-        microscope = params.get("microscope_type", "widefield")
-        self._log(f"  Channels    : {n_ch} (indices {active_indices})")
-        self._log(f"  Microscope  : {microscope}")
-        self._log(f"  RL iters/trial: {niter_fit}")
-        self._log(f"  RI sample   : {params['ri_sample']:.4f}")
-        if microscope == "confocal":
-            self._log(f"  Pinholes    : {ph_sel} (held fixed during fitting)")
-        self._log("  RI scan     : rough full-range scan + fine local refinement")
-        # Warn if image is 2D: RI mismatch mainly affects axial PSF (spherical aberration),
-        # so the RI axis of the heatmap will be near-flat for single Z-plane data.
-        if is_2d:
-            self._log("  Note: 2D image — RI sample has minimal effect on lateral PSF (spherical aberration is axial).")
-        if guessed_z_p is not None:
-            guessed_z_p_um, nz_guess, stack_depth_um = guessed_z_p
-            self._log(
-                f"  z_p         : auto {guessed_z_p_um:.3f} um from stack depth "
-                f"({nz_guess} planes, {stack_depth_um:.3f} um total)"
-            )
-        elif not is_2d and float(params.get("z_p", 0.0)) <= 0.0:
-            self._log("  Warning: Particle depth (z_p) is 0 um, and stack depth could not be inferred for automatic RI fitting.")
-        if niter_fit < 25:
-            self._log(
-                f"  Warning: {niter_fit} iterations may be too few to discriminate RI sample — "
-                "narrow PSFs converge faster in early iterations, biasing toward RI=1.515. "
-                "Recommend \u226525 iterations."
-            )
-        self._log("  Searching\u2026")
-
-        self._fit_psf_worker = _FitPsfWorker(channels, fit_params, niter_fit=niter_fit, parent=self)
-        self._fit_psf_worker.progress.connect(self._on_fit_psf_progress)
-        self._fit_psf_worker.finished.connect(self._on_fit_psf_done)
-        self._fit_psf_worker.start()
-
-    def _on_fit_psf_progress(self, idx: int, total: int, params: dict, i_div: float):
-        if total > 0:
-            pct = int(idx * 100 / total)
-            ri = params.get("ri_sample", "?")
-            eta_text = ""
-            if self._fit_psf_started_at is not None and idx > 0:
-                elapsed = max(time.time() - self._fit_psf_started_at, 0.0)
-                seconds_per_trial = elapsed / idx
-                eta_seconds = max(total - idx, 0) * seconds_per_trial
-                eta_text = f"  ETA {_format_duration(eta_seconds)}"
-            self._status.showMessage(
-                f"Fitting PSF… {pct}%{eta_text}  (RI={ri:.4f}, residual={i_div:.5g})"
-                if isinstance(ri, float) else
-                f"Fitting PSF… {pct}%{eta_text}  residual={i_div:.5g}",
-                0,
-            )
-
-    def _on_fit_psf_done(self, result):
-        self._btn_fit_psf.setText("Fit PSF\u2026")
-        self._btn_fit_psf.setStyleSheet("")
-        self._sp_fit_niter.setEnabled(True)
-        self._fit_psf_started_at = None
-
-        if isinstance(result, Exception):
-            self._fit_psf_worker = None
-            if "Stopped by user" in str(result):
-                self._log("PSF fitting stopped by user.")
-                self._status.showMessage("PSF fitting stopped", 5000)
-                return
-            self._log(f"PSF fitting failed: {result}")
-            QMessageBox.critical(self, "PSF Fit Error", str(result))
-            self._status.showMessage("PSF fitting failed", 5000)
-            return
-
-        try:
-            best = result["best_params"]
-            grid_best = result.get("grid_best_params", best)
-            improvement = result.get("improvement_pct", 0.0)
-            score_label = result.get("score_label", "PSF fit score")
-            best_ri = float(best.get("ri_sample", 1.33))
-            grid_best_ri = float(grid_best.get("ri_sample", best_ri))
-
-            self._log("")
-            self._log(f"  Best score        : {result['best_i_div']:.5g}")
-            baseline = result.get("baseline_i_div", float("inf"))
-            self._log(f"  Baseline score    : {baseline:.5g}" if baseline != float("inf") else "  Baseline score    : (not available)")
-            self._log(f"  Score model       : {score_label}")
-
-            if improvement <= 0.0:
-                msg = (
-                    f"PSF fit: no improvement found. "
-                    f"Original parameters kept. "
-                    f"(grid best RI={grid_best_ri:.4f})"
-                )
-                self._log(msg)
-                self._status.showMessage(msg, 8000)
-            else:
-                # Apply best params to UI
-                self._sp_ri_sample.setValue(best_ri)
-                msg = (
-                    f"PSF fit complete \u2014 {improvement:.0f}% improvement "
-                    f"(RI={best_ri:.4f})"
-                )
-                self._log(msg)
-                self._status.showMessage(msg, 8000)
-
-            # Always render heatmap so user can see the full search landscape
-            self._render_psf_fit_heatmap(result)
-
-        except Exception as exc:
-            traceback.print_exc()
-            self._log(f"PSF fit result display error: {exc}")
-        finally:
-            self._fit_psf_worker = None
-            self._set_operation_state("Idle")
-
-    def _render_psf_fit_heatmap(self, result: dict):
-        """Render a PSF fitting heatmap and display it in the decon viewer pane."""
-        try:
-            import matplotlib.figure as mfig
-            from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-            search_log = result.get("search_log", [])
-            grid = result.get("grid", {})
-            pinhole_vals = grid.get("pinhole", [])
-            ri_vals = grid.get("ri_sample", [])
-            is_confocal = len(pinhole_vals) > 1
-
-            if not search_log:
-                return
-
-            if is_confocal:
-                n_ri = len(ri_vals)
-                n_ph = len(pinhole_vals)
-                matrix = np.full((n_ri, n_ph), np.nan)
-                ph_idx = {round(v, 6): i for i, v in enumerate(pinhole_vals)}
-                ri_idx = {round(v, 6): i for i, v in enumerate(ri_vals)}
-                for entry in search_log:
-                    ph = round(float(entry["params"].get("pinhole_airy_units", -1)), 6)
-                    ri = round(float(entry["params"].get("ri_sample", -1)), 6)
-                    pi = ph_idx.get(ph)
-                    ri_i = ri_idx.get(ri)
-                    if pi is not None and ri_i is not None:
-                        matrix[ri_i, pi] = entry["i_div"]
-
-                fig = mfig.Figure(figsize=(max(5.0, n_ph * 0.8), max(3.5, n_ri * 0.8)), dpi=100)
-                FigureCanvasAgg(fig)
-                ax = fig.add_subplot(111)
-                im = ax.imshow(
-                    matrix,
-                    aspect="auto",
-                    cmap="inferno_r",
-                    origin="lower",
-                    interpolation="nearest",
-                )
-                ax.set_xticks(range(n_ph))
-                ax.set_xticklabels([f"{v:.2f}" for v in pinhole_vals], fontsize=8)
-                ax.set_yticks(range(n_ri))
-                ax.set_yticklabels([f"{v:.4f}" for v in ri_vals], fontsize=8)
-                ax.set_xlabel("Pinhole (AU)", fontsize=9)
-                ax.set_ylabel("RI sample", fontsize=9)
-                ax.set_title("PSF Fit — composite score (lower = better)", fontsize=9)
-
-                # Mark best
-                best = result.get("best_params", {})
-                best_ph = round(float(best.get("pinhole_airy_units", -1)), 6)
-                best_ri = round(float(best.get("ri_sample", -1)), 6)
-                bpi = ph_idx.get(best_ph)
-                bri = ri_idx.get(best_ri)
-                if bpi is not None and bri is not None:
-                    ax.plot(bpi, bri, "w*", markersize=14, zorder=5)
-
-                fig.colorbar(im, ax=ax, label="Composite score")
-                fig.tight_layout()
-
-            else:
-                # Widefield: 1D bar chart over RI
-                ri_div = [(e["params"].get("ri_sample", 0), e["i_div"]) for e in search_log]
-                ri_div.sort(key=lambda x: x[0])
-                xs = [v[0] for v in ri_div]
-                ys = [v[1] for v in ri_div]
-
-                fig = mfig.Figure(figsize=(5.5, 3.5), dpi=100)
-                FigureCanvasAgg(fig)
-                ax = fig.add_subplot(111)
-                ax.bar(range(len(xs)), ys, color="#ff6600", edgecolor="white", alpha=0.85)
-                ax.set_xticks(range(len(xs)))
-                ax.set_xticklabels([f"{v:.4f}" for v in xs], fontsize=8, rotation=45, ha="right")
-                ax.set_xlabel("RI sample", fontsize=9)
-                ax.set_ylabel("Composite score", fontsize=9)
-                ax.set_title("PSF Fit — composite score by RI sample (lower = better)", fontsize=9)
-
-                # Mark best
-                best_ri = float(result.get("best_params", {}).get("ri_sample", -1))
-                for i, x in enumerate(xs):
-                    if abs(x - best_ri) < 1e-5:
-                        ax.bar(i, ys[i], color="#ffdd00", edgecolor="white", alpha=1.0)
-                        ax.annotate("best", (i, ys[i]), textcoords="offset points",
-                                    xytext=(0, 4), ha="center", fontsize=8, color="white",
-                                    fontweight="bold")
-                fig.tight_layout()
-
-            # Render to RGBA buffer via the Agg canvas
-            fig.canvas.draw()
-            buf = fig.canvas.buffer_rgba()
-            w, h = fig.canvas.get_width_height()
-            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
-            rgb = arr[:, :, :3].copy()
-            fig.clf()
-
-            # Convert to QPixmap
-            h_px, w_px, _ = rgb.shape
-            qimg = QImage(rgb.data, w_px, h_px, w_px * 3, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimg)
-
-            self._viewer._output_pane.set_pixmap(pixmap)
-            self._viewer._output_pane.show_content()
-
-        except Exception as exc:
-            self._log(f"Heatmap render error: {exc}")
-            traceback.print_exc()
-
-    # -----------------------------------------------------------------------
     # Save
     # -----------------------------------------------------------------------
 
@@ -10888,7 +10426,7 @@ class DeconvolveCIWindow(QMainWindow):
         projection: str,
     ) -> tuple[np.ndarray, dict]:
         mode = str(projection or "").strip().upper()
-        if mode not in {"MIP", "SUM"}:
+        if mode not in {"MIP", "SUM", "MEAN"}:
             raise ValueError(f"Unsupported preview projection: {projection}")
         arr = np.asarray(data, dtype=np.float32)
         if arr.ndim != 5:
@@ -10897,8 +10435,10 @@ class DeconvolveCIWindow(QMainWindow):
             projected = arr.copy()
         elif mode == "MIP":
             projected = np.max(arr, axis=2, keepdims=True).astype(np.float32, copy=False)
-        else:
+        elif mode == "SUM":
             projected = np.sum(arr, axis=2, keepdims=True, dtype=np.float32)
+        else:
+            projected = np.mean(arr, axis=2, keepdims=True, dtype=np.float32)
         projected_metadata = dict(metadata or {})
         projected_metadata["size_z"] = 1
         projected_metadata["default_z"] = 0
@@ -10909,11 +10449,27 @@ class DeconvolveCIWindow(QMainWindow):
         projected_metadata["cideconvolve_processing"]["projection"] = mode.lower()
         return projected.astype(np.float32, copy=False), projected_metadata
 
-    def _preview_export_stem(self, current_t: int) -> str:
+    def _current_preview_export_data_for_save(self, projection: str = "Stack") -> tuple[int, np.ndarray, dict, str]:
+        current_t, data, metadata = self._current_preview_export_data()
+        if projection.upper() in {"MIP", "SUM", "MEAN"}:
+            data, metadata = self._project_preview_export_data(data, metadata, projection)
+        else:
+            projection = "Stack"
+            metadata = dict(metadata or {})
+            metadata["projection"] = "stack"
+            metadata["cideconvolve_processing"] = dict(metadata.get("cideconvolve_processing") or {})
+            metadata["cideconvolve_processing"]["projection"] = "stack"
+        return current_t, data, metadata, projection
+
+    def _preview_export_stem(self, current_t: int, projection: str = "Stack") -> str:
         stem = self._input_path.stem if self._input_path else "deconvolved"
         method = self._method_combo.currentText()
         niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
-        return f"{_safe_filename_stem(stem)}_{method}_{niter_text}i_T{current_t:03d}"
+        base = f"{_safe_filename_stem(stem)}_{method}_{niter_text}i_T{current_t:03d}"
+        projection_key = str(projection or "Stack").strip().lower()
+        if projection_key and projection_key not in {"org", "stack"}:
+            return f"{base}_{_safe_filename_stem(projection_key)}"
+        return base
 
     def _start_preview_save(self, job: dict[str, Any]) -> None:
         if self._preview_save_worker is not None and self._preview_save_worker.isRunning():
@@ -10962,59 +10518,82 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _on_save(self):
         try:
-            current_t, data, metadata = self._current_preview_export_data()
+            current_t, preview_data, _preview_metadata = self._current_preview_export_data()
         except RuntimeError as exc:
             QMessageBox.information(self, "No deconvolved result", str(exc))
             return
-        suggested = f"{self._preview_export_stem(current_t)}.ome.tiff"
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Error", str(exc))
+            return
 
+        options = _PreviewSaveOptionsDialog(has_z=preview_data.shape[2] > 1, parent=self)
+        if options.exec() != QDialog.DialogCode.Accepted:
+            return
+        output_kind = options.output_kind()
+        projection = options.projection_mode()
+        output_dtype = options.output_dtype()
+        try:
+            current_t, data, metadata, projection = self._current_preview_export_data_for_save(projection)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Error", str(exc))
+            return
+
+        if output_kind == "ome_zarr":
+            suggested = f"{self._preview_export_stem(current_t, projection)}.ome.zarr"
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Save Deconvolved {projection} as OME-Zarr",
+                str(Path(self._last_save_dir) / suggested),
+                "OME-Zarr (*.ome.zarr);;Zarr (*.zarr)",
+            )
+            if not path:
+                return
+            if not (path.lower().endswith(".ome.zarr") or path.lower().endswith(".zarr")):
+                path += ".ome.zarr"
+            out = Path(path)
+            if out.exists():
+                answer = QMessageBox.question(
+                    self,
+                    "Replace OME-Zarr",
+                    f"Replace existing folder?\n{out}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                if out.is_dir():
+                    shutil.rmtree(out)
+                else:
+                    out.unlink()
+            self._last_save_dir = str(out.parent)
+            self._log(f"Saving {projection} OME-Zarr preview to {out} ({output_dtype})")
+            self._start_preview_save({
+                "kind": "ome_zarr",
+                "path": str(out),
+                "data": data,
+                "metadata": metadata,
+                "output_dtype": output_dtype,
+            })
+            return
+
+        suggested = f"{self._preview_export_stem(current_t, projection)}.ome.tiff"
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Deconvolved Preview as OME-TIFF",
+            f"Save Deconvolved {projection} as OME-TIFF",
             str(Path(self._last_save_dir) / suggested),
             "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)",
         )
         if not path:
             return
         self._last_save_dir = str(Path(path).parent)
-        self._log(f"Saving OME-TIFF preview to {path}")
-        self._start_preview_save({"kind": "ome_tiff", "path": path, "data": data, "metadata": metadata})
-
-    def _on_save_zarr(self) -> None:
-        try:
-            current_t, data, metadata = self._current_preview_export_data()
-        except RuntimeError as exc:
-            QMessageBox.information(self, "No deconvolved result", str(exc))
-            return
-        suggested = f"{self._preview_export_stem(current_t)}.ome.zarr"
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Deconvolved Preview as OME-Zarr",
-            str(Path(self._last_save_dir) / suggested),
-            "OME-Zarr (*.ome.zarr);;Zarr (*.zarr)",
-        )
-        if not path:
-            return
-        if not (path.lower().endswith(".ome.zarr") or path.lower().endswith(".zarr")):
-            path += ".ome.zarr"
-        out = Path(path)
-        if out.exists():
-            answer = QMessageBox.question(
-                self,
-                "Replace OME-Zarr",
-                f"Replace existing folder?\n{out}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            if out.is_dir():
-                shutil.rmtree(out)
-            else:
-                out.unlink()
-        self._last_save_dir = str(out.parent)
-        self._log(f"Saving OME-Zarr preview to {out}")
-        self._start_preview_save({"kind": "ome_zarr", "path": str(out), "data": data, "metadata": metadata})
+        self._log(f"Saving {projection} OME-TIFF preview to {path} ({output_dtype})")
+        self._start_preview_save({
+            "kind": "ome_tiff",
+            "path": path,
+            "data": data,
+            "metadata": metadata,
+            "output_dtype": output_dtype,
+        })
 
     def _original_zarr_export_metadata(self) -> dict:
         base = {}
@@ -11145,65 +10724,6 @@ class DeconvolveCIWindow(QMainWindow):
         self._log(f"Original OME-Zarr export saved: {path} ({tiles} tiles)")
         self._status.showMessage(f"Saved -> {path.name}", 5000)
 
-    def _on_save_projection(self, output_kind: str, projection: str) -> None:
-        try:
-            current_t, data, metadata = self._current_preview_export_data()
-            data, metadata = self._project_preview_export_data(data, metadata, projection)
-        except RuntimeError as exc:
-            QMessageBox.information(self, "No deconvolved result", str(exc))
-            return
-        except Exception as exc:
-            QMessageBox.critical(self, "Save Error", str(exc))
-            return
-
-        projection_key = _safe_filename_stem(projection.lower())
-        suggested_stem = f"{self._preview_export_stem(current_t)}_{projection_key}"
-        if output_kind == "ome_tiff":
-            path, _ = QFileDialog.getSaveFileName(
-                self,
-                f"Save {projection} Projection as OME-TIFF",
-                str(Path(self._last_save_dir) / f"{suggested_stem}.ome.tiff"),
-                "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)",
-            )
-            if not path:
-                return
-            self._last_save_dir = str(Path(path).parent)
-            self._log(f"Saving {projection} OME-TIFF preview to {path}")
-            self._start_preview_save({"kind": "ome_tiff", "path": path, "data": data, "metadata": metadata})
-            return
-
-        if output_kind != "ome_zarr":
-            QMessageBox.critical(self, "Save Error", f"Unknown export format: {output_kind}")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            f"Save {projection} Projection as OME-Zarr",
-            str(Path(self._last_save_dir) / f"{suggested_stem}.ome.zarr"),
-            "OME-Zarr (*.ome.zarr);;Zarr (*.zarr)",
-        )
-        if not path:
-            return
-        if not (path.lower().endswith(".ome.zarr") or path.lower().endswith(".zarr")):
-            path += ".ome.zarr"
-        out = Path(path)
-        if out.exists():
-            answer = QMessageBox.question(
-                self,
-                "Replace OME-Zarr",
-                f"Replace existing folder?\n{out}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            if out.is_dir():
-                shutil.rmtree(out)
-            else:
-                out.unlink()
-        self._last_save_dir = str(out.parent)
-        self._log(f"Saving {projection} OME-Zarr preview to {out}")
-        self._start_preview_save({"kind": "ome_zarr", "path": str(out), "data": data, "metadata": metadata})
-
     def _on_save_view(self):
         current_t = self._viewer.current_timepoint()
         if current_t not in self._preview_outputs_by_t:
@@ -11310,22 +10830,63 @@ class DeconvolveCIWindow(QMainWindow):
         if self._save_worker is not None and self._save_worker.isRunning():
             return
 
+        size_t = max(int(self._metadata.get("size_t", 1) or 1), 1)
+        options = _TSeriesSaveOptionsDialog(size_t, parent=self)
+        if options.exec() != QDialog.DialogCode.Accepted:
+            return
+        output_kind = options.output_kind()
+        projection_mode = options.projection_mode()
+        output_dtype = options.output_dtype()
+        selected_timepoints = options.timepoints()
+        range_label = options.range_label()
+
         stem = self._input_path.stem if self._input_path else "deconvolved"
         method = self._method_combo.currentText()
         niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
-        suggested = f"{stem}_{method}_{niter_text}i_TSERIES.ome.tiff"
+        projection_key = str(projection_mode or "Stack").strip().lower()
+        projection_tag = "" if projection_key in {"stack", "org"} else f"_{_safe_filename_stem(projection_key)}"
+        if output_kind == "ome_zarr":
+            suggested = f"{stem}_{method}_{niter_text}i_{range_label}{projection_tag}.ome.zarr"
+            title = "Save Deconvolved T-Series as OME-Zarr"
+            filter_text = "OME-Zarr (*.ome.zarr);;Zarr (*.zarr)"
+        else:
+            suggested = f"{stem}_{method}_{niter_text}i_{range_label}{projection_tag}.ome.tiff"
+            title = "Save Deconvolved T-Series as OME-TIFF"
+            filter_text = "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)"
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Deconvolved T-Series",
+            title,
             str(Path(self._last_save_dir) / suggested),
-            "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)",
+            filter_text,
         )
         if not path:
             return
-        self._last_save_dir = str(Path(path).parent)
+        if output_kind == "ome_zarr" and not (path.lower().endswith(".ome.zarr") or path.lower().endswith(".zarr")):
+            path += ".ome.zarr"
+        out_path = Path(path)
+        if output_kind == "ome_zarr" and out_path.exists():
+            answer = QMessageBox.question(
+                self,
+                "Replace OME-Zarr",
+                f"Replace existing folder?\n{out_path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                if out_path.is_dir():
+                    shutil.rmtree(out_path)
+                else:
+                    out_path.unlink()
+            except Exception as exc:
+                QMessageBox.critical(self, "Save Error", f"Could not replace existing output:\n{exc}")
+                return
+        self._last_save_dir = str(out_path.parent)
 
         self._save_last_settings()
-        self._begin_busy_progress("Saving full T-series …")
+        label = "OME-Zarr" if output_kind == "ome_zarr" else "OME-TIFF"
+        self._begin_busy_progress(f"Saving full T-series to {label} …")
         self._set_operation_state("Saving", message="Saving full T-series...")
         self._btn_run.setEnabled(False)
         self._btn_save.setEnabled(False)
@@ -11335,7 +10896,10 @@ class DeconvolveCIWindow(QMainWindow):
         self._set_log_running(True)
         self._log("")
         self._log("=" * 70)
-        self._log(f"Starting full T-series export to {path}")
+        self._log(f"Starting full T-series {label} export to {out_path}")
+        self._log(f"  Projection: {projection_mode}")
+        self._log(f"  Dtype     : {output_dtype}")
+        self._log("  T frames  : " + ", ".join(str(t + 1) for t in selected_timepoints))
         self._log("=" * 70)
 
         if self._input_source_factory is None:
@@ -11361,7 +10925,11 @@ class DeconvolveCIWindow(QMainWindow):
             save_source,
             self._metadata,
             params,
-            path,
+            str(out_path),
+            output_kind=output_kind,
+            projection_mode=projection_mode,
+            timepoints=selected_timepoints,
+            output_dtype=output_dtype,
             parent=self,
         )
         self._save_worker.progress.connect(self._on_worker_progress)
@@ -11388,7 +10956,7 @@ class DeconvolveCIWindow(QMainWindow):
             return
 
         path = Path(result["path"])
-        size = path.stat().st_size / (1024 * 1024) if path.exists() else 0.0
+        size = _path_size_mb(path)
         self._log(f"T-series export saved: {path} ({_format_bytes(size)})")
         self._status.showMessage(f"Saved → {Path(result['path']).name}", 5000)
 
@@ -11402,8 +10970,6 @@ class DeconvolveCIWindow(QMainWindow):
             "method": self._method_combo.currentText(),
             "iterations": self._le_niter.text(),
             "tv_lambda": self._sp_tv_lambda.value(),
-            "damping": self._damping_combo.currentText(),
-            "damping_value": self._sp_damping.value(),
             "two_d_mode": self._two_d_mode_combo.currentText(),
             "two_d_wf_aggressiveness": self._two_d_wf_aggr_combo.currentText(),
             "two_d_wf_bg_radius_um": self._sp_two_d_wf_bg_radius.value(),
@@ -11477,8 +11043,6 @@ class DeconvolveCIWindow(QMainWindow):
         _combo(self._method_combo, "method")
         _line(self._le_niter, "iterations")
         _spin(self._sp_tv_lambda, "tv_lambda")
-        _combo(self._damping_combo, "damping")
-        _spin(self._sp_damping, "damping_value")
         self._two_d_mode_combo.setCurrentText("Auto")
         aggr = data.get("two_d_wf_aggressiveness")
         if aggr is not None:
@@ -11795,11 +11359,8 @@ class DeconvolveCIWindow(QMainWindow):
             recent_locator = str(context.get("recent_locator") or "")
             self._log_many(_image_detail_lines(display_name, source_path, self._metadata, self._input_channels))
             self._btn_run.setEnabled(True)
-            self._btn_fit_psf.setEnabled(not source_is_pyramidal)
             self._btn_save_series.setEnabled(False)
             self._btn_save_series.setVisible(False)
-            if source_is_pyramidal:
-                self._btn_fit_psf.setEnabled(False)
             if source_path is not None:
                 kind = recent_kind or ("zarr" if str(source_path).lower().endswith((".zarr", ".ome.zarr")) or source_path.is_dir() else "file")
                 self._remember_recent_source(
@@ -11937,11 +11498,6 @@ def main():
         action="store_true",
         help="Expose advanced MP4 iteration movie export controls.",
     )
-    parser.add_argument(
-        "--fitpsf",
-        action="store_true",
-        help="Expose the experimental Fit PSF panel for refractive-index fitting.",
-    )
     args, qt_args = parser.parse_known_args(sys.argv[1:])
 
     app = QApplication([sys.argv[0], *qt_args])
@@ -11951,7 +11507,7 @@ def main():
         app.setWindowIcon(app_icon)
 
     _update_pyinstaller_splash("90% - Building main window...")
-    window = DeconvolveCIWindow(movie_available=args.movie, fitpsf_available=args.fitpsf)
+    window = DeconvolveCIWindow(movie_available=args.movie)
     _update_pyinstaller_splash("100% - Starting CI Deconvolve...")
     window.show()
     app.processEvents()

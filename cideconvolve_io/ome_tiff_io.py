@@ -24,8 +24,11 @@ def write_tczyx_ome_tiff(
     path: str | Path,
     metadata: dict[str, Any] | None = None,
     *,
-    levels: int = 1,
+    levels: int | None = None,
     compression: str | None = "lzw",
+    output_dtype: str = "float32",
+    predictor: bool | None = None,
+    write_private_metadata: bool = False,
 ) -> Path:
     """Write a TCZYX float image through the shared tiled OME-TIFF sink."""
     arr = np.asarray(data, dtype=np.float32)
@@ -34,13 +37,17 @@ def write_tczyx_ome_tiff(
 
     meta = dict(metadata or {})
     meta.setdefault("channel_names", _channel_names(meta, arr.shape[1]))
+    use_predictor = str(output_dtype or "float32").strip().lower() == "uint16" if predictor is None else bool(predictor)
     out_path = Path(path)
     sink = TiledOmeTiffSink(
         out_path,
         shape=tuple(int(v) for v in arr.shape),
         metadata=meta,
-        levels=int(levels),
+        levels=levels,
         compression=compression,
+        output_dtype=output_dtype,
+        predictor=use_predictor,
+        write_private_metadata=write_private_metadata,
     )
     try:
         for t in range(arr.shape[0]):
@@ -60,4 +67,3 @@ def write_tczyx_ome_tiff(
         sink.abort()
         raise
     return out_path
-

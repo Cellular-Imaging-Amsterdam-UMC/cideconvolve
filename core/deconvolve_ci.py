@@ -377,19 +377,6 @@ def _estimate_noise_sigma(image: torch.Tensor) -> float:
     return max(sigma, 1e-12)
 
 
-def _damping_map(
-    estimate: torch.Tensor,
-    sigma: float,
-    damping: float,
-    background: float = 0.0,
-) -> torch.Tensor:
-    """Per-voxel damping exponent γ ∈ (0, 1] for noise-gated RL."""
-    scale = max(damping * sigma, 1e-12)
-    signal = (estimate - background).clamp(min=0.0)
-    gamma = 1.0 - torch.exp(-signal / scale)
-    return gamma.clamp(min=1e-3, max=1.0)
-
-
 def _gaussian_smooth(image: torch.Tensor, sigma: float) -> torch.Tensor:
     """Apply separable Gaussian smoothing along each axis."""
     if sigma <= 0.0:
@@ -1038,7 +1025,6 @@ def _ci_rl_deconvolve_2d_widefield(
     *,
     niter: int,
     tv_lambda: float,
-    damping: Union[str, float],
     offset: Union[str, float],
     prefilter_sigma: float,
     start: str,
@@ -1076,23 +1062,18 @@ def _ci_rl_deconvolve_2d_widefield(
 
     mode = str(two_d_wf_aggressiveness).strip().lower()
     if mode == "very conservative":
-        auto_damping_default = 2.5
         auto_offset_default = 3.0
         auto_bg_preset_scale = 1.2
     elif mode == "conservative":
-        auto_damping_default = 2.0
         auto_offset_default = 2.5
         auto_bg_preset_scale = 1.1
     elif mode == "very strong":
-        auto_damping_default = 0.75
         auto_offset_default = 1.0
         auto_bg_preset_scale = 0.8
     elif mode == "strong":
-        auto_damping_default = 1.0
         auto_offset_default = 1.5
         auto_bg_preset_scale = 0.9
     else:
-        auto_damping_default = 1.5
         auto_offset_default = 2.0
         auto_bg_preset_scale = 1.0
 
@@ -1111,11 +1092,6 @@ def _ci_rl_deconvolve_2d_widefield(
     else:
         effective_background = max(float(background), 1e-6)
 
-    if damping == "auto":
-        effective_damping = auto_damping_default
-    else:
-        effective_damping = damping
-
     if offset == "auto":
         effective_offset = auto_offset_default
     else:
@@ -1125,12 +1101,11 @@ def _ci_rl_deconvolve_2d_widefield(
 
     log.info(
         "  2D WF auto -> collapsed-PSF RL  mode=%s  radius_um=%.3g  bg_scale=%.3g  "
-        "bg=%.4g  damping=%s  offset=%s  prefilter=%.4g",
+        "bg=%.4g  offset=%s  prefilter=%.4g",
         two_d_wf_aggressiveness,
         bg_radius_um,
         bg_scale,
         float(effective_background),
-        effective_damping,
         effective_offset,
         effective_prefilter,
     )
@@ -1141,7 +1116,6 @@ def _ci_rl_deconvolve_2d_widefield(
             psf_2d,
             niter=niter,
             tv_lambda=tv_lambda,
-            damping=effective_damping,
             offset=effective_offset,
             prefilter_sigma=effective_prefilter,
             start=start,
@@ -1185,7 +1159,6 @@ def ci_rl_deconvolve(
     *,
     niter: int = 50,
     tv_lambda: float = 0.0,
-    damping: Union[str, float] = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
     start: str = "auto",
@@ -1217,10 +1190,6 @@ def ci_rl_deconvolve(
         Maximum number of iterations.
     tv_lambda : float
         Total-Variation regularisation strength (0 = disabled).
-    damping : ``0.0``, ``"auto"``, or float > 0
-        Noise-gated damping strength for RL-family methods.  When enabled
-        the multiplicative correction factor is attenuated in noisy,
-        near-background regions and preserved in bright structures.
     offset : ``"auto"``, or float >= 0
         Constant added to the image before RL iterations and subtracted
         afterwards.  Shifts all pixels away from zero, preventing the
@@ -1280,7 +1249,7 @@ def ci_rl_deconvolve(
         return _ci_deconvolve_tiled(
             image, psf, n_tiles,
             solver=ci_rl_deconvolve,
-            niter=niter, tv_lambda=tv_lambda, damping=damping, offset=offset,
+            niter=niter, tv_lambda=tv_lambda, offset=offset,
             prefilter_sigma=prefilter_sigma, start=start,
             background=background,
             convergence=convergence, rel_threshold=rel_threshold,
@@ -1303,7 +1272,6 @@ def ci_rl_deconvolve(
             psf,
             niter=niter,
             tv_lambda=tv_lambda,
-            damping=damping,
             offset=offset,
             prefilter_sigma=prefilter_sigma,
             start=start,
@@ -1330,20 +1298,13 @@ def ci_rl_deconvolve(
     else:
         offset_val = max(float(offset), 0.0)
 
-    # Resolve damping
-    if damping == "auto":
-        damp_strength = 3.0
-    else:
-        damp_strength = max(float(damping), 0.0)
-    use_damping = damp_strength > 0.0
-
     if start not in START_MODES:
         start = "flat"
 
     log.info("ci_rl_deconvolve  device=%s  dtype=%s  shape=%s  niter=%d  "
-             "tv_lambda=%.4g  damping=%.4g  offset=%.4g  prefilter_sigma=%.4g  "
+             "tv_lambda=%.4g  offset=%.4g  prefilter_sigma=%.4g  "
              "start=%s  convergence=%s  microscope=%s  two_d_mode=%s",
-             dev, dtype, image.shape, niter, tv_lambda, damp_strength, offset_val,
+             dev, dtype, image.shape, niter, tv_lambda, offset_val,
              prefilter_sigma, start, convergence, microscope_type, two_d_mode)
 
     # Move data to device
@@ -1371,10 +1332,6 @@ def ci_rl_deconvolve(
     start = _resolve_start_mode(start, img_t, bg, microscope_type)
     if requested_start != start:
         log.info("  start=%s resolved to %s", requested_start, start)
-
-    if use_damping:
-        noise_sigma = _estimate_noise_sigma(img_t)
-        log.info("  noise_sigma=%.4g  damping=%.4g", noise_sigma, damp_strength)
 
     # Work shape = image + psf - 1  (full linear convolution)
     work_shape = tuple(si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape))
@@ -1423,11 +1380,6 @@ def ci_rl_deconvolve(
         R_fft = _rfft(r)
         corr = _irfft(R_fft * otf_conj, work_shape)
         del R_fft, r
-
-        # --- Noise-gated damping (attenuate correction in noisy regions) ---
-        if use_damping:
-            gamma = _damping_map(p, noise_sigma, damp_strength, bg)
-            corr = corr.clamp(min=1e-12) ** gamma
 
         # --- Multiplicative update with Bertero weights ---
         x_new = p * corr * W
@@ -2206,316 +2158,3 @@ def ci_generate_psf(
             del psf
         _release_cuda_cache()
 
-
-# ---------------------------------------------------------------------------
-# PSF parameter fitting via short RL trials
-# ---------------------------------------------------------------------------
-
-def _reblur_np(x: np.ndarray, h: np.ndarray) -> np.ndarray:
-    """Re-blur deconvolved image *x* with PSF *h* in numpy.
-
-    Mirrors the RL forward model: the PSF is zero-padded and circularly
-    shifted so its geometric centre sits at array index [0, 0, ...] before
-    the FFT.  Returns the blurred image cropped to ``x.shape``.
-    """
-    lin = tuple(d + p - 1 for d, p in zip(x.shape, h.shape))
-    # Next power-of-2 work shape for FFT speed
-    work = tuple(1 << max(0, (int(n) - 1).bit_length()) for n in lin)
-
-    # PSF: zero-pad then circularly shift centre → origin
-    h32 = h.astype(np.float32)
-    h_pad = np.zeros(work, dtype=np.float32)
-    h_pad[tuple(slice(0, s) for s in h32.shape)] = h32
-    for ax, s in enumerate(h32.shape):
-        h_pad = np.roll(h_pad, -(s // 2), axis=ax)
-
-    # Image: zero-pad
-    x32 = x.astype(np.float32)
-    x_pad = np.zeros(work, dtype=np.float32)
-    x_pad[tuple(slice(0, s) for s in x32.shape)] = x32
-
-    conv = np.fft.irfftn(np.fft.rfftn(x_pad) * np.fft.rfftn(h_pad), s=work)
-    return conv[tuple(slice(0, s) for s in x.shape)].astype(np.float32)
-
-
-def _roughness_np(x: np.ndarray, axis_scales: tuple[float, ...]) -> float:
-    """Return a normalized TV-like roughness for a numpy image."""
-    x32 = np.asarray(x, dtype=np.float32)
-    denom = float(np.mean(np.clip(x32, 0.0, None))) + 1e-8
-    rough = 0.0
-    for axis, scale in enumerate(axis_scales):
-        if axis >= x32.ndim or x32.shape[axis] <= 1:
-            continue
-        rough += float(np.mean(np.abs(np.diff(x32, axis=axis)))) * float(scale)
-    return rough / denom
-
-
-def _normalize_grid_metric(values: list[float]) -> list[float]:
-    """Min-max normalize a list of trial metrics, preserving inf for failures."""
-    finite = [float(v) for v in values if np.isfinite(v)]
-    if not finite:
-        return [float("inf")] * len(values)
-    lo = min(finite)
-    hi = max(finite)
-    if hi - lo <= max(1e-12, abs(lo) * 1e-6):
-        return [0.0 if np.isfinite(v) else float("inf") for v in values]
-    scale = hi - lo
-    return [((float(v) - lo) / scale) if np.isfinite(v) else float("inf") for v in values]
-
-def ci_fit_psf_params(
-    image: np.ndarray,
-    base_params: dict,
-    *,
-    pinhole_grid: Optional[list[float]] = None,
-    ri_sample_grid: Optional[list[float]] = None,
-    niter_fit: int = 40,
-    callback: Optional[Any] = None,
-    should_stop: Optional[Callable[[], bool]] = None,
-) -> dict:
-    """Find the best-fit PSF parameters by evaluating short RL trials.
-
-    Each combination of *pinhole_airy_units* × *ri_sample* values in the
-    search grids is tried: the PSF is generated, ``niter_fit`` RL iterations
-    are run, and a composite score is recorded. The score combines
-    reconstruction residual with deconvolved-image roughness so that the
-    sharpest PSF does not win purely by self-fitting.
-
-    Parameters
-    ----------
-    image:
-        The observed image (2-D or 3-D numpy array) for one channel.
-    base_params:
-        Dict with the same keys as ``_collect_params()`` in the GUI:
-        ``na``, ``ri_immersion``, ``ri_sample``, ``pinhole_airy_units``
-        (scalar for a single channel), ``pixel_size_xy_nm``,
-        ``pixel_size_z_nm``, ``microscope_type``, ``excitation_nm``,
-        ``t_g``, ``t_g0``, ``t_i0``, ``z_p``, ``integrate_pixels``,
-        ``n_subpixels``, ``n_pupil``, ``device``, ``background``,
-        ``offset``.
-    pinhole_grid:
-        List of pinhole sizes (Airy units) to try.  Ignored for widefield.
-        When ``None``, the confocal pinhole is held fixed at
-        ``base_params["pinhole_airy_units"]``.
-    ri_sample_grid:
-        List of sample RI values to try.
-        Defaults to five steps centred on ``base_params["ri_sample"]`` ±0.03.
-    niter_fit:
-        Number of RL iterations per trial (fast / ranking mode).
-    callback:
-        Optional callable invoked after each trial as
-        ``callback(trial_idx, total_trials, trial_params, residual)``.
-    should_stop:
-        Optional callable returning ``True`` when the search should stop.
-
-    Returns
-    -------
-    dict with keys:
-        ``best_params``  – dict of best-fit PSF-relevant params
-        ``best_i_div``   – compatibility alias for the best composite score
-        ``baseline_i_div`` – compatibility alias for baseline composite score
-        ``improvement_pct`` – relative improvement (0–100 %)
-        ``search_log``   – list of per-trial metrics and composite score
-        ``grid``         – ``{"pinhole": [...], "ri_sample": [...]}``
-    """
-    microscope = str(base_params.get("microscope_type", "widefield"))
-    orig_pinhole = float(base_params.get("pinhole_airy_units", 1.0))
-    if isinstance(orig_pinhole, (list, tuple)):
-        orig_pinhole = float(orig_pinhole[0])
-
-    if pinhole_grid is None:
-        # Keep the confocal pinhole fixed by default. For specimen images the
-        # pinhole is effectively acquisition metadata; searching it collapses
-        # toward the sharpest PSF rather than recovering the real setting.
-        pinhole_grid = [orig_pinhole]
-    if ri_sample_grid is None:
-        # Fixed wide range: water (1.33) → oil immersion (1.515) in ~9 steps
-        ri_sample_grid = [1.330, 1.358, 1.385, 1.410, 1.435, 1.460, 1.480, 1.500, 1.515]
-
-    # Clamp RI values to a physically sensible range and deduplicate
-    ri_sample_grid = [max(1.30, min(1.52, v)) for v in ri_sample_grid]
-    ri_sample_grid = list(dict.fromkeys(ri_sample_grid))
-
-    is_confocal = microscope == "confocal"
-    pinhole_trials = pinhole_grid if is_confocal else [float(base_params.get("pinhole_airy_units", 1.0))]
-    ri_trials = ri_sample_grid
-
-    # Build flat list of (pinhole, ri) combinations
-    combos: list[tuple[float, float]] = [
-        (ph, ri) for ph in pinhole_trials for ri in ri_trials
-    ]
-    total = len(combos)
-
-    search_log: list[dict] = []
-    best_i_div = float("inf")
-    best_params: dict = {}
-    baseline_i_div: float = float("inf")
-
-    # Derive PSF size from image (same logic as the GUI worker)
-    img = np.asarray(image, dtype=np.float32)
-    px_xy = float(base_params.get("pixel_size_xy_nm", 65.0))
-    px_z = float(base_params.get("pixel_size_z_nm", 200.0))
-    na = float(base_params.get("na", 1.4))
-    em_wl = float(base_params.get("emission_nm", base_params.get("emission_wavelengths", 520)))
-    if isinstance(em_wl, (list, tuple)):
-        em_wl = float(em_wl[0])
-    ri_imm = float(base_params.get("ri_immersion", 1.515))
-    device = base_params.get("device", None)
-    axis_scales = _axis_scales(img.ndim, px_xy, px_z)
-    orig_ri = float(base_params.get("ri_sample", 1.33))
-
-    # PSF size heuristic (mirror the GUI worker)
-    max_side = max(img.shape[-2], img.shape[-1])
-    psf_xy_fwhm_px = 0.51 * em_wl / (na * px_xy)
-    n_xy_psf = min(int(psf_xy_fwhm_px * 14 + 1) | 1, max_side | 1)
-    n_xy_psf = max(n_xy_psf, 7)
-    if n_xy_psf % 2 == 0:
-        n_xy_psf += 1
-    if img.ndim == 3:
-        psf_z_fwhm_px = 0.88 * em_wl / (ri_imm - (ri_imm ** 2 - na ** 2) ** 0.5) / px_z
-        n_z_psf = min(max(int(psf_z_fwhm_px * 6 + 1) | 1, 7), img.shape[0])
-        if n_z_psf % 2 == 0:
-            n_z_psf += 1
-        psf_pixel_z = px_z
-    else:
-        n_z_psf = 1
-        psf_pixel_z = px_z
-
-    def _run_trial(pinhole: float, ri_sample: float, trial_idx: int) -> dict:
-        try:
-            psf = ci_generate_psf(
-                na=na,
-                wavelength_nm=em_wl,
-                pixel_size_xy_nm=px_xy,
-                pixel_size_z_nm=psf_pixel_z,
-                n_xy=n_xy_psf,
-                n_z=n_z_psf,
-                ri_immersion=ri_imm,
-                ri_sample=ri_sample,
-                ri_coverslip=ri_imm,
-                ri_coverslip_design=ri_imm,
-                ri_immersion_design=ri_imm,
-                t_g=float(base_params.get("t_g", 170_000.0)),
-                t_g0=float(base_params.get("t_g0", 170_000.0)),
-                t_i0=float(base_params.get("t_i0", 100_000.0)),
-                z_p=float(base_params.get("z_p", 0.0)),
-                microscope_type=microscope,
-                excitation_nm=base_params.get("excitation_nm") or base_params.get("excitation_wavelengths"),
-                pinhole_airy_units=pinhole,
-                integrate_pixels=bool(base_params.get("integrate_pixels", True)),
-                n_subpixels=int(base_params.get("n_subpixels", 3)),
-                n_pupil=int(base_params.get("n_pupil", 129)),
-                device=device,
-            )
-            # Trim PSF Z if needed
-            if img.ndim == 3 and psf.ndim == 3 and psf.shape[0] > img.shape[0]:
-                start = (psf.shape[0] - img.shape[0]) // 2
-                psf = psf[start:start + img.shape[0]]
-            if img.ndim == 2 and psf.ndim == 3:
-                psf = psf[0]
-
-            result = ci_rl_deconvolve(
-                img,
-                psf,
-                niter=niter_fit,
-                offset=base_params.get("offset", "auto"),
-                background=base_params.get("background", "auto"),
-                convergence="fixed",
-                device=device,
-            )
-            # Residual alone still favors the sharpest PSF because it lets the
-            # latent image become arbitrarily rough. Charge that complexity too.
-            deconvolved = np.asarray(result["result"], dtype=np.float32)
-            blurred_est = _reblur_np(deconvolved, psf)
-            raw_scale = float(img.mean()) + 1e-8
-            residual = float(np.mean(np.abs(img - blurred_est))) / raw_scale
-            roughness = _roughness_np(deconvolved, axis_scales)
-            return {
-                "residual": residual,
-                "roughness": roughness,
-            }
-        except Exception as exc:
-            log.warning("PSF fit trial (pinhole=%.2f, ri=%.4f) failed: %s", pinhole, ri_sample, exc)
-            return {
-                "residual": float("inf"),
-                "roughness": float("inf"),
-            }
-
-    for idx, (pinhole, ri_sample) in enumerate(combos):
-        if should_stop is not None and should_stop():
-            raise RuntimeError("Stopped by user")
-        trial_params = {"pinhole_airy_units": pinhole, "ri_sample": ri_sample}
-        metrics = _run_trial(pinhole, ri_sample, idx)
-        residual = float(metrics["residual"])
-        roughness = float(metrics["roughness"])
-        entry = {
-            "params": dict(trial_params),
-            "residual": residual,
-            "roughness": roughness,
-            "score": float("inf"),
-            "i_div": float("inf"),
-        }
-        search_log.append(entry)
-
-        if callback is not None:
-            try:
-                callback(idx + 1, total, trial_params, residual)
-            except Exception:
-                pass
-
-    residual_norm = _normalize_grid_metric([entry["residual"] for entry in search_log])
-    roughness_norm = _normalize_grid_metric([entry["roughness"] for entry in search_log])
-    for entry, resid_n, rough_n in zip(search_log, residual_norm, roughness_norm):
-        score = resid_n + rough_n if np.isfinite(resid_n) and np.isfinite(rough_n) else float("inf")
-        entry["score"] = score
-        entry["i_div"] = score
-
-    best_entry = min(search_log, key=lambda e: e["score"])
-    best_i_div = float(best_entry["score"])
-    best_params = dict(best_entry["params"])
-
-    baseline_entry = next(
-        (
-            entry for entry in search_log
-            if abs(float(entry["params"].get("pinhole_airy_units", -1.0)) - orig_pinhole) < 1e-6
-            and abs(float(entry["params"].get("ri_sample", -1.0)) - orig_ri) < 1e-6
-        ),
-        None,
-    )
-
-    # If baseline was never hit (original params not in grid), compute it
-    if baseline_i_div == float("inf"):
-        if should_stop is not None and should_stop():
-            raise RuntimeError("Stopped by user")
-        if baseline_entry is not None:
-            baseline_i_div = float(baseline_entry["score"])
-        else:
-            baseline_metrics = _run_trial(orig_pinhole, orig_ri, -1)
-            resid_lo = min((float(entry["residual"]) for entry in search_log if np.isfinite(entry["residual"])), default=float("inf"))
-            resid_hi = max((float(entry["residual"]) for entry in search_log if np.isfinite(entry["residual"])), default=float("inf"))
-            rough_lo = min((float(entry["roughness"]) for entry in search_log if np.isfinite(entry["roughness"])), default=float("inf"))
-            rough_hi = max((float(entry["roughness"]) for entry in search_log if np.isfinite(entry["roughness"])), default=float("inf"))
-
-            def _norm_external(value: float, lo: float, hi: float) -> float:
-                if not np.isfinite(value) or not np.isfinite(lo) or not np.isfinite(hi):
-                    return float("inf")
-                if hi - lo <= max(1e-12, abs(lo) * 1e-6):
-                    return 0.0
-                return (float(value) - lo) / (hi - lo)
-
-            baseline_i_div = _norm_external(float(baseline_metrics["residual"]), resid_lo, resid_hi) + _norm_external(float(baseline_metrics["roughness"]), rough_lo, rough_hi)
-
-    improvement_pct = (
-        max(0.0, (baseline_i_div - best_i_div) / baseline_i_div * 100.0)
-        if baseline_i_div > 0 and baseline_i_div != float("inf")
-        else 0.0
-    )
-
-    return {
-        "best_params": best_params,
-        "best_i_div": best_i_div,
-        "baseline_i_div": baseline_i_div,
-        "improvement_pct": improvement_pct,
-        "search_log": search_log,
-        "grid": {"pinhole": pinhole_trials, "ri_sample": ri_trials},
-        "score_label": "normalized residual + normalized roughness",
-    }

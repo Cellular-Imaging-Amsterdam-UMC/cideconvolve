@@ -323,6 +323,8 @@ parameters:
     value: mip
   - label: sum
     value: sum
+  - label: mean
+    value: mean
   default: none
   multiselect: false
   cli_tag: --projection
@@ -330,6 +332,54 @@ parameters:
   optional: true
   section_id: essential
   mode: beginner
+- name: device
+  type: dropdown
+  label: Compute Device
+  description: Force compute device. Auto uses CUDA if available, otherwise CPU.
+  options:
+  - label: auto
+    value: auto
+  - label: cpu
+    value: cpu
+  - label: cuda
+    value: cuda
+  default: auto
+  multiselect: false
+  cli_tag: --device
+  cli_order: 26
+  optional: true
+  section_id: advanced
+  mode: advanced
+- name: tv_lambda
+  type: float
+  label: TV Lambda
+  description: Total Variation regularization strength for ci_rl_tv.
+  default: 0.0001
+  cli_tag: --tv_lambda
+  cli_order: 27
+  optional: true
+  section_id: advanced
+  mode: advanced
+- name: sparse_hessian_reg
+  type: float
+  label: Sparse Hessian Reg
+  description: Data-vs-regularizer balance for ci_sparse_hessian.
+  default: 0.98
+  cli_tag: --sparse_hessian_reg
+  cli_order: 28
+  optional: true
+  section_id: advanced
+  mode: advanced
+- name: sparse_hessian_weight
+  type: float
+  label: Sparse Hessian Weight
+  description: Hessian-vs-sparsity balance for ci_sparse_hessian.
+  default: 0.6
+  cli_tag: --sparse_hessian_weight
+  cli_order: 29
+  optional: true
+  section_id: advanced
+  mode: advanced
 - name: output_format
   type: dropdown
   label: Output Format
@@ -342,7 +392,23 @@ parameters:
   default: ome-zarr
   multiselect: false
   cli_tag: --output_format
-  cli_order: 26
+  cli_order: 30
+  optional: true
+  section_id: advanced
+  mode: advanced
+- name: output_dtype
+  type: dropdown
+  label: Output Data Type
+  description: Save quantitative float32 output or scaled uint16 output. Uint16 uses global scaling to avoid clipping high values.
+  options:
+  - label: float32
+    value: float32
+  - label: uint16
+    value: uint16
+  default: float32
+  multiselect: false
+  cli_tag: --output_dtype
+  cli_order: 31
   optional: true
   section_id: advanced
   mode: advanced
@@ -360,7 +426,7 @@ parameters:
   default: auto
   multiselect: false
   cli_tag: --streaming
-  cli_order: 27
+  cli_order: 32
   optional: true
   section_id: advanced
   mode: advanced
@@ -370,27 +436,47 @@ parameters:
   description: Estimated full source array size above which streaming auto mode is enabled.
   default: 2.0
   cli_tag: --streaming_threshold_gb
-  cli_order: 28
+  cli_order: 33
   optional: true
   section_id: advanced
   mode: advanced
-- name: scene
-  type: textbox
-  label: Image Scene
-  description: Optional scene index or name for multi-scene images. Use auto for the default scene.
-  default: auto
-  cli_tag: --scene
-  cli_order: 29
+- name: t_start
+  type: integer
+  label: T Start
+  description: First time frame to save, using 1-based inclusive indexing.
+  default: 1
+  cli_tag: --t_start
+  cli_order: 34
+  optional: true
+  section_id: advanced
+  mode: advanced
+- name: t_stop
+  type: integer
+  label: T Stop
+  description: Last time frame to save, using 1-based inclusive indexing. Use 0 for the final frame.
+  default: 0
+  cli_tag: --t_stop
+  cli_order: 35
+  optional: true
+  section_id: advanced
+  mode: advanced
+- name: t_step
+  type: integer
+  label: T Step
+  description: Save every Nth time frame in the selected T range.
+  default: 1
+  cli_tag: --t_step
+  cli_order: 36
   optional: true
   section_id: advanced
   mode: advanced
 - name: hcs_field
   type: textbox
-  label: OME-Zarr HCS Field
-  description: Optional HCS field path such as A/1/0. Use auto for the first field.
+  label: OME-Zarr HCS Field (single field)
+  description: Optional HCS field path such as A/1/0 for single-field reads. Auto selects the first field. Full HCS plate input ignores this and processes every field.
   default: auto
   cli_tag: --hcs_field
-  cli_order: 30
+  cli_order: 37
   optional: true
   section_id: advanced
   mode: advanced
@@ -400,7 +486,7 @@ parameters:
   description: Run benchmark mode on the first input image.
   default: false
   cli_tag: --benchmark
-  cli_order: 31
+  cli_order: 38
   optional: true
   append_value: true
   section_id: advanced
@@ -411,7 +497,7 @@ parameters:
   description: Center-crop benchmark input to speed up comparison runs.
   default: false
   cli_tag: --bench_crop
-  cli_order: 32
+  cli_order: 39
   optional: true
   append_value: true
   section_id: advanced
@@ -422,57 +508,9 @@ parameters:
   description: Compute optional deconvolution-effect image metrics.
   default: false
   cli_tag: --compute_metrics
-  cli_order: 33
+  cli_order: 40
   optional: true
   append_value: true
-  section_id: advanced
-  mode: advanced
-- name: tv_lambda
-  type: float
-  label: TV Lambda
-  description: Total Variation regularization strength for ci_rl_tv.
-  default: 0.0001
-  cli_tag: --tv_lambda
-  cli_order: 34
-  optional: true
-  section_id: advanced
-  mode: advanced
-- name: sparse_hessian_weight
-  type: float
-  label: Sparse Hessian Weight
-  description: Hessian-vs-sparsity balance for ci_sparse_hessian.
-  default: 0.6
-  cli_tag: --sparse_hessian_weight
-  cli_order: 35
-  optional: true
-  section_id: advanced
-  mode: advanced
-- name: sparse_hessian_reg
-  type: float
-  label: Sparse Hessian Reg
-  description: Data-vs-regularizer balance for ci_sparse_hessian.
-  default: 0.98
-  cli_tag: --sparse_hessian_reg
-  cli_order: 36
-  optional: true
-  section_id: advanced
-  mode: advanced
-- name: device
-  type: dropdown
-  label: Compute Device
-  description: Force compute device. Auto uses CUDA if available, otherwise CPU.
-  options:
-  - label: auto
-    value: auto
-  - label: cpu
-    value: cpu
-  - label: cuda
-    value: cuda
-  default: auto
-  multiselect: false
-  cli_tag: --device
-  cli_order: 37
-  optional: true
   section_id: advanced
   mode: advanced
 - name: background
@@ -481,7 +519,7 @@ parameters:
   description: Background subtraction mode. Use auto, 0, or a numeric constant.
   default: auto
   cli_tag: --background
-  cli_order: 38
+  cli_order: 41
   optional: true
   section_id: advanced
   mode: advanced
@@ -491,17 +529,7 @@ parameters:
   description: Positive offset added during processing and removed afterwards. Use auto, none, 0, or a numeric value.
   default: auto
   cli_tag: --offset
-  cli_order: 39
-  optional: true
-  section_id: advanced
-  mode: advanced
-- name: damping
-  type: textbox
-  label: Damping
-  description: Noise-gated damping for ci_rl and ci_rl_tv. Use none, auto, or a numeric value.
-  default: none
-  cli_tag: --damping
-  cli_order: 40
+  cli_order: 42
   optional: true
   section_id: advanced
   mode: advanced
@@ -511,7 +539,7 @@ parameters:
   description: Sigma in pixels for Anscombe-domain Gaussian prefiltering. Use 0 to disable.
   default: 0.0
   cli_tag: --prefilter_sigma
-  cli_order: 41
+  cli_order: 43
   optional: true
   section_id: advanced
   mode: advanced
@@ -525,7 +553,7 @@ parameters:
   default: auto
   multiselect: false
   cli_tag: --two_d_mode
-  cli_order: 42
+  cli_order: 44
   optional: true
   section_id: advanced
   mode: advanced
@@ -547,7 +575,7 @@ parameters:
   default: Balanced
   multiselect: false
   cli_tag: --two_d_wf_aggressiveness
-  cli_order: 43
+  cli_order: 45
   optional: true
   section_id: advanced
   mode: advanced
@@ -557,7 +585,7 @@ parameters:
   description: Background estimator neighborhood radius in micrometers for 2D widefield auto mode.
   default: 0.5
   cli_tag: --two_d_wf_bg_radius_um
-  cli_order: 44
+  cli_order: 46
   optional: true
   section_id: advanced
   mode: advanced
@@ -567,7 +595,7 @@ parameters:
   description: Multiplier applied to the auto-estimated background in 2D widefield auto mode.
   default: 1.0
   cli_tag: --two_d_wf_bg_scale
-  cli_order: 45
+  cli_order: 47
   optional: true
   section_id: advanced
   mode: advanced

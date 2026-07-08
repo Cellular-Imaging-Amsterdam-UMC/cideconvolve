@@ -31,7 +31,6 @@ def test_deconvolve_2d_widefield_accepts_metadata_um_pixel_size() -> None:
         method="ci_rl",
         niter=1,
         background="auto",
-        damping=0.0,
         offset=0.0,
         start="observed",
         convergence="fixed",

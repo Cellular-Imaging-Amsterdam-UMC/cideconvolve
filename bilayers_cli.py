@@ -424,13 +424,6 @@ def resolve_workflow_parameters(parameters: object | None) -> SimpleNamespace:
     )
 
     tv_lambda = _parse_float_or_default(getattr(parameters, "tv_lambda", 0.0001), 0.0001)
-    damping_raw = str(getattr(parameters, "damping", "none")).strip().lower()
-    if damping_raw in ("none", "0", "0.0"):
-        damping: float | str = 0.0
-    elif damping_raw == "auto":
-        damping = "auto"
-    else:
-        damping = _parse_float_or_default(damping_raw, 0.0)
 
     bg_raw = str(getattr(parameters, "background", "auto")).strip()
     background: float | str = "auto" if bg_raw.lower() == "auto" else _parse_float_or_default(bg_raw, 0.0)
@@ -484,14 +477,21 @@ def resolve_workflow_parameters(parameters: object | None) -> SimpleNamespace:
     output_format = str(getattr(parameters, "output_format", "ome-zarr")).strip().lower()
     if output_format in ("ome_zarr", "zarr"):
         output_format = "ome-zarr"
+    output_dtype = str(getattr(parameters, "output_dtype", "float32")).strip().lower()
+    if output_dtype in ("uint16", "ushort", "u16"):
+        output_dtype = "uint16"
+    else:
+        output_dtype = "float32"
     streaming_mode = str(getattr(parameters, "streaming", "auto")).strip().lower()
     tile_limits = _parse_tile_limits(getattr(parameters, "tile_limits", "auto"))
     streaming_threshold_gb = max(
         _parse_float_or_default(getattr(parameters, "streaming_threshold_gb", 2.0), 2.0),
         0.01,
     )
-    scene = getattr(parameters, "scene", None)
-    scene = None if scene in (None, "", "auto") else scene
+    t_start = max(int(_parse_float_or_default(getattr(parameters, "t_start", 1), 1)), 1)
+    t_stop_raw = getattr(parameters, "t_stop", 0)
+    t_stop = int(_parse_float_or_default(t_stop_raw, 0))
+    t_step = max(int(_parse_float_or_default(getattr(parameters, "t_step", 1), 1)), 1)
     hcs_field = getattr(parameters, "hcs_field", None)
     hcs_field = None if hcs_field in (None, "", "auto") else str(hcs_field)
 
@@ -522,7 +522,6 @@ def resolve_workflow_parameters(parameters: object | None) -> SimpleNamespace:
         ex_value=ex_value,
         pinhole_airy=pinhole_airy,
         tv_lambda=tv_lambda,
-        damping=damping,
         background=background,
         offset=offset,
         prefilter_sigma=prefilter_sigma,
@@ -552,10 +551,13 @@ def resolve_workflow_parameters(parameters: object | None) -> SimpleNamespace:
         bench_crop=bench_crop,
         compute_metrics=compute_metrics,
         output_format=output_format,
+        output_dtype=output_dtype,
         streaming_mode=streaming_mode,
         tile_limits=tile_limits,
         streaming_threshold_gb=streaming_threshold_gb,
-        scene=scene,
+        t_start=t_start,
+        t_stop=t_stop,
+        t_step=t_step,
         hcs_field=hcs_field,
         two_d_mode=two_d_mode,
         two_d_wf_aggressiveness=two_d_wf_aggressiveness,
