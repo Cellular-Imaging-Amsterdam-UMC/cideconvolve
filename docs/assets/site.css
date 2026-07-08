@@ -94,7 +94,7 @@ main { min-height: 75vh; }
 
 .hero {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.9fr);
+  grid-template-columns: minmax(520px, 0.9fr) minmax(360px, 1fr);
   align-items: center;
   gap: 2rem;
   padding-top: 3rem;
@@ -110,15 +110,15 @@ main { min-height: 75vh; }
 
 h1 {
   margin: 0 0 1rem;
-  max-width: 18ch;
-  font-size: clamp(1.35rem, 2.5vw, 1.9rem);
-  line-height: 1.18;
+  max-width: none;
+  font-size: clamp(1.15rem, 1.9vw, 1.45rem);
+  line-height: 1.2;
   letter-spacing: 0;
   font-weight: 650;
 }
 
 h2 {
-  font-size: clamp(1.15rem, 1.8vw, 1.45rem);
+  font-size: clamp(1.05rem, 1.45vw, 1.25rem);
   line-height: 1.28;
   font-weight: 620;
 }
@@ -181,7 +181,7 @@ h3 {
 .stats {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 0.65rem;
+  gap: 0.55rem;
   margin-top: 1.6rem;
 }
 
@@ -197,7 +197,7 @@ h3 {
 }
 
 .stat {
-  padding: 0.85rem;
+  padding: 0.75rem;
   color: var(--muted);
 }
 
@@ -210,7 +210,7 @@ h3 {
 
 .stat span:not(.stat-label) {
   color: var(--muted);
-  font-size: 0.88rem;
+  font-size: 0.82rem;
 }
 
 .section-title {
@@ -221,7 +221,7 @@ h3 {
 .section-title h2,
 .page-title h1 {
   margin: 0.45rem 0;
-  max-width: 24ch;
+  max-width: none;
 }
 
 .section-title p,
@@ -240,7 +240,7 @@ h3 {
 .grid.two { grid-template-columns: repeat(2, 1fr); }
 
 .card {
-  padding: 1.1rem;
+  padding: 1rem;
   min-height: 100%;
 }
 
@@ -422,6 +422,21 @@ pre { margin: 0; }
   color: var(--muted);
   padding: 2rem 1.2rem;
   text-align: center;
+}
+
+@media (min-width: 921px) {
+  .section-title h2,
+  .page-title h1 {
+    white-space: nowrap;
+  }
+
+  .stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .stat-label {
+    white-space: nowrap;
+  }
 }
 
 @media (max-width: 920px) {
