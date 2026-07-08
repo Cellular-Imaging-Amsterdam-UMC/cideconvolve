@@ -43,6 +43,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 STATUS_ORDER = {"pass": 0, "xy only": 1, "near": 2, "too coarse": 3, "unknown": 4}
+KEPT_NYQUIST_STATUSES = {"pass", "xy only", "near"}
 DEFAULT_PINHOLE_AIRY = 1.0
 LEICA_LIF_EXTENSIONS = {".lif"}
 LEICA_PROJECT_EXTENSIONS = {".lof", ".xlef", ".xlif"}
@@ -1702,15 +1703,11 @@ class MainWindow(QMainWindow):
         filters = QHBoxLayout()
         self.show_pass = self._filter_box("pass", True)
         self.show_near = self._filter_box("xy only / near", True)
-        self.show_too_coarse = self._filter_box("too coarse", False)
-        self.show_unknown = self._filter_box("unknown", False)
         self.require_3d = self._filter_box("require 3D", True)
         self.require_confocal = self._filter_box("require confocal", True)
         for box in (
             self.show_pass,
             self.show_near,
-            self.show_too_coarse,
-            self.show_unknown,
             self.require_3d,
             self.require_confocal,
         ):
@@ -1764,8 +1761,6 @@ class MainWindow(QMainWindow):
             "include_project_files": self.include_project_files_box.isChecked(),
             "show_pass": self.show_pass.isChecked(),
             "show_near": self.show_near.isChecked(),
-            "show_too_coarse": self.show_too_coarse.isChecked(),
-            "show_unknown": self.show_unknown.isChecked(),
             "require_3d": self.require_3d.isChecked(),
             "require_confocal": self.require_confocal.isChecked(),
         }
@@ -1847,19 +1842,21 @@ class MainWindow(QMainWindow):
         self.include_project_files_box.setChecked(bool(settings.get("include_project_files", self.include_project_files_box.isChecked())))
         self.show_pass.setChecked(bool(settings.get("show_pass", self.show_pass.isChecked())))
         self.show_near.setChecked(bool(settings.get("show_near", self.show_near.isChecked())))
-        self.show_too_coarse.setChecked(bool(settings.get("show_too_coarse", self.show_too_coarse.isChecked())))
-        self.show_unknown.setChecked(bool(settings.get("show_unknown", self.show_unknown.isChecked())))
         self.require_3d.setChecked(bool(settings.get("require_3d", self.require_3d.isChecked())))
         self.require_confocal.setChecked(bool(settings.get("require_confocal", self.require_confocal.isChecked())))
         if load_records:
             self.records = []
             skipped_positions = 0
+            skipped_status = 0
             for item in payload.get("records", []) or []:
                 try:
                     if isinstance(item, dict):
                         record = record_from_dict(item)
                         if position_dimension_count(record) > 1:
                             skipped_positions += 1
+                            continue
+                        if not self._record_kept(record):
+                            skipped_status += 1
                             continue
                         self.records.append(record)
                 except Exception as exc:
@@ -1872,6 +1869,8 @@ class MainWindow(QMainWindow):
             )
             if skipped_positions:
                 self._log(f"Skipped {skipped_positions} cached position/tile image entries.")
+            if skipped_status:
+                self._log(f"Skipped {skipped_status} cached too-coarse/unknown entries.")
             self.progress_label.setText(
                 f"Restored cache | Records {len(self.records)} | Completed files {len(self.completed_containers)}"
             )
@@ -1982,6 +1981,8 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(message)
 
     def _queue_record(self, record: LeicaRecord) -> None:
+        if not self._record_kept(record):
+            return
         self._pending_records.append(record)
         if not self._record_flush_timer.isActive():
             self._record_flush_timer.start()
@@ -2028,6 +2029,8 @@ class MainWindow(QMainWindow):
         self._start_thumbnail_worker_if_idle()
 
     def _record_visible(self, record: LeicaRecord) -> bool:
+        if not self._record_kept(record):
+            return False
         if position_dimension_count(record) > 1:
             return False
         status = record.nyquist.status
@@ -2035,15 +2038,14 @@ class MainWindow(QMainWindow):
             return False
         if status in {"xy only", "near"} and not self.show_near.isChecked():
             return False
-        if status == "too coarse" and not self.show_too_coarse.isChecked():
-            return False
-        if status == "unknown" and not self.show_unknown.isChecked():
-            return False
         if self.require_3d.isChecked() and not record.is_3d:
             return False
         if self.require_confocal.isChecked() and not record.is_confocal:
             return False
         return True
+
+    def _record_kept(self, record: LeicaRecord) -> bool:
+        return record.nyquist.status in KEPT_NYQUIST_STATUSES
 
     def _append_row(self, record: LeicaRecord, index: int) -> None:
         self._queue_thumbnail(index)
