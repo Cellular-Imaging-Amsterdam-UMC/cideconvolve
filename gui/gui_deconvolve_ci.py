@@ -5296,7 +5296,7 @@ class _SavePreviewWorker(QThread):
             kind = str(self.job.get("kind", ""))
             if kind == "ome_tiff":
                 path = Path(str(self.job["path"]))
-                self.progress.emit(f"Saving OME-TIFF preview to {path}")
+                self.progress.emit(f"Saving OME-TIFF result to {path}")
                 _write_ome_tiff(
                     self.job["data"],
                     path,
@@ -5314,7 +5314,7 @@ class _SavePreviewWorker(QThread):
                 return
             if kind == "ome_zarr":
                 path = Path(str(self.job["path"]))
-                self.progress.emit(f"Saving OME-Zarr preview to {path}")
+                self.progress.emit(f"Saving OME-Zarr result to {path}")
                 _write_ome_zarr(
                     self.job["data"],
                     path,
@@ -10125,7 +10125,7 @@ class DeconvolveCIWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Save in progress",
-                "A preview export is currently running. Please wait for it to finish first.",
+                "A save job is currently running. Please wait for it to finish first.",
             )
             return
 
@@ -10473,10 +10473,12 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _start_preview_save(self, job: dict[str, Any]) -> None:
         if self._preview_save_worker is not None and self._preview_save_worker.isRunning():
-            QMessageBox.information(self, "Save in progress", "A preview export is already running.")
+            QMessageBox.information(self, "Save in progress", "A save job is already running.")
             return
-        self._set_operation_state("Saving", message="Saving preview export...")
-        self._begin_busy_progress("Saving preview export...")
+        kind = str(job.get("kind", ""))
+        label = "Saving view PNGs..." if kind in {"view_pngs", "comparison_png"} else "Saving deconvolved result..."
+        self._set_operation_state("Saving", message=label)
+        self._begin_busy_progress(label)
         self._preview_save_worker = _SavePreviewWorker(job, parent=self)
         self._preview_save_worker.progress.connect(self._on_worker_progress)
         self._preview_save_worker.finished.connect(self._on_preview_save_done)
@@ -10500,12 +10502,12 @@ class DeconvolveCIWindow(QMainWindow):
         path = Path(str(payload.get("path", "")))
         if kind == "ome_tiff":
             self._log(
-                f"Saved OME-TIFF preview in {elapsed} "
+                f"Saved OME-TIFF result in {elapsed} "
                 f"({_format_bytes(float(payload.get('size_mb', 0.0)))})"
             )
             self._status.showMessage(f"Saved -> {path.name}", 5000)
         elif kind == "ome_zarr":
-            self._log(f"Saved OME-Zarr preview in {elapsed}")
+            self._log(f"Saved OME-Zarr result in {elapsed}")
             self._status.showMessage(f"Saved -> {path.name}", 5000)
         elif kind == "view_pngs":
             decon_path = Path(str(payload.get("deconvolved_path", "")))
@@ -10566,7 +10568,7 @@ class DeconvolveCIWindow(QMainWindow):
                 else:
                     out.unlink()
             self._last_save_dir = str(out.parent)
-            self._log(f"Saving {projection} OME-Zarr preview to {out} ({output_dtype})")
+            self._log(f"Saving deconvolved {projection} OME-Zarr result to {out} ({output_dtype})")
             self._start_preview_save({
                 "kind": "ome_zarr",
                 "path": str(out),
@@ -10586,7 +10588,7 @@ class DeconvolveCIWindow(QMainWindow):
         if not path:
             return
         self._last_save_dir = str(Path(path).parent)
-        self._log(f"Saving {projection} OME-TIFF preview to {path} ({output_dtype})")
+        self._log(f"Saving deconvolved {projection} OME-TIFF result to {path} ({output_dtype})")
         self._start_preview_save({
             "kind": "ome_tiff",
             "path": path,
