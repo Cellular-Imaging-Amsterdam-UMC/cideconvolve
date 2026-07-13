@@ -21,6 +21,15 @@ def test_cli_help_smoke(capsys):
     assert "ci_deconvolve" in capsys.readouterr().out
 
 
+def test_cli_accepts_snr_and_acuity_options():
+    args = cli._build_parser().parse_args([
+        "--input", "image.ome.tiff", "--output", "out", "--snr", "auto", "--acuity", "25",
+    ])
+
+    assert args.snr == "auto"
+    assert args.acuity == 25.0
+
+
 def test_discover_single_ome_tiff(tmp_path):
     path = tmp_path / "image.ome.tiff"
     path.write_bytes(b"")

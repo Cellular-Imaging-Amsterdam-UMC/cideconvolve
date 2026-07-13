@@ -1086,6 +1086,8 @@ def deconvolve(
     background: Union[int, str] = "auto",
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
+    snr: Union[str, float, None] = None,
+    acuity: float = 0.0,
     start: str = "auto",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
@@ -1163,6 +1165,7 @@ def deconvolve(
         method=method,
         background=background, offset=offset,
         prefilter_sigma=prefilter_sigma, start=start,
+        snr=snr, acuity=acuity,
         convergence=convergence, rel_threshold=rel_threshold,
         pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
         microscope_type=microscope_type, two_d_mode=two_d_mode,
@@ -1186,6 +1189,8 @@ def _deconvolve_ci_method(
     background: Union[int, str] = "auto",
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
+    snr: Union[str, float, None] = None,
+    acuity: float = 0.0,
     start: str = "auto",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
@@ -1224,6 +1229,8 @@ def _deconvolve_ci_method(
         raise ValueError("The focused CLI package only supports method='ci_rl'.")
     result = ci_rl_deconvolve(
         tv_lambda=0.0,
+        snr=snr,
+        acuity=acuity,
         microscope_type=microscope_type,
         two_d_mode=two_d_mode,
         two_d_wf_aggressiveness=two_d_wf_aggressiveness,
@@ -1270,6 +1277,8 @@ def deconvolve_image(
     background: Union[int, str] = "auto",
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
+    snr: Union[str, float, None] = None,
+    acuity: float = 0.0,
     start: str = "auto",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
@@ -1384,6 +1393,11 @@ def deconvolve_image(
         else:
             ch_niter = niter
 
+        channel_snr = snr
+        if isinstance(snr, str) and snr.strip().lower() == "auto":
+            from .deconvolve_ci import estimate_image_snr
+            channel_snr = float(estimate_image_snr(time_slices[0])["snr"])
+            logger.info("Channel %d frozen auto SNR=%.4g", ch_idx + 1, channel_snr)
         channel_results: list[np.ndarray] = []
         for t_idx, time_img in enumerate(time_slices):
             if cancel_checker is not None and cancel_checker():
@@ -1397,6 +1411,7 @@ def deconvolve_image(
                 time_img, psf, method=method,
                 niter=ch_niter, background=background, offset=offset,
                 prefilter_sigma=prefilter_sigma, start=start,
+                snr=channel_snr, acuity=acuity,
                 convergence=convergence, rel_threshold=rel_threshold,
                 check_every=check_every, device=device,
                 pixel_size_xy=metadata.get("pixel_size_x"),

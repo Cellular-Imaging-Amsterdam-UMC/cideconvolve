@@ -353,6 +353,9 @@ The public CLI parameters are defined in `config.yaml` and exposed via `wrapper.
 | `--tv_lambda` | `0.0001` | TV regularisation strength (for `ci_rl_tv`; typical 0.00005–0.001) |
 | `--offset` | `auto` | Positive processing offset: `auto`, `none`, or numeric |
 | `--prefilter_sigma` | `0.0` | Anscombe-domain Gaussian prefilter sigma in pixels |
+| `--snr_mode` | `none` | Bilayers SNR selection: `none`, `auto`, or `manual` |
+| `--snr_value` | `4.0` | Positive SNR used only when `--snr_mode manual` |
+| `--acuity` | `0` | Smooth/sharp balance from `-100` to `+100` when SNR is enabled |
 | `--start` | `auto` | Initial estimate: `auto`, `flat`, `percentile_flat`, `observed`, `observed_bgsub`, `lowpass`, `lowpass_bgsub`, or `hybrid` |
 | `--background` | `auto` | Background subtraction: `auto`, numeric, or `0` to disable |
 | `--two_d_mode` | `auto` | 2D widefield mode: `auto` (widefield-aware PSF) or `legacy_2d` |

@@ -42,6 +42,9 @@ EXPECTED_PARAMETER_ORDER = [
     "background",
     "offset",
     "prefilter_sigma",
+    "snr_mode",
+    "snr_value",
+    "acuity",
     "two_d_mode",
     "two_d_wf_aggressiveness",
     "two_d_wf_bg_radius_um",
@@ -148,6 +151,8 @@ def test_bilayers_cli_helper_validates_and_generates_command() -> None:
     assert "--method ci_rl" in command
     assert "--output_format ome-zarr" in command
     assert "--output_dtype float32" in command
+    assert "--snr_mode none" in command
+    assert "--snr_value 4.0" in command
     assert "--two_d_wf_aggressiveness Balanced" in command
 
 

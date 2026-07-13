@@ -103,6 +103,18 @@ def _parse_float_or_auto(raw: str):
     return float(text)
 
 
+def _parse_snr(raw: str):
+    text = str(raw or "off").strip().lower()
+    if text in {"off", "none", ""}:
+        return None
+    if text == "auto":
+        return "auto"
+    value = float(text)
+    if value <= 0.0:
+        raise argparse.ArgumentTypeError("SNR must be off, auto, or a positive number")
+    return value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ci_deconvolve",
@@ -149,6 +161,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background", default="auto")
     parser.add_argument("--offset", default="auto")
     parser.add_argument("--prefilter-sigma", type=float, default=0.0)
+    parser.add_argument("--snr", default="off", help="Noise-aware setup: off, auto, or a positive SNR.")
+    parser.add_argument("--acuity", type=float, default=0.0, help="Sharpness balance from -100 to +100.")
     parser.add_argument(
         "--start",
         choices=(
@@ -368,6 +382,7 @@ def _run_streaming_one(input_path: Path, output_dir: Path, args: argparse.Namesp
     sink = ProjectionPyramidSink(base_sink, source_shape=source.shape, mode="mip") if project_output else base_sink
 
     psf_cache: dict[int, np.ndarray] = {}
+    frozen_snr: dict[int, float] = {}
 
     def _psf_for_channel(channel: int) -> np.ndarray:
         if channel not in psf_cache:
@@ -381,6 +396,12 @@ def _run_streaming_one(input_path: Path, output_dir: Path, args: argparse.Namesp
         elif tile_img.ndim == 3 and effective_psf.ndim == 2:
             effective_psf = effective_psf[np.newaxis, :, :]
         niter = args.iterations[channel] if channel < len(args.iterations) else args.iterations[-1]
+        requested_snr = _parse_snr(args.snr)
+        if requested_snr == "auto":
+            if channel not in frozen_snr:
+                from core.deconvolve_ci import estimate_image_snr
+                frozen_snr[channel] = float(estimate_image_snr(tile_img)["snr"])
+            requested_snr = frozen_snr[channel]
         return deconvolve(
             tile_img,
             effective_psf,
@@ -389,6 +410,8 @@ def _run_streaming_one(input_path: Path, output_dir: Path, args: argparse.Namesp
             background=_parse_float_or_auto(args.background),
             offset=_parse_float_or_auto(args.offset),
             prefilter_sigma=max(0.0, float(args.prefilter_sigma)),
+            snr=requested_snr,
+            acuity=max(-100.0, min(100.0, float(args.acuity))),
             start=args.start,
             convergence=_normalise_convergence(args.convergence),
             rel_threshold=max(1e-8, float(args.rel_threshold)),
@@ -423,6 +446,8 @@ def _run_streaming_one(input_path: Path, output_dir: Path, args: argparse.Namesp
             "timepoints_one_based": [t + 1 for t in selected],
             "tile_xy": tile_xy,
             "output_dtype": args.output_dtype,
+            "snr": args.snr,
+            "acuity": args.acuity,
         },
         summary=summary,
     )
@@ -539,6 +564,8 @@ def _run_one(input_path: Path, output_dir: Path, args: argparse.Namespace) -> Pa
         background=_parse_float_or_auto(args.background),
         offset=_parse_float_or_auto(args.offset),
         prefilter_sigma=max(0.0, float(args.prefilter_sigma)),
+        snr=_parse_snr(args.snr),
+        acuity=max(-100.0, min(100.0, float(args.acuity))),
         start=args.start,
         convergence=_normalise_convergence(args.convergence),
         rel_threshold=max(1e-8, float(args.rel_threshold)),
@@ -613,10 +640,12 @@ def _write_manifest(output_dir: Path, records: list[dict], args: argparse.Namesp
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "output_format": args.output_format,
         "projection": args.projection,
-        "t_start": args.t_start,
-        "t_stop": args.t_stop,
-        "t_step": args.t_step,
+        "t_start": getattr(args, "t_start", 1),
+        "t_stop": getattr(args, "t_stop", 0),
+        "t_step": getattr(args, "t_step", 1),
         "iterations": args.iterations,
+        "snr": getattr(args, "snr", "off"),
+        "acuity": getattr(args, "acuity", 0.0),
         "records": records,
     }
     (output_dir / "ci_deconvolve_manifest.json").write_text(

@@ -54,6 +54,7 @@ from core.deconvolve import (
     save_result,
 )
 from core.ome_zarr_io import save_result_ome_zarr
+from core.deconvolve_ci import estimate_image_snr
 from core.streaming import (
     ProjectionPyramidSink,
     TiledOmeTiffSink,
@@ -1259,6 +1260,8 @@ def _run_plate_zarr(
     background,
     offset,
     prefilter_sigma: float,
+    snr,
+    acuity: float,
     start: str,
     convergence: str,
     rel_threshold: float,
@@ -1362,7 +1365,7 @@ def _run_plate_zarr(
             result = deconvolve(
                 img, psf, method=method,
                 niter=ch_niter, background=background, offset=offset,
-                prefilter_sigma=prefilter_sigma, start=start,
+                prefilter_sigma=prefilter_sigma, snr=snr, acuity=acuity, start=start,
                 convergence=convergence, rel_threshold=rel_threshold,
                 check_every=check_every, device=device,
                 tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
@@ -1420,6 +1423,8 @@ def _run_streaming_regular_image(
     background,
     offset,
     prefilter_sigma: float,
+    snr,
+    acuity: float,
     start: str,
     convergence: str,
     rel_threshold: float,
@@ -1516,6 +1521,7 @@ def _run_streaming_regular_image(
     )
 
     psf_cache: dict[int, np.ndarray] = {}
+    frozen_snr: dict[int, float] = {}
 
     def _psf_for_channel(ch_idx: int) -> np.ndarray:
         cached = psf_cache.get(ch_idx)
@@ -1553,6 +1559,11 @@ def _run_streaming_regular_image(
             ch_niter = niter_list[ch_idx] if ch_idx < len(niter_list) else niter_list[-1]
         else:
             ch_niter = niter_list[0] if isinstance(niter_list, list) else niter_list
+        effective_snr = snr
+        if isinstance(snr, str) and snr.strip().lower() == "auto":
+            if ch_idx not in frozen_snr:
+                frozen_snr[ch_idx] = float(estimate_image_snr(tile_img)["snr"])
+            effective_snr = frozen_snr[ch_idx]
         return deconvolve(
             tile_img,
             effective_psf,
@@ -1561,6 +1572,8 @@ def _run_streaming_regular_image(
             background=background,
             offset=offset,
             prefilter_sigma=prefilter_sigma,
+            snr=effective_snr,
+            acuity=acuity,
             start=start,
             convergence=convergence,
             rel_threshold=rel_threshold,
@@ -1625,6 +1638,8 @@ def _run_streaming_regular_image(
             "background": background,
             "offset": offset,
             "prefilter_sigma": prefilter_sigma,
+            "snr": snr,
+            "acuity": acuity,
             "start": start,
         },
         summary=summary,
@@ -1656,6 +1671,8 @@ def main(argv):
         background = run_params.background
         offset = run_params.offset
         prefilter_sigma = run_params.prefilter_sigma
+        snr = run_params.snr
+        acuity = run_params.acuity
         start = run_params.start
         sparse_hessian_weight = run_params.sparse_hessian_weight
         sparse_hessian_reg = run_params.sparse_hessian_reg
@@ -1721,6 +1738,8 @@ def main(argv):
         print(f"  Offset       : {offset}")
         if prefilter_sigma > 0.0:
             print(f"  Prefilter    : sigma={prefilter_sigma}")
+        print(f"  SNR          : {snr if snr is not None else 'off'}")
+        print(f"  Acuity       : {acuity:g}")
         print(f"  Start        : {start}")
         print(f"  Convergence  : {convergence} (threshold={rel_threshold}, every={check_every})")
         if overrule_metadata:
@@ -1773,6 +1792,8 @@ def main(argv):
                     background=background,
                     offset=offset,
                     prefilter_sigma=prefilter_sigma,
+                    snr=snr,
+                    acuity=acuity,
                     start=start,
                     convergence=convergence,
                     rel_threshold=rel_threshold,
@@ -1836,6 +1857,8 @@ def main(argv):
                     background=background,
                     offset=offset,
                     prefilter_sigma=prefilter_sigma,
+                    snr=snr,
+                    acuity=acuity,
                     start=start,
                     convergence=convergence,
                     rel_threshold=rel_threshold,
@@ -1950,6 +1973,8 @@ def main(argv):
                         background=background,
                         offset=offset,
                         prefilter_sigma=prefilter_sigma,
+                        snr=snr,
+                        acuity=acuity,
                         start=start,
                         convergence=convergence,
                         rel_threshold=rel_threshold,
@@ -2072,6 +2097,8 @@ def main(argv):
                             background=background,
                             offset=offset,
                             prefilter_sigma=prefilter_sigma,
+                            snr=snr,
+                            acuity=acuity,
                             start=start,
                             convergence=convergence,
                             rel_threshold=rel_threshold,
@@ -2763,6 +2790,8 @@ def _run_benchmark(
     background,
     offset,
     prefilter_sigma,
+    snr,
+    acuity,
     start,
     convergence,
     rel_threshold,
@@ -2901,6 +2930,8 @@ def _run_benchmark(
         background=background,
         offset=offset,
         prefilter_sigma=prefilter_sigma,
+        snr=snr,
+        acuity=acuity,
         start=start,
         convergence=convergence,
         rel_threshold=rel_threshold,

@@ -32,7 +32,7 @@ bioio-nd2==1.7.0
 omero-browser-qt[viewer]==0.2.5
 
 # Microscope browsers (Open Leica/Zeiss/Nikon/Olympus… buttons)
-leica-browser-qt>=0.4.0
+leica-browser-qt>=0.5.1
 zeiss-browser-qt>=0.4.0
 nikon-browser-qt>=0.1.0
 evident-browser-qt>=0.3.0

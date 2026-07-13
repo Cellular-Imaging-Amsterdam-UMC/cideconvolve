@@ -72,6 +72,8 @@ The CLI always runs `ci_rl`. It intentionally has no `--method` option.
 ```bash
 ci_deconvolve --input image.ome.tiff --output out ^
   --iterations 40 ^
+  --snr auto ^
+  --acuity 0 ^
   --device auto ^
   --output-format ome-tiff ^
   --projection none ^
@@ -135,6 +137,8 @@ does not process plate fields.
 | `--background VALUE\|auto` | `auto` | Background level used by the solver. `auto` estimates it from the image. Numeric values are accepted. |
 | `--offset VALUE\|auto\|none` | `auto` | Positive offset added before iteration and removed afterwards. Use `none`, `0`, or `0.0` to disable. |
 | `--prefilter-sigma VALUE` | `0.0` | Optional Anscombe/low-pass prefilter sigma. `0.0` disables prefiltering. |
+| `--snr off\|auto\|VALUE` | `off` | Enables SNR-aware setup. `auto` estimates SNR once per channel; a positive number supplies a manual SNR. |
+| `--acuity VALUE` | `0.0` | Smooth/sharp balance from `-100` (smoother) to `+100` (sharper) when SNR is enabled. |
 | `--start MODE` | `auto` | Initial estimate mode. Choices: `auto`, `flat`, `percentile_flat`, `observed`, `observed_bgsub`, `lowpass`, `lowpass_bgsub`, `hybrid`. |
 | `--convergence auto\|fixed\|none` | `auto` | `auto` enables early stopping based on convergence. `fixed` and `none` both run the requested iteration count. |
 | `--rel-threshold VALUE` | `0.005` | Relative convergence threshold used when `--convergence auto`. Values are clamped to at least `1e-8`. |

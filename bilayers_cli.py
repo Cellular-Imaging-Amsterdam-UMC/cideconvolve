@@ -436,6 +436,28 @@ def resolve_workflow_parameters(parameters: object | None) -> SimpleNamespace:
         offset = _parse_float_or_default(offset_raw, 0.0)
 
     prefilter_sigma = max(0.0, _parse_float_or_default(getattr(parameters, "prefilter_sigma", 0.0), 0.0))
+    legacy_snr = getattr(parameters, "snr", None)
+    if legacy_snr is not None:
+        snr_raw = str(legacy_snr or "off").strip().lower()
+        if snr_raw in ("off", "none", ""):
+            snr: float | str | None = None
+        elif snr_raw == "auto":
+            snr = "auto"
+        else:
+            snr = _parse_float_or_default(snr_raw, 0.0)
+            if snr <= 0.0:
+                snr = None
+    else:
+        snr_mode = str(getattr(parameters, "snr_mode", "none") or "none").strip().lower()
+        if snr_mode == "auto":
+            snr = "auto"
+        elif snr_mode == "manual":
+            snr = _parse_float_or_default(getattr(parameters, "snr_value", 4.0), 4.0)
+            if snr <= 0.0:
+                snr = 4.0
+        else:
+            snr = None
+    acuity = min(max(_parse_float_or_default(getattr(parameters, "acuity", 0.0), 0.0), -100.0), 100.0)
     start = str(getattr(parameters, "start", "auto")).strip().lower()
     if start not in _START_MODES:
         start = "flat"
@@ -525,6 +547,8 @@ def resolve_workflow_parameters(parameters: object | None) -> SimpleNamespace:
         background=background,
         offset=offset,
         prefilter_sigma=prefilter_sigma,
+        snr=snr,
+        acuity=acuity,
         start=start,
         sparse_hessian_weight=sparse_hessian_weight,
         sparse_hessian_reg=sparse_hessian_reg,

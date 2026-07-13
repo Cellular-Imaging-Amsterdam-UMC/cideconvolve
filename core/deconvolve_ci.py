@@ -50,6 +50,8 @@ CONCRETE_START_MODES = (
 )
 START_MODES = ("auto",) + CONCRETE_START_MODES
 
+SNR_AUTO = "auto"
+
 # ---------------------------------------------------------------------------
 # Helpers — device / dtype
 # ---------------------------------------------------------------------------
@@ -377,6 +379,131 @@ def _estimate_noise_sigma(image: torch.Tensor) -> float:
     return max(sigma, 1e-12)
 
 
+def estimate_image_snr(image: np.ndarray) -> dict[str, Any]:
+    """Estimate image SNR without interpreting empty pixels as zero noise.
+
+    Sparse, quantised data is treated as photon-count-like when most values
+    lie close to integer multiples of a recurring positive intensity step.
+    Other data uses a robust adjacent-difference noise estimate.  The result
+    is intentionally deterministic so it can be frozen across a time series.
+    """
+    values = np.asarray(image, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {"snr": 1.0, "reliability": "low", "mode": "empty", "intensity_step": None,
+                "noise_sigma": 0.0}
+    if values.size > 1_000_000:
+        values = values[::max(1, int(math.ceil(values.size / 1_000_000)))]
+
+    background = float(np.percentile(values, 10.0))
+    signal = np.clip(values - background, 0.0, None)
+    positive = signal[signal > 0.0]
+    if positive.size:
+        low = positive[positive <= np.percentile(positive, 25.0)]
+        step = float(np.median(low)) if low.size else float(np.min(positive))
+        if step > 0.0 and np.isfinite(step):
+            multiples = signal / step
+            quantised_fraction = float(np.mean(np.abs(multiples - np.rint(multiples)) <= 0.05))
+            sparse_fraction = float(np.mean(signal <= 0.0))
+            if quantised_fraction >= 0.90 and sparse_fraction >= 0.20:
+                bright = float(np.percentile(signal, 99.99))
+                photons = max(bright / step, 1.0)
+                return {
+                    "snr": float(np.clip(math.sqrt(photons), 0.1, 1e4)),
+                    "reliability": "high" if quantised_fraction >= 0.98 else "medium",
+                    "mode": "photon-count",
+                    "intensity_step": step,
+                    "noise_sigma": math.sqrt(photons) * step,
+                }
+
+    shaped = np.asarray(image, dtype=np.float64)
+    differences = []
+    for axis, size in enumerate(shaped.shape):
+        if size > 1:
+            differences.append(np.diff(shaped, axis=axis).reshape(-1))
+    diff = np.concatenate(differences) if differences else values - np.median(values)
+    diff = diff[np.isfinite(diff)]
+    if diff.size > 1_000_000:
+        diff = diff[::max(1, int(math.ceil(diff.size / 1_000_000)))]
+    diff_med = float(np.median(diff)) if diff.size else 0.0
+    noise_sigma = 1.4826 * float(np.median(np.abs(diff - diff_med))) / math.sqrt(2.0)
+    dynamic = max(float(np.percentile(values, 99.9)) - float(np.median(values)), 0.0)
+    scale = max(float(np.max(values) - np.min(values)), 1e-12)
+    reliable = noise_sigma > scale * 1e-9
+    snr = dynamic / max(noise_sigma, scale * 1e-9)
+    return {
+        "snr": float(np.clip(snr, 0.1, 1e4)),
+        "reliability": "medium" if reliable else "low",
+        "mode": "continuous",
+        "intensity_step": None,
+        "noise_sigma": float(max(noise_sigma, 0.0)),
+    }
+
+
+def _snr_prefilter_sigma(snr: float) -> float:
+    """Piecewise-linear SNR-to-prefilter mapping from the public UI contract."""
+    snr = max(float(snr), 0.1)
+    if snr <= 4.0:
+        return 0.8
+    if snr <= 8.0:
+        return 0.8 + (snr - 4.0) * (0.5 - 0.8) / 4.0
+    if snr <= 15.0:
+        return 0.5 + (snr - 8.0) * (0.25 - 0.5) / 7.0
+    if snr <= 30.0:
+        return 0.25 + (snr - 15.0) * (0.0 - 0.25) / 15.0
+    return 0.0
+
+
+def _resolve_snr_settings(
+    image: np.ndarray,
+    snr: Union[str, float, None],
+    acuity: float,
+    prefilter_sigma: float,
+    rel_threshold: float,
+) -> dict[str, Any]:
+    """Resolve SNR-aware preprocessing while leaving the RL update unchanged."""
+    if snr is None or (isinstance(snr, str) and snr.strip().lower() in {"", "off", "none"}):
+        return {
+            "enabled": False, "requested_snr": None, "effective_snr": None,
+            "acuity": 0.0, "prefilter_sigma": max(float(prefilter_sigma), 0.0),
+            "rel_threshold": float(rel_threshold), "estimate": None,
+        }
+    acuity_value = float(np.clip(float(acuity), -100.0, 100.0))
+    if isinstance(snr, str) and snr.strip().lower() == SNR_AUTO:
+        estimate = estimate_image_snr(image)
+        effective_snr = float(estimate["snr"])
+        requested: Union[str, float] = SNR_AUTO
+    else:
+        effective_snr = float(snr)
+        if not np.isfinite(effective_snr) or effective_snr <= 0.0:
+            raise ValueError("snr must be 'auto', None/off, or a finite value > 0")
+        estimate = {"snr": effective_snr, "reliability": "manual", "mode": "manual",
+                    "intensity_step": None, "noise_sigma": 0.0}
+        requested = effective_snr
+    factor = 2.0 ** (-acuity_value / 50.0)
+    auto_prefilter = _snr_prefilter_sigma(effective_snr) * factor
+    effective_prefilter = max(float(prefilter_sigma), 0.0) if float(prefilter_sigma) > 0.0 else auto_prefilter
+    effective_threshold = float(np.clip(0.02 / effective_snr, 0.0005, 0.005)) * factor
+    return {
+        "enabled": True, "requested_snr": requested, "effective_snr": effective_snr,
+        "acuity": acuity_value, "prefilter_sigma": effective_prefilter,
+        "rel_threshold": effective_threshold, "estimate": estimate,
+    }
+
+
+def _scale_aware_auto_offset(image: np.ndarray, estimate: Optional[dict[str, Any]]) -> float:
+    """Return a small positive offset expressed in the image's own intensity scale."""
+    if estimate and estimate.get("intensity_step"):
+        return float(np.clip(0.05 * float(estimate["intensity_step"]), 1e-6, 5.0))
+    values = np.asarray(image, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 1e-6
+    dynamic = max(float(np.percentile(values, 99.9)) - float(np.percentile(values, 1.0)), 0.0)
+    noise = float((estimate or {}).get("noise_sigma", 0.0) or 0.0)
+    return float(np.clip(max(0.05 * noise, 1e-6 * dynamic, 1e-6), 1e-6, 5.0))
+
+
 def _gaussian_smooth(image: torch.Tensor, sigma: float) -> torch.Tensor:
     """Apply separable Gaussian smoothing along each axis."""
     if sigma <= 0.0:
@@ -471,6 +598,18 @@ def _resolve_start_mode(start: str, img_t: torch.Tensor, bg: float, microscope_t
     if snr < 8.0:
         return "lowpass_bgsub"
     return "hybrid"
+
+
+def _resolve_snr_start_mode(start: str, snr_settings: dict[str, Any]) -> str:
+    """Resolve automatic initialisation from an explicitly enabled SNR."""
+    if str(start).strip().lower() != "auto" or not snr_settings.get("enabled"):
+        return start
+    snr = float(snr_settings["effective_snr"])
+    if snr < 8.0:
+        return "lowpass_bgsub"
+    if snr <= 20.0:
+        return "hybrid"
+    return "observed_bgsub"
 
 
 def _initial_estimate(
@@ -974,6 +1113,7 @@ def _ci_deconvolve_tiled(
 
     total_iterations = 0
     all_convergence: list[float] = []
+    effective_parameters: dict[str, Any] = {}
 
     for idx, desc in enumerate(tiles):
         _, ey, ex = desc["extract"]
@@ -990,6 +1130,8 @@ def _ci_deconvolve_tiled(
         total_iterations = max(total_iterations, tile_out["iterations_used"])
         if tile_out["convergence"]:
             all_convergence = tile_out["convergence"]
+        if tile_out.get("effective_parameters"):
+            effective_parameters = dict(tile_out["effective_parameters"])
 
         # Crop margin back to the original extract region
         crop_y0 = ey.start - y0_m
@@ -1015,6 +1157,7 @@ def _ci_deconvolve_tiled(
         "result": result,
         "convergence": all_convergence,
         "iterations_used": total_iterations,
+        "effective_parameters": effective_parameters,
     }
 
 
@@ -1027,6 +1170,8 @@ def _ci_rl_deconvolve_2d_widefield(
     tv_lambda: float,
     offset: Union[str, float],
     prefilter_sigma: float,
+    snr: Union[str, float, None],
+    acuity: float,
     start: str,
     background: Union[str, float],
     convergence: str,
@@ -1093,7 +1238,7 @@ def _ci_rl_deconvolve_2d_widefield(
         effective_background = max(float(background), 1e-6)
 
     if offset == "auto":
-        effective_offset = auto_offset_default
+        effective_offset = "auto" if snr is not None else auto_offset_default
     else:
         effective_offset = offset
 
@@ -1118,6 +1263,8 @@ def _ci_rl_deconvolve_2d_widefield(
             tv_lambda=tv_lambda,
             offset=effective_offset,
             prefilter_sigma=effective_prefilter,
+            snr=snr,
+            acuity=acuity,
             start=start,
             background=effective_background,
             convergence=convergence,
@@ -1161,6 +1308,8 @@ def ci_rl_deconvolve(
     tv_lambda: float = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
+    snr: Union[str, float, None] = None,
+    acuity: float = 0.0,
     start: str = "auto",
     background: Union[str, float] = "auto",
     convergence: str = "auto",
@@ -1194,10 +1343,16 @@ def ci_rl_deconvolve(
         Constant added to the image before RL iterations and subtracted
         afterwards.  Shifts all pixels away from zero, preventing the
         extreme ratio amplification that causes background noise.
-        ``"auto"`` uses 5.0 (DeconWolf default).  ``0`` = disabled.
+        With SNR off, ``"auto"`` uses the legacy value 5.0. With SNR
+        enabled it is scaled to the image intensity step. ``0`` disables it.
     prefilter_sigma : float
         Gaussian sigma (in pixels) for Anscombe variance-stabilising
         pre-filter.  ``0`` = disabled.  Typical values: 0.5–1.0.
+    snr : ``None``, ``"auto"``, or float
+        Enable noise-aware initializer, prefilter, convergence, and offset
+        selection. ``None`` preserves legacy behavior.
+    acuity : float
+        Smooth/sharp balance from -100 to +100 when SNR is enabled.
     start : str
         Initial estimate.  Supported modes are ``"auto"``, ``"flat"``,
         ``"percentile_flat"``, ``"observed"``, ``"observed_bgsub"``,
@@ -1246,11 +1401,14 @@ def ci_rl_deconvolve(
         )
         iteration_callback = None
     if n_tiles > 1:
+        dispatch_snr = snr
+        if isinstance(snr, str) and snr.strip().lower() == SNR_AUTO:
+            dispatch_snr = float(estimate_image_snr(image)["snr"])
         return _ci_deconvolve_tiled(
             image, psf, n_tiles,
             solver=ci_rl_deconvolve,
             niter=niter, tv_lambda=tv_lambda, offset=offset,
-            prefilter_sigma=prefilter_sigma, start=start,
+            prefilter_sigma=prefilter_sigma, snr=dispatch_snr, acuity=acuity, start=start,
             background=background,
             convergence=convergence, rel_threshold=rel_threshold,
             check_every=check_every,
@@ -1274,6 +1432,8 @@ def ci_rl_deconvolve(
             tv_lambda=tv_lambda,
             offset=offset,
             prefilter_sigma=prefilter_sigma,
+            snr=snr,
+            acuity=acuity,
             start=start,
             background=background,
             convergence=convergence,
@@ -1287,6 +1447,23 @@ def ci_rl_deconvolve(
             device=device,
             iteration_callback=iteration_callback,
             channel_index=channel_index,
+        )
+
+    snr_settings = _resolve_snr_settings(image, snr, acuity, prefilter_sigma, rel_threshold)
+    effective_snr = snr_settings["effective_snr"]
+    prefilter_sigma = float(snr_settings["prefilter_sigma"])
+    if snr_settings["enabled"] and convergence == "auto":
+        rel_threshold = float(snr_settings["rel_threshold"])
+    start = _resolve_snr_start_mode(start, snr_settings)
+    if offset == "auto" and snr_settings["enabled"]:
+        offset = _scale_aware_auto_offset(image, snr_settings.get("estimate"))
+    if snr_settings["enabled"]:
+        estimate = snr_settings["estimate"] or {}
+        log.info(
+            "  SNR requested=%s effective=%.4g reliability=%s mode=%s acuity=%.1f "
+            "effective_prefilter=%.4g effective_rel_threshold=%.4g",
+            snr_settings["requested_snr"], effective_snr, estimate.get("reliability", "manual"),
+            estimate.get("mode", "manual"), snr_settings["acuity"], prefilter_sigma, rel_threshold,
         )
 
     dev = _pick_device(device)
@@ -1460,6 +1637,17 @@ def ci_rl_deconvolve(
         "result": result_np,
         "convergence": convergence_history,
         "iterations_used": iterations_used,
+        "effective_parameters": {
+            "snr_requested": snr_settings["requested_snr"],
+            "snr": effective_snr,
+            "snr_reliability": (snr_settings.get("estimate") or {}).get("reliability"),
+            "snr_mode": (snr_settings.get("estimate") or {}).get("mode"),
+            "acuity": snr_settings["acuity"],
+            "start": start,
+            "prefilter_sigma": prefilter_sigma,
+            "rel_threshold": rel_threshold,
+            "offset": offset_val,
+        },
     }
 
 
@@ -2157,4 +2345,3 @@ def ci_generate_psf(
         if "psf" in locals():
             del psf
         _release_cuda_cache()
-

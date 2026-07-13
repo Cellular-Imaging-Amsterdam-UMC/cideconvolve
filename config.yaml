@@ -543,6 +543,48 @@ parameters:
   optional: true
   section_id: advanced
   mode: advanced
+- name: snr_mode
+  type: dropdown
+  label: SNR Mode
+  description: Select None to disable SNR-aware setup, Auto to estimate SNR, or Manual to use SNR Value.
+  options:
+  - label: None
+    value: none
+  - label: Auto
+    value: auto
+  - label: Manual
+    value: manual
+  default: none
+  multiselect: false
+  cli_tag: --snr_mode
+  cli_order: 44
+  optional: true
+  section_id: method
+  mode: beginner
+- name: snr_value
+  type: float
+  label: SNR Value
+  description: Manual SNR value. Ignored when SNR Mode is None or Auto.
+  default: 4.0
+  min: 0.1
+  max: 10000.0
+  cli_tag: --snr_value
+  cli_order: 45
+  optional: true
+  section_id: method
+  mode: beginner
+- name: acuity
+  type: float
+  label: Acuity
+  description: Sharpness/smoothness balance from -100 (smooth) to +100 (sharp).
+  default: 0.0
+  min: -100.0
+  max: 100.0
+  cli_tag: --acuity
+  cli_order: 46
+  optional: true
+  section_id: method
+  mode: beginner
 - name: two_d_mode
   type: dropdown
   label: 2D Widefield Mode

@@ -1051,6 +1051,22 @@ def _parse_float_list(text: str) -> list[float]:
     return values
 
 
+def _snr_for_channel(params: dict, channel_index: int, image: Optional[np.ndarray] = None):
+    mode = str(params.get("snr_mode", "off")).strip().lower()
+    if mode == "auto":
+        frozen = params.setdefault("_frozen_snr", {})
+        if channel_index not in frozen and image is not None:
+            from core.deconvolve_ci import estimate_image_snr
+            frozen[channel_index] = float(estimate_image_snr(image)["snr"])
+        return frozen.get(channel_index, "auto")
+    if mode != "manual":
+        return None
+    values = params.get("snr_values") or []
+    if not values:
+        return None
+    return float(values[channel_index] if channel_index < len(values) else values[-1])
+
+
 def _format_nm(value: Optional[float]) -> str:
     if value is None or not math.isfinite(float(value)):
         return "unknown"
@@ -1495,6 +1511,18 @@ class _BaseTimepointSource:
     ) -> list[np.ndarray]:
         raise NotImplementedError
 
+    def supports_plane_preview(self) -> bool:
+        return False
+
+    def load_timepoint_plane(
+        self,
+        t_index: int,
+        z_index: int,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> list[np.ndarray]:
+        """Load one Z plane per channel when cheap plane I/O is available."""
+        raise NotImplementedError
+
 
 class _BioImageTimepointSource(_BaseTimepointSource):
     def __init__(self, path_str: str, reader: Any = None):
@@ -1937,6 +1965,7 @@ class _TimepointLoadWorker(QThread):
         source: _BaseTimepointSource,
         timepoint: int,
         generation: int,
+        z_preview: Optional[int] = None,
         source_factory: Optional[Callable[[], _BaseTimepointSource]] = None,
         parent=None,
     ):
@@ -1945,6 +1974,7 @@ class _TimepointLoadWorker(QThread):
         self.source_factory = source_factory
         self.timepoint = int(timepoint)
         self.generation = int(generation)
+        self.z_preview = int(z_preview) if z_preview is not None else None
 
     def run(self):
         try:
@@ -1960,12 +1990,18 @@ class _TimepointLoadWorker(QThread):
                 )
                 return
             source = self.source_factory() if self.source_factory is not None else self.source
-            channels = source.load_timepoint(
-                self.timepoint,
-                progress_cb=lambda done, total, text: self.progress.emit(
-                    int(done), int(total), str(text)
-                ),
-            )
+            def progress(done: int, total: int, text: str) -> None:
+                self.progress.emit(int(done), int(total), str(text))
+            if self.z_preview is not None and source.supports_plane_preview():
+                channels = source.load_timepoint_plane(
+                    self.timepoint,
+                    self.z_preview,
+                    progress_cb=progress,
+                )
+                full_stack = False
+            else:
+                channels = source.load_timepoint(self.timepoint, progress_cb=progress)
+                full_stack = True
             if self.isInterruptionRequested():
                 self.finished.emit(
                     {
@@ -1983,6 +2019,7 @@ class _TimepointLoadWorker(QThread):
                     "generation": self.generation,
                     "timepoint": self.timepoint,
                     "channels": channels,
+                    "full_stack": full_stack,
                 }
             )
         except Exception as exc:
@@ -2262,6 +2299,39 @@ class _BrowserTimepointSource(_BaseTimepointSource):
                     c_index + 1,
                     total,
                     f"Loading {self._vendor_label} stack… channel {c_index + 1}/{total}",
+                )
+        return channels
+
+    def supports_plane_preview(self) -> bool:
+        return hasattr(self._handle, "read_plane")
+
+    def load_timepoint_plane(
+        self,
+        t_index: int,
+        z_index: int,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> list[np.ndarray]:
+        size_c = max(int(self.metadata.get("size_c", 1)), 1)
+        size_t = max(int(self.metadata.get("size_t", 1)), 1)
+        size_z = max(int(self.metadata.get("size_z", 1)), 1)
+        target_t = max(0, min(int(t_index), size_t - 1))
+        target_z = max(0, min(int(z_index), size_z - 1))
+        selected_s = getattr(self._context, "selected_s", None)
+        channels: list[np.ndarray] = []
+        for c_index in range(size_c):
+            if progress_cb is not None:
+                progress_cb(
+                    c_index,
+                    size_c,
+                    f"Loading {self._vendor_label} middle Z plane… channel {c_index + 1}/{size_c}",
+                )
+            plane = self._handle.read_plane(z=target_z, c=c_index, t=target_t, s=selected_s)
+            channels.append(_normalize_stack_to_zyx(plane))
+            if progress_cb is not None:
+                progress_cb(
+                    c_index + 1,
+                    size_c,
+                    f"Loaded {self._vendor_label} middle Z plane… channel {c_index + 1}/{size_c}",
                 )
         return channels
 
@@ -5232,6 +5302,8 @@ def _deconvolve_channel_stacks(
                 out = ci_rl_deconvolve(
                     ch_data,
                     psf,
+                    snr=_snr_for_channel(params, ci, ch_data),
+                    acuity=params.get("acuity", 0.0),
                     tv_lambda=params["tv_lambda"],
                     microscope_type=params["microscope_type"],
                     two_d_mode=params["two_d_mode"],
@@ -5241,6 +5313,15 @@ def _deconvolve_channel_stacks(
                     **common,
                 )
             iterations_used = out.get("iterations_used", niter)
+            effective = out.get("effective_parameters") or {}
+            if effective.get("snr") is not None:
+                _progress(
+                    f"  Ch{ci}: SNR={effective['snr']:.3g} "
+                    f"({effective.get('snr_reliability') or 'manual'}), "
+                    f"acuity={effective.get('acuity', 0):g}, "
+                    f"start={effective.get('start')}, prefilter={effective.get('prefilter_sigma', 0):.3g}, "
+                    f"threshold={effective.get('rel_threshold', 0):.3g}, offset={effective.get('offset', 0):.3g}"
+                )
             convergence_history = out.get("convergence") or []
             conv_text = f", last objective={convergence_history[-1]:.6g}" if convergence_history else ""
             _progress(
@@ -5707,6 +5788,99 @@ class _TSeriesSaveOptionsDialog(QDialog):
         return f"T{self._start_spin.value():03d}-{self._stop_spin.value():03d}_step{self._step_spin.value()}"
 
 
+class _OriginalZarrSaveOptionsDialog(QDialog):
+    """Select the T and Z subset used by an original OME-Zarr export."""
+
+    def __init__(self, size_t: int, size_z: int, *, parent=None):
+        super().__init__(parent)
+        self._size_t = max(int(size_t or 1), 1)
+        self._size_z = max(int(size_z or 1), 1)
+        self.setWindowTitle("Save Original Options")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self._t_start_spin = QSpinBox()
+        self._t_start_spin.setRange(1, self._size_t)
+        self._t_start_spin.setValue(1)
+        form.addRow("T start", self._t_start_spin)
+
+        self._t_stop_spin = QSpinBox()
+        self._t_stop_spin.setRange(1, self._size_t)
+        self._t_stop_spin.setValue(self._size_t)
+        form.addRow("T stop", self._t_stop_spin)
+
+        self._t_step_spin = QSpinBox()
+        self._t_step_spin.setRange(1, self._size_t)
+        self._t_step_spin.setValue(1)
+        form.addRow("T step", self._t_step_spin)
+
+        self._z_mode_combo = QComboBox()
+        self._z_mode_combo.addItems(["Full stack", "Z-slice range"])
+        self._z_mode_combo.setEnabled(self._size_z > 1)
+        form.addRow("Z selection", self._z_mode_combo)
+
+        self._z_start_spin = QSpinBox()
+        self._z_start_spin.setRange(1, self._size_z)
+        self._z_start_spin.setValue(1)
+        form.addRow("Z start", self._z_start_spin)
+
+        self._z_stop_spin = QSpinBox()
+        self._z_stop_spin.setRange(1, self._size_z)
+        self._z_stop_spin.setValue(self._size_z)
+        form.addRow("Z stop", self._z_stop_spin)
+
+        self._z_step_spin = QSpinBox()
+        self._z_step_spin.setRange(1, self._size_z)
+        self._z_step_spin.setValue(1)
+        form.addRow("Z step", self._z_step_spin)
+        layout.addLayout(form)
+
+        self._z_mode_combo.currentTextChanged.connect(self._refresh_z_controls)
+        self._refresh_z_controls()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        save = QPushButton("Save")
+        save.setDefault(True)
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self._accept_if_valid)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+    def _refresh_z_controls(self) -> None:
+        ranged = self._z_mode_combo.currentText() == "Z-slice range" and self._size_z > 1
+        self._z_start_spin.setEnabled(ranged)
+        self._z_stop_spin.setEnabled(ranged)
+        self._z_step_spin.setEnabled(ranged)
+
+    def _accept_if_valid(self) -> None:
+        if self._t_stop_spin.value() < self._t_start_spin.value():
+            QMessageBox.information(self, "Invalid T range", "T stop must be greater than or equal to T start.")
+            return
+        if self._z_mode_combo.currentText() == "Z-slice range" and self._z_stop_spin.value() < self._z_start_spin.value():
+            QMessageBox.information(self, "Invalid Z range", "Z stop must be greater than or equal to Z start.")
+            return
+        self.accept()
+
+    def timepoints(self) -> list[int]:
+        return list(range(
+            self._t_start_spin.value() - 1,
+            self._t_stop_spin.value(),
+            self._t_step_spin.value(),
+        ))
+
+    def z_slices(self) -> list[int]:
+        if self._z_mode_combo.currentText() != "Z-slice range":
+            return list(range(self._size_z))
+        return list(range(
+            self._z_start_spin.value() - 1,
+            self._z_stop_spin.value(),
+            self._z_step_spin.value(),
+        ))
+
+
 class _PreviewSaveOptionsDialog(QDialog):
     """Small options prompt for current preview exports."""
 
@@ -5967,6 +6141,8 @@ class _StreamingOmeroWorker(QThread):
                     out = ci_rl_deconvolve(
                         tile_img,
                         effective_psf,
+                        snr=_snr_for_channel(self.params, ci, tile_img),
+                        acuity=self.params.get("acuity", 0.0),
                         tv_lambda=self.params["tv_lambda"] if self.params["method"] == "ci_rl_tv" else 0.0,
                         microscope_type=self.params["microscope_type"],
                         two_d_mode=self.params["two_d_mode"],
@@ -6023,6 +6199,9 @@ class _StreamingOmeroWorker(QThread):
                     "background": self.params["background"],
                     "offset": self.params["offset"],
                     "prefilter_sigma": self.params["prefilter_sigma"],
+                    "snr_mode": self.params.get("snr_mode"),
+                    "snr_values": self.params.get("snr_values"),
+                    "acuity": self.params.get("acuity", 0.0),
                     "start": self.params["start"],
                 },
                 summary=summary,
@@ -6061,6 +6240,8 @@ class _SaveOriginalZarrWorker(QThread):
         metadata: dict,
         output_path: str,
         *,
+        timepoints: Optional[Sequence[int]] = None,
+        z_slices: Optional[Sequence[int]] = None,
         source_factory: Optional[Callable[[], _BaseTimepointSource]] = None,
         tile_size: int = 512,
         parent=None,
@@ -6069,6 +6250,8 @@ class _SaveOriginalZarrWorker(QThread):
         self.source = source
         self.metadata = dict(metadata or {})
         self.output_path = str(output_path)
+        self.timepoints = list(timepoints) if timepoints is not None else None
+        self.z_slices = list(z_slices) if z_slices is not None else None
         self.source_factory = source_factory
         self.tile_size = max(int(tile_size or 512), 64)
 
@@ -6082,23 +6265,44 @@ class _SaveOriginalZarrWorker(QThread):
             else:
                 region_source = _TimepointRegionSource(source, source_id="gui:original")
             region_source.metadata.update(self.metadata)
-            region_source.metadata["size_t"] = region_source.shape[0]
+            source_size_t, size_c, source_size_z, size_y, size_x = region_source.shape
+            timepoints = self.timepoints if self.timepoints is not None else list(range(source_size_t))
+            z_indices = self.z_slices if self.z_slices is not None else list(range(source_size_z))
+            timepoints = [int(t) for t in timepoints if 0 <= int(t) < source_size_t]
+            z_indices = [int(z) for z in z_indices if 0 <= int(z) < source_size_z]
+            if not timepoints:
+                raise ValueError("The selected T range is empty.")
+            if not z_indices:
+                raise ValueError("The selected Z range is empty.")
+            output_shape = (len(timepoints), size_c, len(z_indices), size_y, size_x)
+
+            region_source.metadata["size_t"] = output_shape[0]
             region_source.metadata["size_c"] = region_source.shape[1]
-            region_source.metadata["size_z"] = region_source.shape[2]
+            region_source.metadata["size_z"] = output_shape[2]
             region_source.metadata["size_y"] = region_source.shape[3]
             region_source.metadata["size_x"] = region_source.shape[4]
             region_source.metadata["n_channels"] = region_source.shape[1]
+            region_source.metadata["default_t"] = 0
+            region_source.metadata["default_z"] = output_shape[2] // 2 if output_shape[2] > 1 else 0
+            z_step = z_indices[1] - z_indices[0] if len(z_indices) > 1 else 1
+            if z_step > 1 and region_source.metadata.get("pixel_size_z") is not None:
+                region_source.metadata["pixel_size_z"] = float(region_source.metadata["pixel_size_z"]) * z_step
             processing = dict(region_source.metadata.get("cideconvolve_processing") or {})
-            processing.update({"export": "original_to_ome_zarr", "tile_streaming": True})
+            processing.update({
+                "export": "original_to_ome_zarr",
+                "tile_streaming": True,
+                "source_timepoints": timepoints,
+                "source_z_slices": z_indices,
+            })
             region_source.metadata["cideconvolve_processing"] = processing
 
             sink = ZarrPyramidSink(
                 self.output_path,
-                shape=region_source.shape,
+                shape=output_shape,
                 metadata=region_source.metadata,
                 resume=False,
             )
-            size_t, size_c, size_z, size_y, size_x = region_source.shape
+            size_t, size_c, size_z, size_y, size_x = output_shape
             tile_y = min(self.tile_size, size_y)
             tile_x = min(self.tile_size, size_x)
             total_tiles = max(size_t * size_c * math.ceil(size_y / tile_y) * math.ceil(size_x / tile_x), 1)
@@ -6110,8 +6314,9 @@ class _SaveOriginalZarrWorker(QThread):
             )
             self.progress.emit(f"  Tile size   : {tile_y} x {tile_x} px")
             self.progress.emit(f"  Output      : {self.output_path}")
-            z_slice = slice(0, size_z)
-            for t_index in range(size_t):
+            destination_z = slice(0, size_z)
+            contiguous_z = z_indices == list(range(z_indices[0], z_indices[-1] + 1))
+            for output_t, source_t in enumerate(timepoints):
                 for c_index in range(size_c):
                     for y0 in range(0, size_y, tile_y):
                         y_slice = slice(y0, min(y0 + tile_y, size_y))
@@ -6119,17 +6324,29 @@ class _SaveOriginalZarrWorker(QThread):
                             if self.isInterruptionRequested():
                                 raise RuntimeError("Stopped by user")
                             x_slice = slice(x0, min(x0 + tile_x, size_x))
-                            tile = region_source.read_region(
-                                t=t_index,
-                                c=c_index,
-                                z=z_slice,
-                                y=y_slice,
-                                x=x_slice,
-                            )
+                            if contiguous_z:
+                                tile = region_source.read_region(
+                                    t=source_t,
+                                    c=c_index,
+                                    z=slice(z_indices[0], z_indices[-1] + 1),
+                                    y=y_slice,
+                                    x=x_slice,
+                                )
+                            else:
+                                tile = np.concatenate([
+                                    region_source.read_region(
+                                        t=source_t,
+                                        c=c_index,
+                                        z=slice(source_z, source_z + 1),
+                                        y=y_slice,
+                                        x=x_slice,
+                                    )
+                                    for source_z in z_indices
+                                ], axis=0)
                             sink.write_tile(
-                                t=t_index,
+                                t=output_t,
                                 c=c_index,
-                                z=z_slice,
+                                z=destination_z,
                                 y=y_slice,
                                 x=x_slice,
                                 data=np.asarray(tile, dtype=np.float32),
@@ -6138,13 +6355,14 @@ class _SaveOriginalZarrWorker(QThread):
                             if done == 1 or done == total_tiles or done % 10 == 0:
                                 self.progress.emit(
                                     f"  Copied {done}/{total_tiles} tiles "
-                                    f"(T={t_index + 1}/{size_t}, C={c_index + 1}/{size_c})"
+                                    f"(source T={source_t + 1}, output T={output_t + 1}/{size_t}, "
+                                    f"C={c_index + 1}/{size_c})"
                                 )
             self.progress.emit("  Building OME-Zarr pyramid levels...")
             sink.build_pyramids()
             sink.validate()
             sink.close()
-            self.finished.emit({"path": self.output_path, "tiles": done, "shape": region_source.shape})
+            self.finished.emit({"path": self.output_path, "tiles": done, "shape": output_shape})
         except Exception as exc:
             if "Stopped by user" not in str(exc):
                 traceback.print_exc()
@@ -6204,6 +6422,9 @@ def _streaming_output_metadata(base_metadata: dict, params: dict, *, source_name
         "background": params.get("background"),
         "offset": params.get("offset"),
         "prefilter_sigma": params.get("prefilter_sigma"),
+        "snr_mode": params.get("snr_mode"),
+        "snr_values": params.get("snr_values"),
+        "acuity": params.get("acuity", 0.0),
         "tile_streaming": True,
     }
     return meta
@@ -6480,6 +6701,8 @@ def _run_streaming_deconvolution_job(
             out = ci_rl_deconvolve(
                 tile_img,
                 effective_psf,
+                snr=_snr_for_channel(params, ci, tile_img),
+                acuity=params.get("acuity", 0.0),
                 tv_lambda=params["tv_lambda"] if params["method"] == "ci_rl_tv" else 0.0,
                 microscope_type=params["microscope_type"],
                 two_d_mode=params["two_d_mode"],
@@ -7472,13 +7695,24 @@ class DeconvolveCIWindow(QMainWindow):
         self._input_source: Optional[_BaseTimepointSource] = None
         self._input_source_factory: Optional[Callable[[], _BaseTimepointSource]] = None
         self._loaded_timepoint: Optional[int] = None
+        self._loaded_timepoint_is_full = False
         self._preview_outputs_by_t: dict[int, list[np.ndarray]] = {}
         self._preview_roi_by_t: dict[int, dict] = {}
         self._metadata: dict = {}
         self._worker: Optional[_DeconvolveWorker] = None
         self._load_worker: Optional[_TimepointLoadWorker] = None
         self._load_generation = 0
-        self._queued_load_timepoint: Optional[int] = None
+        self._queued_load_request: Optional[tuple[int, bool]] = None
+        self._pending_scrub_timepoint: Optional[int] = None
+        self._run_after_full_load = False
+        self._timepoint_scrub_timer = QTimer(self)
+        self._timepoint_scrub_timer.setSingleShot(True)
+        self._timepoint_scrub_timer.setInterval(140)
+        self._timepoint_scrub_timer.timeout.connect(self._start_scrub_timepoint_load)
+        self._full_stack_load_timer = QTimer(self)
+        self._full_stack_load_timer.setSingleShot(True)
+        self._full_stack_load_timer.setInterval(300)
+        self._full_stack_load_timer.timeout.connect(self._load_full_stack_for_current_timepoint)
         self._initial_load_context: Optional[dict[str, Any]] = None
         self._save_worker: Optional[_SaveTSeriesWorker] = None
         self._preview_save_worker: Optional[_SavePreviewWorker] = None
@@ -7689,6 +7923,23 @@ class DeconvolveCIWindow(QMainWindow):
             "hybrid",
         ])
         ml.addRow("Start:", self._start_combo)
+
+        self._snr_combo = NoWheelComboBox()
+        self._snr_combo.addItems(["Auto", "Off", "Manual"])
+        self._snr_combo.currentTextChanged.connect(self._on_snr_changed)
+        ml.addRow("SNR:", self._snr_combo)
+
+        self._le_snr = QLineEdit("4.0")
+        self._le_snr.setEnabled(False)
+        self._le_snr.setToolTip("Manual SNR per channel, comma-separated.")
+        ml.addRow("SNR value(s):", self._le_snr)
+
+        self._sp_acuity = NoWheelDoubleSpinBox()
+        self._sp_acuity.setRange(-100.0, 100.0)
+        self._sp_acuity.setDecimals(1)
+        self._sp_acuity.setSingleStep(5.0)
+        self._sp_acuity.setValue(0.0)
+        ml.addRow("Acuity:", self._sp_acuity)
 
         ctrl_layout.addWidget(method_group)
 
@@ -8339,6 +8590,7 @@ class DeconvolveCIWindow(QMainWindow):
         vl.setContentsMargins(0, 0, 0, 0)
         self._viewer = DualViewerWidget()
         self._viewer.timepointChanged.connect(self._on_viewer_time_changed)
+        self._viewer.fullStackRequested.connect(self._on_viewer_full_stack_requested)
         self._viewer.logRequested.connect(self._open_log_dialog)
         self._viewer.cursorInfoChanged.connect(self._on_viewer_cursor_info)
         self._viewer.roiChanged.connect(self._on_viewer_roi_changed)
@@ -9276,6 +9528,11 @@ class DeconvolveCIWindow(QMainWindow):
 
         self._two_d_wf_essential_group.setVisible(is_rl_family)
         self._two_d_wf_group.setVisible(is_rl_family)
+        self._snr_combo.setEnabled(is_rl_family)
+        self._sp_acuity.setEnabled(is_rl_family)
+        self._le_snr.setEnabled(
+            is_rl_family and self._snr_combo.currentText().strip().lower() == "manual"
+        )
 
         if self._sparse_weight_label is not None:
             self._sparse_weight_label.setVisible(is_sparse)
@@ -9291,6 +9548,10 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _on_offset_changed(self, text: str):
         self._sp_offset.setEnabled(text == "manual")
+
+    def _on_snr_changed(self, text: str):
+        is_rl = self._method_combo.currentText() in ("ci_rl", "ci_rl_tv")
+        self._le_snr.setEnabled(is_rl and str(text).strip().lower() == "manual")
 
     def _on_conv_changed(self, text: str):
         auto = text == "auto"
@@ -9484,7 +9745,10 @@ class DeconvolveCIWindow(QMainWindow):
     def _cancel_loading(self) -> None:
         if self._load_worker is None or not self._load_worker.isRunning():
             return
-        self._queued_load_timepoint = None
+        self._queued_load_request = None
+        self._pending_scrub_timepoint = None
+        self._timepoint_scrub_timer.stop()
+        self._full_stack_load_timer.stop()
         self._initial_load_context = None
         self._load_generation += 1
         self._load_worker.requestInterruption()
@@ -9701,6 +9965,12 @@ class DeconvolveCIWindow(QMainWindow):
         self._input_source_factory = source_factory
         self._input_channels = []
         self._loaded_timepoint = None
+        self._loaded_timepoint_is_full = False
+        self._queued_load_request = None
+        self._pending_scrub_timepoint = None
+        self._run_after_full_load = False
+        self._timepoint_scrub_timer.stop()
+        self._full_stack_load_timer.stop()
         self._metadata = dict(source.metadata)
         self._preview_outputs_by_t.clear()
         self._preview_roi_by_t.clear()
@@ -9984,6 +10254,11 @@ class DeconvolveCIWindow(QMainWindow):
         if not niter_list:
             niter_list = [50]
 
+        snr_mode = self._snr_combo.currentText().strip().lower()
+        snr_values = [value for value in _parse_float_list(self._le_snr.text()) if value > 0.0]
+        if snr_mode == "manual" and not snr_values:
+            snr_values = [4.0]
+
         movie_enabled = (
             self._movie_available
             and hasattr(self, "_cb_movie")
@@ -10020,6 +10295,9 @@ class DeconvolveCIWindow(QMainWindow):
             "two_d_wf_bg_scale": self._sp_two_d_wf_bg_scale.value(),
             "offset": offset,
             "prefilter_sigma": self._sp_prefilter.value(),
+            "snr_mode": snr_mode,
+            "snr_values": snr_values,
+            "acuity": self._sp_acuity.value(),
             "start": self._start_combo.currentText(),
             "sparse_hessian_weight": self._sp_sparse_weight.value(),
             "sparse_hessian_reg": self._sp_sparse_reg.value(),
@@ -10187,6 +10465,13 @@ class DeconvolveCIWindow(QMainWindow):
             return
         if self._is_streamed_omero_pyramid_source():
             self._start_streaming_omero_deconvolution()
+            return
+        current_t = self._viewer.current_timepoint()
+        if self._loaded_timepoint != current_t or not self._loaded_timepoint_is_full:
+            self._run_after_full_load = True
+            self._full_stack_load_timer.stop()
+            self._load_timepoint_into_viewer(current_t, force=True, full_stack=True)
+            self._status.showMessage("Loading the full Z stack before deconvolution...", 5000)
             return
 
         self._btn_run.setText("Stop")
@@ -10689,6 +10974,15 @@ class DeconvolveCIWindow(QMainWindow):
         if self._save_worker is not None and self._save_worker.isRunning():
             return
 
+        source_meta = getattr(self._input_source, "metadata", {}) or {}
+        size_t = max(int(source_meta.get("size_t", 1) or 1), 1)
+        size_z = max(int(source_meta.get("size_z", 1) or 1), 1)
+        options = _OriginalZarrSaveOptionsDialog(size_t, size_z, parent=self)
+        if options.exec() != QDialog.DialogCode.Accepted:
+            return
+        timepoints = options.timepoints()
+        z_slices = options.z_slices()
+
         stem = "original"
         if self._input_path is not None:
             stem = _safe_filename_stem(self._input_path.stem)
@@ -10745,12 +11039,18 @@ class DeconvolveCIWindow(QMainWindow):
         self._log("")
         self._log("=" * 70)
         self._log(f"Saving original input to OME-Zarr: {out}")
+        self._log(
+            f"  Selection: T={','.join(str(t + 1) for t in timepoints)}; "
+            f"Z={','.join(str(z + 1) for z in z_slices)}"
+        )
         self._log("=" * 70)
 
         self._save_worker = _SaveOriginalZarrWorker(
             self._input_source,
             metadata,
             str(out),
+            timepoints=timepoints,
+            z_slices=z_slices,
             source_factory=self._input_source_factory,
             parent=self,
         )
@@ -11037,6 +11337,9 @@ class DeconvolveCIWindow(QMainWindow):
             "offset": self._offset_combo.currentText(),
             "offset_value": self._sp_offset.value(),
             "prefilter_sigma": self._sp_prefilter.value(),
+            "snr_mode": self._snr_combo.currentText(),
+            "snr_values": self._le_snr.text(),
+            "acuity": self._sp_acuity.value(),
             "start": self._start_combo.currentText(),
             "sparse_hessian_weight": self._sp_sparse_weight.value(),
             "sparse_hessian_reg": self._sp_sparse_reg.value(),
@@ -11120,6 +11423,12 @@ class DeconvolveCIWindow(QMainWindow):
         _combo(self._offset_combo, "offset")
         _spin(self._sp_offset, "offset_value")
         _spin(self._sp_prefilter, "prefilter_sigma")
+        if "snr_mode" in data:
+            _combo(self._snr_combo, "snr_mode")
+        else:
+            self._snr_combo.setCurrentText("Off")
+        _line(self._le_snr, "snr_values")
+        _spin(self._sp_acuity, "acuity")
         _combo(self._start_combo, "start")
         _spin(self._sp_sparse_weight, "sparse_hessian_weight")
         _spin(self._sp_sparse_reg, "sparse_hessian_reg")
@@ -11300,15 +11609,39 @@ class DeconvolveCIWindow(QMainWindow):
     # -----------------------------------------------------------------------
     # Viewer
     # -----------------------------------------------------------------------
-    def _load_timepoint_into_viewer(self, timepoint: int, *, force: bool = False) -> None:
+    def _source_supports_plane_preview(self) -> bool:
+        return bool(
+            self._input_source is not None
+            and max(int(self._metadata.get("size_z", 1)), 1) > 1
+            and self._input_source.supports_plane_preview()
+        )
+
+    def _queue_load_request(self, target_t: int, full_stack: bool) -> None:
+        queued = self._queued_load_request
+        if queued is not None and queued[0] == target_t:
+            full_stack = bool(full_stack or queued[1])
+        self._queued_load_request = (target_t, bool(full_stack))
+
+    def _load_timepoint_into_viewer(
+        self,
+        timepoint: int,
+        *,
+        force: bool = False,
+        full_stack: bool = True,
+    ) -> None:
         if self._input_source is None:
             return
         target_t = max(0, min(int(timepoint), max(int(self._metadata.get("size_t", 1)) - 1, 0)))
-        if not force and self._loaded_timepoint == target_t and self._input_channels:
+        if (
+            not force
+            and self._loaded_timepoint == target_t
+            and self._input_channels
+            and (self._loaded_timepoint_is_full or not full_stack)
+        ):
             return
         if self._load_worker is not None and self._load_worker.isRunning():
-            self._queued_load_timepoint = target_t
-            self._status.showMessage(f"Queued T={target_t + 1}; current load will finish or be ignored.", 5000)
+            self._queue_load_request(target_t, full_stack)
+            self._status.showMessage(f"Queued T={target_t + 1}; keeping only the latest request.", 5000)
             return
 
         size_z = max(int(self._metadata.get("size_z", 1)), 1)
@@ -11338,12 +11671,14 @@ class DeconvolveCIWindow(QMainWindow):
             self._input_source,
             target_t,
             self._load_generation,
+            z_preview=None if full_stack else size_z // 2,
             source_factory=use_factory,
             parent=self,
         )
         self._load_worker.progress.connect(self._on_timepoint_load_progress)
         self._load_worker.finished.connect(self._on_timepoint_load_finished)
-        self._set_operation_state("Loading", message=f"Loading T={target_t + 1}...")
+        load_label = "stack" if full_stack else "middle Z plane"
+        self._set_operation_state("Loading", message=f"Loading T={target_t + 1} {load_label}...")
         if hasattr(self, "_btn_cancel_loading"):
             self._btn_cancel_loading.setEnabled(True)
         self._load_worker.start()
@@ -11369,15 +11704,18 @@ class DeconvolveCIWindow(QMainWindow):
 
         target_t = int(payload.get("timepoint", 0))
         context = self._initial_load_context
-        queued_t = self._queued_load_timepoint
-        if queued_t is not None and queued_t != target_t:
-            self._queued_load_timepoint = None
-            self._log(f"Skipping loaded T={target_t + 1}; loading latest requested T={queued_t + 1}.")
-            self._load_timepoint_into_viewer(queued_t, force=True)
+        full_stack = bool(payload.get("full_stack", True))
+        queued = self._queued_load_request
+        if queued is not None and queued[0] != target_t:
+            self._queued_load_request = None
+            self._log(f"Skipping loaded T={target_t + 1}; loading latest requested T={queued[0] + 1}.")
+            self._load_timepoint_into_viewer(queued[0], force=True, full_stack=queued[1])
             return
-        self._queued_load_timepoint = None
-        self._initial_load_context = None
+        self._queued_load_request = None
+        if full_stack:
+            self._initial_load_context = None
         if not payload.get("ok"):
+            self._run_after_full_load = False
             if payload.get("cancelled"):
                 self._log("Loading cancelled.")
                 self._status.showMessage("Loading cancelled", 5000)
@@ -11393,6 +11731,7 @@ class DeconvolveCIWindow(QMainWindow):
         channels = list(payload.get("channels") or [])
         self._input_channels = channels
         self._loaded_timepoint = target_t
+        self._loaded_timepoint_is_full = full_stack
         self._set_operation_state("Rendering", message=f"Rendering T={target_t + 1}...")
         self._viewer.set_input_timepoint_data(target_t, channels)
 
@@ -11406,9 +11745,10 @@ class DeconvolveCIWindow(QMainWindow):
                 self._viewer.set_tiled_input_provider(provider)
 
         elapsed = time.time() - getattr(self, "_load_started_at", time.time())
-        self._log(f"Loaded timepoint T={target_t + 1} in {_format_duration(elapsed)}")
+        loaded_label = "full stack" if full_stack else "middle Z preview"
+        self._log(f"Loaded timepoint T={target_t + 1} {loaded_label} in {_format_duration(elapsed)}")
 
-        if context is not None:
+        if context is not None and full_stack:
             display_name = str(context.get("display_name") or "Image")
             source_path = context.get("source_path")
             if source_path is not None and not isinstance(source_path, Path):
@@ -11436,6 +11776,14 @@ class DeconvolveCIWindow(QMainWindow):
 
         self._set_operation_state("Idle")
         self._sync_preview_buttons()
+        if queued is not None:
+            self._load_timepoint_into_viewer(queued[0], force=True, full_stack=queued[1])
+            return
+        if not full_stack and self._viewer.needs_full_input_stack():
+            self._full_stack_load_timer.start()
+        if full_stack and self._run_after_full_load and target_t == self._viewer.current_timepoint():
+            self._run_after_full_load = False
+            QTimer.singleShot(0, self._on_run)
 
     def _sync_preview_buttons(self) -> None:
         self._update_operation_controls()
@@ -11457,15 +11805,38 @@ class DeconvolveCIWindow(QMainWindow):
             pass
 
     def _on_viewer_time_changed(self, timepoint: int) -> None:
-        previous_t = self._loaded_timepoint
+        self._run_after_full_load = False
+        self._pending_scrub_timepoint = int(timepoint)
+        self._full_stack_load_timer.stop()
+        self._timepoint_scrub_timer.start()
+        self._sync_preview_buttons()
+
+    def _start_scrub_timepoint_load(self) -> None:
+        if self._pending_scrub_timepoint is None:
+            return
+        target_t = self._pending_scrub_timepoint
+        self._pending_scrub_timepoint = None
         try:
-            self._load_timepoint_into_viewer(int(timepoint))
+            self._load_timepoint_into_viewer(
+                target_t,
+                full_stack=not self._source_supports_plane_preview(),
+            )
         except Exception as exc:
-            if previous_t is not None and previous_t != int(timepoint):
-                self._viewer.set_timepoint(previous_t)
             QMessageBox.critical(self, "Load Error", str(exc))
             self._status.showMessage("Timepoint load failed", 5000)
-        self._sync_preview_buttons()
+
+    def _load_full_stack_for_current_timepoint(self) -> None:
+        if self._input_source is None or not self._viewer.needs_full_input_stack():
+            return
+        target_t = self._viewer.current_timepoint()
+        if self._loaded_timepoint == target_t and self._loaded_timepoint_is_full:
+            return
+        self._load_timepoint_into_viewer(target_t, force=True, full_stack=True)
+
+    def _on_viewer_full_stack_requested(self) -> None:
+        if self._loaded_timepoint_is_full and self._loaded_timepoint == self._viewer.current_timepoint():
+            return
+        self._full_stack_load_timer.start()
 
     def _update_viewer(self):
         self._viewer.refresh_view()

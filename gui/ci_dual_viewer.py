@@ -2146,6 +2146,7 @@ class _AdvancedScalingPrepWorker(QThread):
 
 class DualViewerWidget(QWidget):
     timepointChanged = pyqtSignal(int)
+    fullStackRequested = pyqtSignal()
     logRequested = pyqtSignal()
     cursorInfoChanged = pyqtSignal(str)
     roiChanged = pyqtSignal(object)
@@ -2437,7 +2438,7 @@ class DualViewerWidget(QWidget):
         self._z_slider = QSlider(Qt.Orientation.Vertical)
         self._z_slider.setMinimum(0)
         self._z_slider.setMaximum(0)
-        self._z_slider.valueChanged.connect(self._refresh_view)
+        self._z_slider.valueChanged.connect(self._on_z_changed)
         z_layout.addWidget(self._z_slider, stretch=1)
         self._z_label = QLabel("0/0")
         self._z_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2667,6 +2668,13 @@ class DualViewerWidget(QWidget):
 
     def current_timepoint(self) -> int:
         return self._t_slider.value()
+
+    def needs_full_input_stack(self) -> bool:
+        """Return whether the active view needs more than one input Z plane."""
+        return (
+            self._mode_combo.currentText() == _THREE_D_MODE
+            or self._projection_combo.currentText() != "Slice"
+        )
 
     def has_time_axis(self) -> bool:
         return self._t_slider.maximum() > 0
@@ -3281,6 +3289,8 @@ class DualViewerWidget(QWidget):
         self._z_slider.setEnabled(mode == _TWO_D_MODE and self._z_slider.maximum() > 0 and self._projection_combo.currentText() == "Slice")
         self._refresh_navigator_state()
         self._refresh_view()
+        if mode == _THREE_D_MODE:
+            self.fullStackRequested.emit()
 
     def _on_projection_changed(self, _projection: str) -> None:
         self._z_slider.setEnabled(
@@ -3294,12 +3304,18 @@ class DualViewerWidget(QWidget):
         self._ensure_channel_scaling_defaults()
         self._sync_advanced_scaling_window()
         self._refresh_view()
+        if self._projection_combo.currentText() != "Slice":
+            self.fullStackRequested.emit()
 
     def _on_time_changed(self, value: int) -> None:
         self._update_labels()
         self.timepointChanged.emit(value)
         self._sync_advanced_scaling_window()
         self._refresh_view()
+
+    def _on_z_changed(self, _value: int) -> None:
+        self._refresh_view()
+        self.fullStackRequested.emit()
 
     def _on_contrast_changed(self) -> None:
         if self._mode_combo.currentText() == _THREE_D_MODE:
