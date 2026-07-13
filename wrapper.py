@@ -59,6 +59,8 @@ from core.streaming import (
     TiledOmeTiffSink,
     TimepointSubsetRegionSource,
     ZarrPyramidSink,
+    _resolve_channel_display_colors,
+    _rgb_to_ome_hex,
     deconvolve_streaming,
     normalise_timepoint_indices,
     open_region_source,
@@ -833,13 +835,20 @@ def _load_zarr_field(
 
     # Ensure emission wavelengths have a default
     _em_defaulted = False
+    _ex_defaulted = False
     for ch in meta["channels"]:
         if ch.get("emission_wavelength") is None:
             ch["emission_wavelength"] = 520.0
             _em_defaulted = True
+        if ch.get("excitation_wavelength") is None:
+            ch["excitation_wavelength"] = 488.0
+            _ex_defaulted = True
     if _em_defaulted:
         _defaulted.add("emission_wavelength")
         _add_metadata_warning(meta, "Missing emission wavelength metadata; using 520.0 nm fallback where needed.")
+    if _ex_defaulted:
+        _defaulted.add("excitation_wavelength")
+        _add_metadata_warning(meta, "Missing excitation wavelength metadata; using 488.0 nm fallback where needed.")
 
     if _apply_pinhole_airy_units(
         meta,
@@ -932,6 +941,139 @@ def _downsample_2x_xy(data: np.ndarray) -> np.ndarray:
         raise ValueError(f"Cannot downsample array with {data.ndim} dimensions")
 
 
+def _stack_channel_display_window(stack: np.ndarray, channel: int) -> tuple[float, float, float, float] | None:
+    """Estimate an OMERO rendering window from a TCZYX field stack."""
+    try:
+        _, _, size_z, size_y, size_x = stack.shape
+        z_stride = max(1, int(np.ceil(size_z / 32)))
+        y_stride = max(1, int(np.ceil(size_y / 512)))
+        x_stride = max(1, int(np.ceil(size_x / 512)))
+        sample = np.asarray(
+            stack[
+                0,
+                int(channel),
+                slice(0, size_z, z_stride),
+                slice(0, size_y, y_stride),
+                slice(0, size_x, x_stride),
+            ],
+            dtype=np.float32,
+        )
+    except Exception:
+        return None
+    finite = sample[np.isfinite(sample)]
+    if finite.size == 0:
+        return None
+    min_value = float(np.min(finite))
+    max_value = float(np.max(finite))
+    if max_value <= min_value:
+        end = max(max_value, min_value + 1.0)
+        return min_value, end, min_value, end
+    start = float(np.percentile(finite, 0.1))
+    end = float(np.percentile(finite, 99.9))
+    if end <= start:
+        start, end = min_value, max_value
+    if end <= start:
+        end = start + 1.0
+    return start, end, min_value, max_value
+
+
+def _hcs_field_omero_metadata(
+    metadata: dict,
+    stack: np.ndarray,
+    *,
+    name: str,
+    source_omero: dict | None = None,
+) -> dict:
+    """Build complete field-level OMERO rendering metadata for HCS OME-Zarr."""
+    omero = dict(source_omero) if isinstance(source_omero, dict) else {}
+    n_channels = int(stack.shape[1])
+    source_channels = [
+        dict(ch) if isinstance(ch, dict) else {}
+        for ch in metadata.get("channels", [])
+    ]
+    channel_names = list(metadata.get("channel_names") or [])
+    existing_channels = omero.get("channels")
+    if not isinstance(existing_channels, list):
+        existing_channels = []
+    resolved_colors = _resolve_channel_display_colors(metadata, n_channels)
+
+    channels = []
+    for i in range(n_channels):
+        existing = dict(existing_channels[i]) if i < len(existing_channels) and isinstance(existing_channels[i], dict) else {}
+        src = source_channels[i] if i < len(source_channels) else {}
+        label = (
+            existing.get("label")
+            or src.get("name")
+            or src.get("label")
+            or (channel_names[i] if i < len(channel_names) else f"Ch{i}")
+        )
+        entry = {
+            "label": str(label),
+            "active": bool(existing.get("active", src.get("active", True))),
+            "coefficient": existing.get("coefficient", 1),
+            "family": existing.get("family", "linear"),
+            "inverted": bool(existing.get("inverted", False)),
+        }
+        for src_key in ("emission_wavelength", "excitation_wavelength"):
+            value = src.get(src_key)
+            if value is not None:
+                try:
+                    entry[src_key] = float(value)
+                except (TypeError, ValueError):
+                    entry[src_key] = value
+        color_hex = _rgb_to_ome_hex(existing.get("color"))
+        if color_hex is None:
+            color_hex = _rgb_to_ome_hex(resolved_colors[i] if i < len(resolved_colors) else src.get("color"))
+        entry["color"] = color_hex or "FFFFFF"
+
+        existing_window = existing.get("window") if isinstance(existing.get("window"), dict) else {}
+        data_window = _stack_channel_display_window(stack, i)
+        has_existing_window = existing_window.get("start") is not None and existing_window.get("end") is not None
+        existing_window_ok = False
+        if has_existing_window:
+            try:
+                existing_window_ok = float(existing_window.get("end")) > float(existing_window.get("start"))
+            except (TypeError, ValueError):
+                existing_window_ok = False
+        if data_window is not None and not existing_window_ok:
+            start, end, min_value, max_value = data_window
+        elif data_window is not None:
+            try:
+                start = float(existing_window.get("start"))
+                end = float(existing_window.get("end"))
+            except (TypeError, ValueError):
+                start, end, min_value, max_value = data_window
+            else:
+                min_value = float(existing_window.get("min", data_window[2]))
+                max_value = float(existing_window.get("max", data_window[3]))
+        else:
+            start = float(existing_window.get("start", 0.0) or 0.0)
+            end = float(existing_window.get("end", max(start + 1.0, 1.0)) or max(start + 1.0, 1.0))
+            min_value = float(existing_window.get("min", min(start, 0.0)) or min(start, 0.0))
+            max_value = float(existing_window.get("max", max(end, 1.0)) or max(end, 1.0))
+        if end <= start:
+            end = start + 1.0
+        entry["window"] = {
+            "start": start,
+            "end": end,
+            "min": min_value,
+            "max": max_value,
+        }
+        channels.append(entry)
+
+    omero["channels"] = channels
+    omero["name"] = str(omero.get("name") or metadata.get("name") or name)
+    rdefs = omero.get("rdefs") if isinstance(omero.get("rdefs"), dict) else {}
+    rdefs.setdefault("defaultT", int(metadata.get("default_t", 0) or 0))
+    rdefs.setdefault("defaultZ", int(metadata.get("default_z", 0) or 0))
+    rdefs.setdefault("model", "color")
+    omero["rdefs"] = rdefs
+    description = _metadata_description(metadata)
+    if description:
+        omero["description"] = description
+    return omero
+
+
 def _write_zarr_field(
     result_channels: list,
     metadata: dict,
@@ -1021,16 +1163,14 @@ def _write_zarr_field(
 
     field_group.attrs["multiscales"] = multiscales
 
-    # Copy omero metadata from source
-    omero = orig_field_attrs.get("omero")
-    if omero is not None:
-        omero = dict(omero)
-        description = _metadata_description(metadata)
-        if description:
-            omero["description"] = description
-        field_group.attrs["omero"] = omero
-    elif _metadata_description(metadata):
-        field_group.attrs["omero"] = {"description": _metadata_description(metadata)}
+    # Copy source rendering metadata when available, but always make the block
+    # complete enough for the BIOMERO Zarr registrar.
+    field_group.attrs["omero"] = _hcs_field_omero_metadata(
+        metadata,
+        stack,
+        name=f"{row}/{col}/{field}",
+        source_omero=orig_field_attrs.get("omero"),
+    )
 
 
 def _projection_output_suffix(projection: str) -> str:
@@ -1043,6 +1183,57 @@ def _projection_output_suffix(projection: str) -> str:
     if projection == "mean":
         return "_mean-proj"
     return ""
+
+
+def _project_result_for_save(result: dict, projection: str) -> dict:
+    """Return a copy of a result with Z projected channels and metadata."""
+    projection_key = str(projection or "none").strip().lower()
+    projectors = {
+        "mip": lambda ch: ch.max(axis=0),
+        "max": lambda ch: ch.max(axis=0),
+        "sum": lambda ch: ch.astype(np.float32).sum(axis=0),
+        "mean": lambda ch: ch.astype(np.float32).mean(axis=0),
+    }
+    projector = projectors.get(projection_key)
+    if projector is None:
+        return result
+    projected = dict(result)
+    projected["channels"] = [projector(ch) for ch in result["channels"]]
+    if result.get("source_channels"):
+        projected["source_channels"] = [projector(ch) for ch in result["source_channels"]]
+    metadata = dict(projected.get("metadata") or {})
+    metadata["size_z"] = 1
+    metadata["default_z"] = 0
+    metadata["projection"] = "mip" if projection_key == "max" else projection_key
+    projected["metadata"] = metadata
+    return projected
+
+
+def _save_wrapper_result(
+    result: dict,
+    tmp_work: Path,
+    stem: str,
+    *,
+    projection: str,
+    output_format: str,
+    output_dtype: str,
+) -> tuple[str, Path]:
+    """Save a non-streamed wrapper result in the requested output format."""
+    projection_key = str(projection or "none").strip().lower()
+    is_3d = bool(result.get("channels")) and result["channels"][0].ndim == 3
+    project_output = is_3d and projection_key in {"mip", "max", "sum", "mean"}
+    suffix = _projection_output_suffix("mip" if projection_key == "max" else projection_key) if project_output else ""
+    save_payload = _project_result_for_save(result, projection_key) if project_output else result
+    output_format_key = str(output_format or "ome-zarr").strip().lower().replace("_", "-")
+    if output_format_key == "ome-zarr":
+        out_name = f"{stem}_decon{suffix}.ome.zarr"
+        tmp_file = tmp_work / out_name
+        save_result_ome_zarr(save_payload, tmp_file, output_dtype=output_dtype)
+    else:
+        out_name = f"{stem}_decon{suffix}.ome.tiff"
+        tmp_file = tmp_work / out_name
+        save_result(save_payload, str(tmp_file), output_dtype=output_dtype)
+    return out_name, tmp_file
 
 
 def _run_plate_zarr(
@@ -1923,41 +2114,16 @@ def main(argv):
                     print("\n  Image metrics skipped (disabled).")
 
                 stem = _stem(img_resource.filename)
-                is_3d = result["channels"][0].ndim == 3
-
                 t_save = time.time()
-                if projection in ("mip", "sum") and is_3d:
-                    out_name = f"{stem}_decon{_projection_output_suffix(projection)}.ome.tiff"
-                    tmp_file = tmp_work / out_name
-                    proj_result = dict(result)
-                    if projection == "mip":
-                        proj_result["channels"] = [
-                            ch.max(axis=0) for ch in result["channels"]
-                        ]
-                        if result.get("source_channels"):
-                            proj_result["source_channels"] = [
-                                ch.max(axis=0) for ch in result["source_channels"]
-                            ]
-                    else:  # sum
-                        proj_result["channels"] = [
-                            ch.astype(np.float32).sum(axis=0) for ch in result["channels"]
-                        ]
-                        if result.get("source_channels"):
-                            proj_result["source_channels"] = [
-                                ch.astype(np.float32).sum(axis=0) for ch in result["source_channels"]
-                            ]
-                    save_result(proj_result, str(tmp_file), output_dtype=output_dtype)
-                    print(f"  Saved {projection.upper()}: {out_name}")
-                else:
-                    if output_format == "ome-zarr":
-                        out_name = f"{stem}_decon.ome.zarr"
-                        tmp_file = tmp_work / out_name
-                        save_result_ome_zarr(result, tmp_file, output_dtype=output_dtype)
-                    else:
-                        out_name = f"{stem}_decon.ome.tiff"
-                        tmp_file = tmp_work / out_name
-                        save_result(result, str(tmp_file), output_dtype=output_dtype)
-                    print(f"  Saved: {out_name}")
+                out_name, tmp_file = _save_wrapper_result(
+                    result,
+                    tmp_work,
+                    stem,
+                    projection=projection,
+                    output_format=output_format,
+                    output_dtype=output_dtype,
+                )
+                print(f"  Saved: {out_name}")
                 save_time = time.time() - t_save
 
                 # Move only the deconvolved output to the output folder.

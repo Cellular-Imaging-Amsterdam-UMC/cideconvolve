@@ -4875,58 +4875,95 @@ class _IterationMovieRecorder:
                         self.progress_cb(f"  Movie encoded frame {movie_frame_idx}/{total_frames}")
         self.progress_cb(f"Movie saved: {output}")
 
-    def encode_downsized_gif(self, *, scale: float = 0.5, colors: int = 128) -> Optional[Path]:
-        """Convert the recorded MP4 to an optimised animated GIF.
+    def encode_gif(self, *, scale: float = 0.5, colors: int = 256) -> Optional[Path]:
+        """Render an animated GIF from staged movie frames.
 
         Parameters
         ----------
         scale:
-            Spatial scale factor applied to each frame (default 0.5 = half size).
+            Spatial scale factor applied to each frame. Use 0.5 for half size or
+            1.0 for full movie size.
         colors:
-            Palette size for colour quantisation (2–256).  Fewer colours compress
-            better; 128 is a good balance for microscopy images.  The palette is
-            derived from the first frame and reused for all subsequent frames so
-            that LZW can exploit inter-frame similarity.
+            Palette size for colour quantisation (2-256). GIF is palette based,
+            so 256 colors plus dithering gives the best microscopy appearance.
         """
         try:
-            import imageio.v2 as imageio
             from PIL import Image
         except ImportError as exc:
             raise RuntimeError(
-                "GIF export requires imageio and Pillow. Install the GUI requirements again."
+                "GIF export requires Pillow. Install the GUI requirements again."
             ) from exc
 
         output = Path(self.output_path)
-        if not output.exists():
-            return None
         gif_path = output.with_suffix(".gif")
-        self.progress_cb(f"Creating half-size GIF from MP4: {gif_path}")
-        reader = imageio.get_reader(str(output))
-        meta = reader.get_meta_data() or {}
-        fps = float(meta.get("fps") or self.fps or 10)
+        scale = min(max(float(scale), 0.1), 1.0)
+        colors = min(max(int(colors), 2), 256)
+        size_label = "full-size" if scale >= 0.999 else f"{scale:.2g}x-size"
+        if abs(scale - 0.5) < 1e-6:
+            size_label = "half-size"
+        self.progress_cb(f"Creating high-quality {size_label} GIF: {gif_path}")
+
+        frame_count = max(self.iter_counts.values(), default=0)
+        if frame_count <= 0:
+            return None
+        frame_indices = self._sequence_frame_indices(frame_count)
+        layouts = self._layout_sequence()
+        reference_rgb = self._difference_reference_rgb(frame_count)
+        sample_shapes = [
+            self._render_frame(frame_indices[0], frame_count, layout, reference_rgb).shape[:2]
+            for layout in layouts
+        ]
+        target_shape = (
+            max(shape[0] for shape in sample_shapes),
+            max(shape[1] for shape in sample_shapes),
+        )
+        frame_plan = [(layout, frame_idx) for layout in layouts for frame_idx in frame_indices]
+
+        def _scaled_image(rgb: np.ndarray) -> Image.Image:
+            image = Image.fromarray(np.asarray(rgb[:, :, :3], dtype=np.uint8), mode="RGB")
+            if scale < 0.999:
+                w, h = image.size
+                image = image.resize(
+                    (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                    Image.Resampling.LANCZOS,
+                )
+            return image
+
+        # Build a single palette from sampled frames, not just the first frame.
+        # This keeps colors stable while avoiding the flat, posterized look of
+        # 128-color first-frame quantisation.
+        sample_count = min(40, len(frame_plan))
+        sample_step = max(1, len(frame_plan) // max(sample_count, 1))
+        palette_samples: list[Image.Image] = []
+        for sample_idx, (layout, frame_idx) in enumerate(frame_plan[::sample_step][:sample_count], start=1):
+            rgb = self._render_frame(frame_idx, frame_count, layout, reference_rgb, target_shape)
+            sample = _scaled_image(rgb)
+            if sample.width > 360:
+                new_h = max(1, int(round(sample.height * (360 / sample.width))))
+                sample = sample.resize((360, new_h), Image.Resampling.BILINEAR)
+            palette_samples.append(sample)
+            if sample_idx % 10 == 0:
+                self.progress_cb(f"  GIF palette sampled frame {sample_idx}/{sample_count}")
+        if not palette_samples:
+            return None
+        palette_w = max(img.width for img in palette_samples)
+        palette_h = sum(img.height for img in palette_samples)
+        contact = Image.new("RGB", (palette_w, palette_h), (0, 0, 0))
+        y = 0
+        for img in palette_samples:
+            contact.paste(img, (0, y))
+            y += img.height
+        palette_image = contact.quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+
         # GIF duration is in milliseconds per frame
-        duration_ms = int(round(1000.0 / max(fps, 1e-6)))
+        duration_ms = int(round(1000.0 / max(float(self.fps), 1e-6)))
         frames: list = []
-        palette_image: Optional[Image.Image] = None
-        frame_idx = 0
-        try:
-            for frame in reader:
-                frame_idx += 1
-                rgb = np.asarray(frame[:, :, :3], dtype=np.uint8)
-                h, w = rgb.shape[:2]
-                new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-                resized = Image.fromarray(rgb).resize(new_size, Image.Resampling.LANCZOS)
-                if palette_image is None:
-                    # Derive palette from first frame; reuse for all frames so
-                    # the LZW stream can compress repeated colour indices well.
-                    palette_image = resized.quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=0)
-                    frames.append(palette_image)
-                else:
-                    frames.append(resized.quantize(palette=palette_image, dither=0))
-                if frame_idx % 25 == 0:
-                    self.progress_cb(f"  GIF converted frame {frame_idx}")
-        finally:
-            reader.close()
+        for out_idx, (layout, frame_idx) in enumerate(frame_plan, start=1):
+            rgb = self._render_frame(frame_idx, frame_count, layout, reference_rgb, target_shape)
+            image = _scaled_image(rgb)
+            frames.append(image.quantize(palette=palette_image, dither=Image.Dither.FLOYDSTEINBERG))
+            if out_idx % 25 == 0 or out_idx == len(frame_plan):
+                self.progress_cb(f"  GIF converted frame {out_idx}/{len(frame_plan)}")
 
         if not frames:
             return None
@@ -4937,10 +4974,15 @@ class _IterationMovieRecorder:
             append_images=frames[1:],
             loop=0,
             duration=duration_ms,
-            optimize=True,
+            disposal=2,
+            optimize=False,
         )
         self.progress_cb(f"GIF saved: {gif_path}")
         return gif_path
+
+    def encode_downsized_gif(self, *, scale: float = 0.5, colors: int = 256) -> Optional[Path]:
+        """Backward-compatible wrapper for older call sites."""
+        return self.encode_gif(scale=scale, colors=colors)
 
     def close(self, *, remove_output: bool = False) -> None:
         if self._closed:
@@ -5024,7 +5066,8 @@ def _deconvolve_channel_stacks(
             f"({movie_recorder.projection}, {movie_recorder.fps} fps)"
         )
         if movie_params.get("create_gif"):
-            _progress("Movie GIF export enabled: half-size animated GIF will be created after MP4")
+            gif_size = str(movie_params.get("gif_size") or "Half size").strip()
+            _progress(f"Movie GIF export enabled: {gif_size.lower()} animated GIF will be created after MP4")
 
         # Check whether the image will be tiled — movie is incompatible with tiling.
         # Do this early so the user gets a clear error before any computation starts.
@@ -5221,7 +5264,9 @@ def _deconvolve_channel_stacks(
                 raise RuntimeError("Stopped by user")
             movie_recorder.encode()
             if movie_params.get("create_gif"):
-                movie_recorder.encode_downsized_gif(scale=0.5)
+                gif_size = str(movie_params.get("gif_size") or "Half size").strip().lower()
+                gif_scale = 1.0 if gif_size.startswith("full") else 0.5
+                movie_recorder.encode_gif(scale=gif_scale, colors=256)
     except Exception:
         if movie_recorder is not None:
             movie_recorder.close(remove_output=True)
@@ -6555,7 +6600,7 @@ def _batch_shape_label(metadata: dict) -> str:
         y = int(metadata.get("size_y", 0))
         x = int(metadata.get("size_x", 0))
         if y and x:
-            return f"T{t} C{c} Z{z} {y}x{x}"
+            return f"T={t} C={c} Z={z} {y}x{x}"
     except Exception:
         pass
     return ""
@@ -6772,7 +6817,7 @@ class _BatchDeconvolveWorker(QThread):
                         self._emit_item(
                             index,
                             progress=min(98, int(done * 100 / total)),
-                            message=f"Processing tile {tile_index}/{tile_count} (T{timepoint} C{channel})",
+                            message=f"Processing tile {tile_index}/{tile_count} (T={timepoint} C={channel})",
                         )
                     elif event == "pyramid_start":
                         self._emit_item(index, progress=99, message="Building pyramid")
@@ -7972,8 +8017,16 @@ class DeconvolveCIWindow(QMainWindow):
 
         self._cb_movie_gif = QCheckBox()
         self._cb_movie_gif.setChecked(False)
-        self._cb_movie_gif.setToolTip("After the MP4 is written, also create a half-size animated GIF next to it.")
-        movie_layout.addRow("Also GIF 1/2 size:", self._cb_movie_gif)
+        self._cb_movie_gif.setToolTip("After the MP4 is written, also create a high-quality animated GIF next to it.")
+        movie_layout.addRow("Also GIF:", self._cb_movie_gif)
+
+        self._movie_gif_size_combo = NoWheelComboBox()
+        self._movie_gif_size_combo.addItems(["Half size", "Full size"])
+        self._movie_gif_size_combo.setCurrentText("Half size")
+        self._movie_gif_size_combo.setToolTip(
+            "Half size keeps GIF files smaller. Full size keeps the MP4 dimensions and can be much larger."
+        )
+        movie_layout.addRow("GIF size:", self._movie_gif_size_combo)
 
         self._movie_layout_combo = NoWheelComboBox()
         self._movie_layout_combo.addItems(["Standard", "Split-screen", "Standard + split-screen"])
@@ -9946,6 +9999,7 @@ class DeconvolveCIWindow(QMainWindow):
                 "fps": self._sp_movie_fps.value(),
                 "hold_endpoints": self._cb_movie_hold.isChecked(),
                 "create_gif": self._cb_movie_gif.isChecked(),
+                "gif_size": self._movie_gif_size_combo.currentText(),
                 "layout_mode": self._movie_layout_combo.currentText(),
                 "difference_inset": self._movie_inset_combo.currentText(),
                 "title_text": self._le_movie_title.text().strip(),
@@ -10176,6 +10230,8 @@ class DeconvolveCIWindow(QMainWindow):
             try:
                 import imageio.v2  # noqa: F401
                 import imageio_ffmpeg  # noqa: F401
+                if movie_params.get("create_gif"):
+                    from PIL import Image  # noqa: F401
             except ImportError:
                 self._end_progress()
                 self._monitor_bar.set_active(False)
@@ -10191,9 +10247,9 @@ class DeconvolveCIWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Movie Export",
-                    "Movie export requires imageio and imageio-ffmpeg.\n\n"
+                    "Movie export requires imageio, imageio-ffmpeg, and Pillow for GIF output.\n\n"
                     "Install the GUI requirements again, or run:\n"
-                    "  pip install \"imageio[ffmpeg]\"",
+                    "  pip install \"imageio[ffmpeg]\" pillow",
                 )
                 return
         # Clear charts and live-update state for a fresh run
@@ -10465,7 +10521,7 @@ class DeconvolveCIWindow(QMainWindow):
         stem = self._input_path.stem if self._input_path else "deconvolved"
         method = self._method_combo.currentText()
         niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
-        base = f"{_safe_filename_stem(stem)}_{method}_{niter_text}i_T{current_t:03d}"
+        base = f"{_safe_filename_stem(stem)}_{method}_{niter_text}i_T{current_t + 1:03d}"
         projection_key = str(projection or "Stack").strip().lower()
         if projection_key and projection_key not in {"org", "stack"}:
             return f"{base}_{_safe_filename_stem(projection_key)}"
@@ -10738,7 +10794,7 @@ class DeconvolveCIWindow(QMainWindow):
 
         stem = _safe_filename_stem(self._input_path.stem if self._input_path else self._file_label.text())
         if self._viewer.has_time_axis():
-            stem = f"{stem}_T{current_t:03d}"
+            stem = f"{stem}_T{current_t + 1:03d}"
         suggested = f"{stem}.png"
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -10790,7 +10846,7 @@ class DeconvolveCIWindow(QMainWindow):
             return
         stem = _safe_filename_stem(self._input_path.stem if self._input_path else self._file_label.text())
         if self._viewer.has_time_axis():
-            stem = f"{stem}_T{current_t:03d}"
+            stem = f"{stem}_T{current_t + 1:03d}"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Comparison View PNG",
@@ -11012,6 +11068,7 @@ class DeconvolveCIWindow(QMainWindow):
             "movie_fps": self._sp_movie_fps.value() if self._movie_available else 10,
             "movie_hold_endpoints": self._cb_movie_hold.isChecked() if self._movie_available else False,
             "movie_create_gif": self._cb_movie_gif.isChecked() if self._movie_available else False,
+            "movie_gif_size": self._movie_gif_size_combo.currentText() if self._movie_available else "Half size",
             "movie_layout_mode": self._movie_layout_combo.currentText() if self._movie_available else "Standard",
             "movie_difference_inset": self._movie_inset_combo.currentText() if self._movie_available else "None",
             "movie_title_text": self._le_movie_title.text() if self._movie_available else "",
@@ -11143,6 +11200,7 @@ class DeconvolveCIWindow(QMainWindow):
                 self._cb_movie_hold.setChecked(bool(data["movie_hold_endpoints"]))
             if data.get("movie_create_gif") is not None:
                 self._cb_movie_gif.setChecked(bool(data["movie_create_gif"]))
+            _combo(self._movie_gif_size_combo, "movie_gif_size")
             _combo(self._movie_layout_combo, "movie_layout_mode")
             _combo(self._movie_inset_combo, "movie_difference_inset")
             _line(self._le_movie_title, "movie_title_text")

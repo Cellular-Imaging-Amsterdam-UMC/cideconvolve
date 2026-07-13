@@ -12,6 +12,7 @@ import logging
 import math
 import shutil
 import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Protocol, Sequence
@@ -25,6 +26,7 @@ from core._meta_helpers import (
 )
 
 log = logging.getLogger(__name__)
+_OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
 
 
 def _release_torch_cuda_cache() -> None:
@@ -275,6 +277,101 @@ def _metadata_warnings(metadata: dict[str, Any]) -> list[str]:
     if isinstance(raw, list):
         return [str(item) for item in raw if str(item).strip()]
     return []
+
+
+def _normalise_ome_unit(value: Any) -> Any:
+    text = str(value or "").strip()
+    if text in ("µm", "\xb5m", "痠"):
+        return "micrometer"
+    return value
+
+
+def _parse_ome_xml_sidecar(path: Path) -> dict[str, Any]:
+    """Extract reader-relevant OME metadata from an OME-Zarr sidecar."""
+    ome_xml = path / "OME" / "METADATA.ome.xml"
+    if not ome_xml.is_file():
+        return {}
+    try:
+        root = ET.parse(ome_xml).getroot()
+    except Exception as exc:
+        log.warning("Could not parse OME-Zarr sidecar metadata %s: %s", ome_xml, exc)
+        return {}
+
+    ns = {"ome": _OME_NS}
+    meta: dict[str, Any] = {}
+    image = root.find(".//ome:Image", ns)
+    if image is not None and image.get("Name"):
+        meta["name"] = image.get("Name")
+    obj = root.find(".//ome:Instrument/ome:Objective", ns)
+    if obj is not None:
+        if obj.get("LensNA"):
+            meta["na"] = float(obj.get("LensNA"))
+        if obj.get("NominalMagnification"):
+            meta["magnification"] = float(obj.get("NominalMagnification"))
+        if obj.get("Immersion"):
+            meta["immersion"] = obj.get("Immersion")
+    objset = root.find(".//ome:Image/ome:ObjectiveSettings", ns)
+    if objset is not None and objset.get("RefractiveIndex"):
+        meta["refractive_index"] = float(objset.get("RefractiveIndex"))
+    pixels = root.find(".//ome:Image/ome:Pixels", ns)
+    if pixels is not None:
+        for dim in ("X", "Y", "Z"):
+            value = pixels.get(f"PhysicalSize{dim}")
+            if value:
+                meta[f"pixel_size_{dim.lower()}"] = float(value)
+        for dim in ("X", "Y", "Z", "C", "T"):
+            value = pixels.get(f"Size{dim}")
+            if value:
+                meta[f"size_{dim.lower()}"] = int(value)
+    channels = []
+    names = []
+    for index, ch in enumerate(root.findall(".//ome:Image/ome:Pixels/ome:Channel", ns)):
+        info: dict[str, Any] = {"name": str(ch.get("Name") or f"Ch{index}")}
+        names.append(info["name"])
+        if ch.get("ID"):
+            info["id"] = ch.get("ID")
+        for xml_key, meta_key in (
+            ("EmissionWavelength", "emission_wavelength"),
+            ("ExcitationWavelength", "excitation_wavelength"),
+            ("PinholeSize", "pinhole_size"),
+        ):
+            value = ch.get(xml_key)
+            if value:
+                info[meta_key] = float(value)
+        if ch.get("PinholeSizeUnit"):
+            info["pinhole_size_unit"] = _normalise_ome_unit(ch.get("PinholeSizeUnit"))
+        if ch.get("AcquisitionMode"):
+            info["acquisition_mode"] = ch.get("AcquisitionMode")
+        channels.append(info)
+    if channels:
+        meta["channels"] = channels
+        meta["channel_names"] = names
+    return meta
+
+
+def _merge_channel_metadata(base: dict[str, Any], overlay: dict[str, Any]) -> None:
+    """Merge per-channel metadata without losing rendering fields."""
+    overlay_channels = overlay.pop("channels", None)
+    overlay_names = overlay.pop("channel_names", None)
+    base.update({key: value for key, value in overlay.items() if value is not None})
+    if overlay_names:
+        base["channel_names"] = list(overlay_names)
+    if not overlay_channels:
+        return
+    channels = [dict(ch) if isinstance(ch, dict) else {} for ch in base.get("channels", [])]
+    if len(channels) < len(overlay_channels):
+        channels.extend({} for _ in range(len(overlay_channels) - len(channels)))
+    for idx, src in enumerate(overlay_channels):
+        if not isinstance(src, dict):
+            continue
+        merged = dict(channels[idx])
+        for key, value in src.items():
+            if value is not None:
+                merged[key] = value
+        if merged.get("color") is not None:
+            merged["color"] = _coerce_rgb(merged.get("color"))
+        channels[idx] = merged
+    base["channels"] = channels
 
 
 def _metadata_description(metadata: dict[str, Any]) -> str:
@@ -567,6 +664,9 @@ class ZarrRegionSource:
                     info["window_end"] = window.get("end")
                 channels.append(info)
             meta["channels"] = channels
+        sidecar = _parse_ome_xml_sidecar(self.path)
+        if sidecar:
+            _merge_channel_metadata(meta, sidecar)
         return meta
 
     def read_region(self, *, t: int, c: int, z: slice, y: slice, x: slice) -> np.ndarray:
@@ -1123,7 +1223,11 @@ class TiledOmeTiffSink:
                 float(value) for value in emission_wavelengths
             ]
             channel_meta["EmissionWavelengthUnit"] = emission_units
-        if excitation_wavelengths and all(value is not None for value in excitation_wavelengths):
+        if (
+            not self.metadata.get("_omit_ome_excitation_wavelength")
+            and excitation_wavelengths
+            and all(value is not None for value in excitation_wavelengths)
+        ):
             channel_meta["ExcitationWavelength"] = [
                 float(value) for value in excitation_wavelengths
             ]

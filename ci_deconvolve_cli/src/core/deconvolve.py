@@ -274,10 +274,16 @@ def _parse_ome_xml_root(root: ET.Element) -> dict[str, Any]:
     # --- Channels ---
     channels = root.findall(".//ome:Image/ome:Pixels/ome:Channel", ns)
     ch_info: list[dict[str, Any]] = []
+    channel_names: list[str] = []
     microscope_type = None
     for ch in channels:
         info: dict[str, Any] = {}
         info["id"] = ch.get("ID")
+        if ch.get("Name"):
+            info["name"] = ch.get("Name")
+            channel_names.append(str(ch.get("Name")))
+        else:
+            channel_names.append(f"Ch{len(channel_names)}")
         ex = ch.get("ExcitationWavelength")
         em = ch.get("EmissionWavelength")
         info["excitation_wavelength"] = float(ex) if ex else None
@@ -294,6 +300,8 @@ def _parse_ome_xml_root(root: ET.Element) -> dict[str, Any]:
         ch_info.append(info)
 
     meta["channels"] = ch_info
+    if channel_names:
+        meta["channel_names"] = channel_names
     meta["microscope_type"] = microscope_type or "widefield"
 
     map_values: dict[str, str] = {}
@@ -315,6 +323,46 @@ def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
 def _parse_ome_xml_text(xml_text: str) -> dict[str, Any]:
     """Parse embedded OME-XML text and extract microscopy metadata."""
     return _parse_ome_xml_root(ET.fromstring(xml_text))
+
+
+def _merge_channel_metadata(base: dict[str, Any], overlay: dict[str, Any]) -> None:
+    """Merge per-channel metadata while preserving existing rendering fields."""
+    overlay_channels = overlay.pop("channels", None)
+    overlay_names = overlay.pop("channel_names", None)
+    base.update({key: value for key, value in overlay.items() if value is not None})
+    if overlay_names:
+        base["channel_names"] = list(overlay_names)
+    if not overlay_channels:
+        return
+    channels = [dict(ch) if isinstance(ch, dict) else {} for ch in base.get("channels", [])]
+    if len(channels) < len(overlay_channels):
+        channels.extend({} for _ in range(len(overlay_channels) - len(channels)))
+    for idx, src in enumerate(overlay_channels):
+        if not isinstance(src, dict):
+            continue
+        merged = dict(channels[idx])
+        for key, value in src.items():
+            if value is not None:
+                merged[key] = value
+        channels[idx] = merged
+    base["channels"] = channels
+
+
+def _merge_ome_zarr_sidecar_metadata(meta: dict[str, Any], zarr_path: Path) -> None:
+    """Merge rich OME-XML sidecar metadata from an OME-Zarr store."""
+    ome_xml = zarr_path / "OME" / "METADATA.ome.xml"
+    if not ome_xml.is_file():
+        return
+    try:
+        sidecar = _parse_ome_xml(ome_xml)
+    except Exception as exc:
+        _add_metadata_warning(
+            meta,
+            f"Could not parse OME-Zarr sidecar metadata ({type(exc).__name__}: {exc}); using other metadata.",
+        )
+        logger.warning("Could not parse OME-Zarr sidecar metadata from %s: %s", ome_xml, exc)
+        return
+    _merge_channel_metadata(meta, sidecar)
 
 
 def _extract_bioio_metadata(img) -> dict[str, Any]:
@@ -538,6 +586,7 @@ def load_image(
                 "size_x": size_x,
                 "n_channels": size_c,
             })
+            _merge_ome_zarr_sidecar_metadata(meta, path)
             if node_meta.get("name"):
                 meta["name"] = node_meta["name"]
             transforms = node_meta.get("coordinateTransformations") or []
@@ -1629,11 +1678,15 @@ def save_result(
                 )
             if len(ex_wavelengths) == n_out_channels:
                 ome_meta["Channel"]["ExcitationWavelength"] = ex_wavelengths
-            elif ex_wavelengths:
+            else:
+                metadata["_omit_ome_excitation_wavelength"] = True
+            if ex_wavelengths and len(ex_wavelengths) != n_out_channels:
                 _add_metadata_warning(
                     metadata,
                     "Incomplete excitation wavelength metadata; omitted from OME-XML channel attributes.",
                 )
+        else:
+            metadata["_omit_ome_excitation_wavelength"] = True
 
         description = _metadata_description(metadata)
         if description:
