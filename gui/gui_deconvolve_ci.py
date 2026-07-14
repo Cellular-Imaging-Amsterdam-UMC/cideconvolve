@@ -1393,6 +1393,13 @@ def _runtime_environment_lines() -> list[str]:
                     f"  GPU {idx}       : {props.name} "
                     f"({_format_bytes(props.total_memory / (1024 * 1024))})"
                 )
+            from core.optimized_cuda import backend_status
+
+            optimized = backend_status()
+            state = "loaded" if optimized.get("loaded") else (
+                "compatible" if optimized.get("compatible") else "unavailable"
+            )
+            lines.append(f"  Optimized    : {state} ({optimized.get('reason', '?')})")
     except Exception as exc:
         lines.append(f"  PyTorch      : unavailable ({exc})")
     try:
@@ -5105,13 +5112,38 @@ def _deconvolve_channel_stacks(
         raise RuntimeError(
             f"Failed to load deconvolve_ci (torch DLL error).\n\n"
             f"Your PyTorch installation appears broken. Try:\n"
-            f"  conda install pytorch torchvision torchaudio "
-            f"pytorch-cuda=12.1 -c pytorch -c nvidia\n\n"
+            f"  python -m pip install torch==2.13.0+cu132 "
+            f"--index-url https://download.pytorch.org/whl/cu132\n\n"
             f"Original error: {exc}"
         ) from exc
 
     results: list[np.ndarray] = []
     n_channels = len(channels_zyx)
+    requested_backend = str(params.get("backend", "auto")).strip().lower()
+    if requested_backend in {"auto", "optimized_cuda"}:
+        import torch as _torch
+
+        if _torch.cuda.is_available():
+            from core.optimized_cuda import load_optimized_extension
+
+            _progress("Preparing compiled optimized CUDA backend…")
+            backend_started = time.perf_counter()
+            optimized_module = load_optimized_extension(
+                required=requested_backend == "optimized_cuda",
+            )
+            _torch.cuda.synchronize()
+            backend_prepare_s = time.perf_counter() - backend_started
+            params["_backend_prepare_s"] = backend_prepare_s
+            if optimized_module is not None:
+                _progress(
+                    f"  Optimized CUDA backend ready in {_format_duration(backend_prepare_s)} "
+                    f"({optimized_module.__name__})"
+                )
+            else:
+                _progress(
+                    f"  Optimized CUDA unavailable after {_format_duration(backend_prepare_s)}; "
+                    "Auto will use PyTorch CUDA."
+                )
     movie_recorder: Optional[_IterationMovieRecorder] = None
     movie_params = dict(params.get("movie") or {})
     if movie_params.get("enabled"):
@@ -5287,6 +5319,7 @@ def _deconvolve_channel_stacks(
                 pixel_size_xy=params["pixel_size_xy_nm"],
                 pixel_size_z=psf_pixel_size_z_nm if use_2d_wf_auto else params["pixel_size_z_nm"],
                 device=params["device"],
+                backend=params.get("backend", "auto"),
                 iteration_callback=_make_iter_cb(),
                 channel_index=ci,
             )
@@ -5313,6 +5346,9 @@ def _deconvolve_channel_stacks(
                     **common,
                 )
             iterations_used = out.get("iterations_used", niter)
+            params["_backend_used"] = out.get("backend", params.get("backend"))
+            params["_work_shape"] = out.get("work_shape")
+            params["_optimized_workspace_bytes"] = out.get("optimized_workspace_bytes", 0)
             effective = out.get("effective_parameters") or {}
             if effective.get("snr") is not None:
                 _progress(
@@ -5324,9 +5360,12 @@ def _deconvolve_channel_stacks(
                 )
             convergence_history = out.get("convergence") or []
             conv_text = f", last objective={convergence_history[-1]:.6g}" if convergence_history else ""
+            execution_text = f", backend={out.get('backend', 'unknown')}"
+            if int(out.get("tile_count", 1)) > 1:
+                execution_text += f", tiles={int(out['tile_count'])}"
             _progress(
                 f"  Ch{ci}: done in {_format_duration(time.time() - t_deconv)} "
-                f"(iterations used={iterations_used}{conv_text})"
+                f"(iterations used={iterations_used}{conv_text}{execution_text})"
             )
             results.append(_solver_output_to_zyx(out["result"]))
 
@@ -5524,7 +5563,7 @@ class _DeconvolveWorker(QThread):
             self.progress.emit(f"  Timepoint   : {self.t_index + 1}")
             self.progress.emit(f"  Method      : {self.params['method']}")
             self.progress.emit(f"  Iterations  : {', '.join(str(n) for n in self.params['niter_list'])}")
-            self.progress.emit(f"  Device      : {self.params['device'] or 'auto'}")
+            self.progress.emit(f"  Backend     : {self.params.get('backend', 'auto')}")
             self.progress.emit(f"  Background  : {self.params['background']}")
             self.progress.emit(f"  Offset      : {self.params['offset']}")
             self.progress.emit(f"  Start       : {self.params['start']}")
@@ -6125,6 +6164,7 @@ class _StreamingOmeroWorker(QThread):
                         else self.params["pixel_size_z_nm"]
                     ),
                     device=self.params["device"],
+                    backend=self.params.get("backend", "auto"),
                     tiling="none",
                     iteration_callback=None,
                     channel_index=ci,
@@ -6153,6 +6193,9 @@ class _StreamingOmeroWorker(QThread):
                     )
                 if _stopped():
                     raise RuntimeError("Stopped by user")
+                self.params["_backend_used"] = out.get("backend", self.params.get("backend"))
+                self.params["_work_shape"] = out.get("work_shape")
+                self.params["_optimized_workspace_bytes"] = out.get("optimized_workspace_bytes", 0)
                 result = out["result"]
                 del out
                 _release_cuda_memory()
@@ -6425,6 +6468,11 @@ def _streaming_output_metadata(base_metadata: dict, params: dict, *, source_name
         "snr_mode": params.get("snr_mode"),
         "snr_values": params.get("snr_values"),
         "acuity": params.get("acuity", 0.0),
+        "backend_requested": params.get("backend", "auto"),
+        "backend_used": params.get("_backend_used"),
+        "backend_prepare_seconds": params.get("_backend_prepare_s", 0.0),
+        "work_shape": params.get("_work_shape"),
+        "optimized_workspace_bytes": params.get("_optimized_workspace_bytes", 0),
         "tile_streaming": True,
     }
     return meta
@@ -6685,6 +6733,7 @@ def _run_streaming_deconvolution_job(
                 else params["pixel_size_z_nm"]
             ),
             device=params["device"],
+            backend=params.get("backend", "auto"),
             tiling="none",
             iteration_callback=None,
             channel_index=ci,
@@ -6713,6 +6762,9 @@ def _run_streaming_deconvolution_job(
             )
         if _stopped():
             raise RuntimeError("Stopped by user")
+        params["_backend_used"] = out.get("backend", params.get("backend"))
+        params["_work_shape"] = out.get("work_shape")
+        params["_optimized_workspace_bytes"] = out.get("optimized_workspace_bytes", 0)
         result = out["result"]
         del out
         _release_cuda_memory()
@@ -8038,8 +8090,13 @@ class DeconvolveCIWindow(QMainWindow):
         self._conv_combo.currentTextChanged.connect(self._on_conv_changed)
 
         self._device_combo = NoWheelComboBox()
-        self._device_combo.addItems(["auto", "cuda", "cpu"])
-        aml.addRow("Device:", self._device_combo)
+        self._device_combo.addItems([
+            "Auto",
+            "Optimized CUDA",
+            "PyTorch CUDA",
+            "CPU",
+        ])
+        aml.addRow("Backend:", self._device_combo)
 
         advanced_layout.addWidget(method_adv_group)
 
@@ -8429,8 +8486,9 @@ class DeconvolveCIWindow(QMainWindow):
         _set_field_tooltip(
             aml,
             self._device_combo,
-            "Processing device. `auto` chooses CUDA when available, otherwise CPU. Select "
-            "`cpu` if you want deterministic fallback or your GPU is too small.",
+            "Execution backend. Auto uses the compiled optimized CUDA backend when compatible, "
+            "then falls back to PyTorch CUDA or CPU. Optimized CUDA requires the compiled "
+            "direct-cuFFT backend; PyTorch CUDA bypasses it explicitly.",
         )
 
         _set_field_tooltip(
@@ -10222,8 +10280,14 @@ class DeconvolveCIWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _collect_params(self) -> dict:
-        device_text = self._device_combo.currentText()
-        device = None if device_text == "auto" else device_text
+        backend_label = self._device_combo.currentText()
+        backend_map = {
+            "Auto": ("auto", None),
+            "Optimized CUDA": ("optimized_cuda", "cuda"),
+            "PyTorch CUDA": ("pytorch_cuda", "cuda"),
+            "CPU": ("cpu", "cpu"),
+        }
+        backend, device = backend_map.get(backend_label, ("auto", None))
 
         bg_text = self._bg_combo.currentText()
         background: str | float = "auto"
@@ -10306,6 +10370,7 @@ class DeconvolveCIWindow(QMainWindow):
             "rel_threshold": self._sp_rel_thresh.value(),
             "check_every": self._sp_check_every.value(),
             "device": device,
+            "backend": backend,
             "na": self._sp_na.value(),
             "emission_wavelengths": em_list,
             "excitation_wavelengths": ex_list,
@@ -10355,6 +10420,9 @@ class DeconvolveCIWindow(QMainWindow):
             "rel_threshold": params.get("rel_threshold"),
             "check_every": params.get("check_every"),
             "two_d_mode": params.get("two_d_mode"),
+            "backend_requested": params.get("backend", "auto"),
+            "backend_used": params.get("_backend_used"),
+            "backend_prepare_seconds": params.get("_backend_prepare_s", 0.0),
             "two_d_wf_aggressiveness": params.get("two_d_wf_aggressiveness"),
         }
         channels_meta = [
@@ -11346,7 +11414,7 @@ class DeconvolveCIWindow(QMainWindow):
             "convergence": self._conv_combo.currentText(),
             "rel_threshold": self._sp_rel_thresh.value(),
             "check_every": self._sp_check_every.value(),
-            "device": self._device_combo.currentText(),
+            "backend": self._device_combo.currentText(),
             "na": self._sp_na.value(),
             "emission_wavelengths": self._le_emission.text(),
             "excitation_wavelengths": self._excitation_saved if not self._le_excitation.isEnabled() else self._le_excitation.text(),
@@ -11435,7 +11503,27 @@ class DeconvolveCIWindow(QMainWindow):
         _combo(self._conv_combo, "convergence")
         _spin(self._sp_rel_thresh, "rel_threshold")
         _spin(self._sp_check_every, "check_every")
-        _combo(self._device_combo, "device")
+        if "backend" in data:
+            saved_backend = str(data.get("backend", "auto")).strip()
+            backend_label = {
+                "auto": "Auto",
+                "Auto": "Auto",
+                "Auto — compiled optimized backend when compatible, otherwise PyTorch": "Auto",
+                "optimized_cuda": "Optimized CUDA",
+                "pytorch_cuda": "PyTorch CUDA",
+                "cpu": "CPU",
+            }.get(saved_backend, saved_backend)
+            self._device_combo.setCurrentText(backend_label)
+        else:
+            legacy_backend = {
+                "auto": "Auto",
+                "cuda": "PyTorch CUDA",
+                "cpu": "CPU",
+            }.get(
+                str(data.get("device", "auto")).strip().lower(),
+                "Auto",
+            )
+            self._device_combo.setCurrentText(legacy_backend)
         _spin(self._sp_na, "na")
         _line(self._le_emission, "emission_wavelengths")
         ex_val = data.get("excitation_wavelengths")

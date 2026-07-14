@@ -8,7 +8,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CLI_SRC = ROOT / "ci_deconvolve_cli" / "src"
 if str(CLI_SRC) not in sys.path:
-    sys.path.insert(0, str(CLI_SRC))
+    # The CLI package imports the repository's single shared ``core`` package.
+    sys.path.append(str(CLI_SRC))
 
 from ci_deconvolve import cli  # noqa: E402
 
@@ -108,8 +109,6 @@ def test_load_image_tracks_metadata_provenance(tmp_path):
     pytest.importorskip("torch")
     tifffile = pytest.importorskip("tifffile")
 
-    from core.deconvolve import load_image
-
     src = tmp_path / "meta.ome.tiff"
     ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
@@ -126,6 +125,8 @@ def test_load_image_tracks_metadata_provenance(tmp_path):
   </Image>
 </OME>"""
     tifffile.imwrite(src, np.ones((4, 5), dtype=np.uint16), description=ome_xml)
+
+    from core.deconvolve import load_image
 
     loaded = load_image(
         src,

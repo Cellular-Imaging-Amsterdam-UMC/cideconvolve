@@ -20,8 +20,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Building headless %IMAGE_NAME%:%VERSION% and %IMAGE_NAME%:latest
-docker build -t %IMAGE_NAME%:%VERSION% -t %IMAGE_NAME%:latest %* .
+echo Building CUDA 13.2 headless %IMAGE_NAME%:%VERSION% and %IMAGE_NAME%:latest
+docker build ^
+    %* ^
+    --build-arg PYTORCH_VERSION=2.13.0 ^
+    --build-arg PYTORCH_CUDA=cu132 ^
+    -t %IMAGE_NAME%:%VERSION% ^
+    -t %IMAGE_NAME%:latest ^
+    .
 if errorlevel 1 (
     popd >nul
     endlocal & exit /b 1

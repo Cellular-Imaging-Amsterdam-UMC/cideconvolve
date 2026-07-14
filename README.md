@@ -74,7 +74,7 @@ The standalone interactive GUI is the primary tool for exploratory deconvolution
 python gui/gui_deconvolve_ci.py
 ```
 
-The title bar shows the detected PyTorch version and GPU (e.g. `CI Deconvolve — torch 2.4.1 | NVIDIA RTX 4090 CUDA 12.6`).
+The title bar shows the detected PyTorch version and GPU (e.g. `CI Deconvolve — torch 2.13.0 | NVIDIA RTX 4090 CUDA 13.2`).
 
 #### GUI-only command-line flags
 
@@ -151,7 +151,7 @@ Drag-and-drop uses the same loading path as the Open menu.  Large pyramidal OMER
 | RI sample | `1.47` | editable spin box |
 
 #### Advanced parameters (collapsible)
-- **Method Tuning** — TV lambda, sparse-Hessian weight/reg, background mode/value, offset mode/value, prefilter sigma, convergence check interval, and device (`auto`, `cuda`, `cpu`).
+- **Method Tuning** — TV lambda, sparse-Hessian weight/reg, background mode/value, offset mode/value, prefilter sigma, convergence check interval, and backend (`Auto`, `Optimized CUDA`, `PyTorch CUDA`, `CPU`). Auto uses the compiled direct-cuFFT backend when compatible and otherwise falls back safely.
 - **2D Widefield Expert** — background estimator radius (`0.50 µm`) and auto background scale (`1.00`) for 2D widefield auto mode.
 - **Coverslip / Depth** — actual/design coverslip thickness, design immersion thickness, and particle depth.
 - **PSF Advanced** — pixel integration toggle, sub-pixel count, and pupil sampling density.
@@ -266,13 +266,18 @@ Computed on both input and output (≤ 32 Z-planes, ≤ 512 YX) and shown in the
 
 ### Installation
 
-**Requirements:** Python 3.10 or 3.11, PyTorch 2.4+ with CUDA.
+**Requirements:** Python 3.10 or 3.11 and a current NVIDIA driver. The default
+GPU environment uses PyTorch 2.13 with CUDA 13.2.
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-
 pip install -r requirements_gui.txt
 ```
+
+`requirements_gui.txt` installs exactly `torch==2.13.0+cu132`. CUDA 13.x needs
+an NVIDIA driver from the 580 series or newer; driver 595.45.04 or newer is
+recommended for full CUDA 13.2 support. The H100 NVL cluster driver 580.167.08
+uses CUDA 13.x minor-version compatibility and must pass the documented cluster
+smoke test before the CUDA 13.2 image is promoted there.
 
 The **Open OMERO…** button requires `omero-browser-qt`, which depends on **ZeroC ICE**.  ZeroC ICE is not on PyPI and must be installed from a pre-built wheel matching your Python version and platform before running `pip install -r requirements_gui.txt`.
 
@@ -320,7 +325,7 @@ The public CLI parameters are defined in `config.yaml` and exposed via `wrapper.
 | `--iterations` | `60` | RL iterations; comma-separated for per-channel |
 | `--convergence` | `auto` | Early stopping: `auto` or fixed iteration count: `fixed` |
 | `--rel_threshold` | `0.005` | Relative I-divergence change threshold for early stopping |
-| `--device` | `auto` | `auto`, `cpu`, or `cuda` |
+| `--device` | `auto` | `auto`, `cpu`, or `cuda`; automatic CUDA execution prefers the compatible optimized backend |
 | `--projection` | `none` | Z-projection: `none`, `mip`, `sum`, or `mean` |
 | `--output_format` | `ome-zarr` | `ome-tiff` or chunked multiscale `ome-zarr` |
 | `--output_dtype` | `float32` | `float32` for quantitative output, or globally scaled `uint16` to reduce size without clipping high values |
@@ -446,7 +451,28 @@ w_cideconvolve:<version>-jupyter
 w_cideconvolve:latest-jupyter
 ```
 
-The headless Dockerfile builds on Python 3.11 — no Java, no conda, no compilation step. Interface images are intentionally separate and larger because they add the Bilayers interface generator and the relevant UI runtime.
+The unqualified tags contain PyTorch 2.13 with CUDA 13.2. `builddocker.cmd` also
+builds temporary headless CUDA 13.0 fallback tags:
+
+```text
+w_cideconvolve:<version>-cu130
+w_cideconvolve:latest-cu130
+```
+
+Validate the local GPU runtime and the compiled backend for all three solvers with:
+
+```bash
+docker run --rm --gpus all --entrypoint python \
+    w_cideconvolve:<version> /app/cuda_smoke.py
+```
+
+The headless runtime is Python 3.11 with no Java, conda, compiler, or CUDA
+toolkit. A multi-stage builder uses the selected CUDA toolkit to compile native
+optimized kernels for SM 86, 89, 90, 100, and 120; only the resulting extension
+is copied into the slim runtime. Users therefore need only a compatible NVIDIA
+driver and container runtime. Interface images are intentionally separate and
+larger because they add the Bilayers interface generator and the relevant UI
+runtime.
 
 **Prerequisites:**
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) for GPU pass-through
@@ -548,6 +574,19 @@ docker run --rm --gpus all \
 3. On submission, BIOMERO pulls the Singularity image from Docker Hub, transfers the selected images, and executes the workflow on the cluster.
 
 4. Results (deconvolved images, benchmark montages, metrics CSV) are automatically uploaded back into OMERO.
+
+Before selecting the CUDA 13.2 tag on a cluster, run the image through the same
+Apptainer/Singularity path used by BIOMERO:
+
+```bash
+apptainer exec --nv docker://cellularimagingcf/w_cideconvolve:<version> \
+    python /app/cuda_smoke.py
+```
+
+The output must report the expected PyTorch/CUDA versions, native `sm_90` on
+H100/H200, a successful FFT round trip, and passing `ci_rl`, `ci_rl_tv`, and
+`ci_sparse_hessian` checks. Use `<version>-cu130` if the cu132 image reports that
+a newer driver or CUDA feature is required.
 
 > For full setup instructions see the
 > [BIOMERO documentation](https://nl-bioimaging.github.io/biomero/)

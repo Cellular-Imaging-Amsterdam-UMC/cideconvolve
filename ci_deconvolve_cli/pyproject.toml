@@ -7,7 +7,7 @@ name = "ci-deconvolve"
 dynamic = ["version"]
 description = "Focused command-line CI-RL deconvolution for OME-TIFF and OME-Zarr images."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = "MIT"
 authors = [
   { name = "NL-BioImaging contributors" },
@@ -17,6 +17,7 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Image Processing",
 ]
@@ -34,13 +35,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "build", "twine"]
+optimized = ["ninja>=1.11"]
 
 [project.scripts]
 ci_deconvolve = "ci_deconvolve.cli:main"
 
 [tool.setuptools]
-packages = ["ci_deconvolve", "core", "cideconvolve_io"]
-package-dir = { "ci_deconvolve" = "src/ci_deconvolve", "core" = "src/core", "cideconvolve_io" = "../cideconvolve_io" }
+packages = ["ci_deconvolve", "core", "core.optimized_cuda", "core.optimized_cuda.cuda", "cideconvolve_io"]
+package-dir = { "ci_deconvolve" = "src/ci_deconvolve", "core" = "../core", "cideconvolve_io" = "../cideconvolve_io" }
+
+[tool.setuptools.package-data]
+"core.optimized_cuda.cuda" = ["*.cpp", "*.cu"]
 
 [tool.setuptools.dynamic]
 version = { file = "version.txt" }

@@ -13,14 +13,18 @@ build that matches your system before running `ci_deconvolve`.
 Examples:
 
 ```bash
-pip install torch
+# CPU
+pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+
+# CUDA 13.0 fallback
+pip install torch==2.13.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+
+# CUDA 13.2 default
+pip install torch==2.13.0+cu132 --index-url https://download.pytorch.org/whl/cu132
 ```
 
-or install a CUDA build using the command from:
-
-```text
-https://pytorch.org/get-started/locally/
-```
+CUDA 13.2 requires an NVIDIA 580-series driver or newer. Driver 595.45.04 or
+newer is recommended for full CUDA 13.2 support.
 
 ## Install
 
@@ -38,6 +42,16 @@ pip install ci-deconvolve
 
 The package depends on `ome-zarr` for OME-Zarr reading and `zarr>=2.16,<4` for
 writing QuPath- and OMERO-compatible OME-Zarr output.
+
+To allow a local source build of the optional optimized CUDA backend, install:
+
+```bash
+pip install "ci-deconvolve[optimized]"
+```
+
+This still requires a CUDA Toolkit matching `torch.version.cuda` and a supported
+C++ compiler. Without a compatible compiled backend, automatic selection safely
+uses PyTorch CUDA or CPU.
 
 ## Usage
 
@@ -66,6 +80,13 @@ Only these inputs are accepted:
 - `.zarr` / `.ome.zarr` directories
 
 The CLI always runs `ci_rl`. It intentionally has no `--method` option.
+
+## Shared numerical core
+
+The CLI wheel packages the repository's main `core` implementation; there is no
+separate CLI copy of the CI-RL algorithm. The public CLI remains deliberately
+limited to `ci_rl`, while fixes to the shared solver and image I/O now reach the
+GUI, Docker images, and PyPI wheel from one source tree.
 
 ## Examples
 
@@ -127,7 +148,7 @@ does not process plate fields.
 | `--t-stop N` | `0` | Last T frame to save, using 1-based inclusive indexing. `0` means final frame. |
 | `--t-step N` | `1` | Save every Nth T frame in the selected range. |
 | `--iterations N[,N...]` | `40` | CI-RL iteration count. A comma- or semicolon-separated list applies per channel, with the last value reused for extra channels. |
-| `--device auto\|cpu\|cuda` | `auto` | Compute device. `auto` lets PyTorch choose CUDA when available, otherwise CPU. |
+| `--device auto\|cpu\|cuda` | `auto` | Compute device. `auto` prefers compatible optimized CUDA, then PyTorch CUDA, then CPU; `cuda` permits optimized CUDA with PyTorch fallback. |
 | `-v`, `--verbose` | off | Enable INFO logging from the CLI and core deconvolution code. |
 
 ### CI-RL Solver

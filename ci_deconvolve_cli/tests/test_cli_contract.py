@@ -8,7 +8,15 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 CLI_SRC = ROOT / "src"
 if str(CLI_SRC) not in sys.path:
-    sys.path.insert(0, str(CLI_SRC))
+    # The wheel maps ``core`` to the repository's single shared implementation.
+    sys.path.append(str(CLI_SRC))
+
+
+def test_cli_uses_single_shared_core_source():
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert '"core" = "../core"' in pyproject
+    assert not list((ROOT / "src" / "core").glob("*.py"))
 
 from ci_deconvolve import __version__
 from ci_deconvolve.cli import _apply_projection, _write_manifest

@@ -17,9 +17,9 @@
     <section class="wrap split">
       <div>
         <h2>Install and run</h2>
-        <pre class="code-block"><code>pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-pip install -r requirements_gui.txt
+        <pre class="code-block"><code>pip install -r requirements_gui.txt
 python gui/gui_deconvolve_ci.py</code></pre>
+        <div class="callout"><span class="callout-label">CUDA</span> The default environment uses PyTorch 2.13 with CUDA 13.2. NVIDIA driver 595.45.04 or newer is recommended.</div>
         <div class="callout"><span class="callout-label">Optional</span> Add <code>--movie</code> to expose iteration movie export.</div>
       </div>
       <div class="media-frame"><img src="screenshots/gui_deconvolve_ci.png" alt="CIDeconvolve GUI"></div>

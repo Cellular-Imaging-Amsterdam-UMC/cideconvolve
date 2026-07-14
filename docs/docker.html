@@ -22,9 +22,9 @@
         <pre class="code-block"><code>.\builddocker.cmd
 .\builddocker_gradio.cmd
 .\builddocker_jupyter.cmd</code></pre>
-        <p class="muted">Tags are read from <code>version.txt</code>. The default <code>latest</code> tag remains the headless workflow image.</p>
+        <p class="muted">Tags are read from <code>version.txt</code>. Unqualified tags use PyTorch 2.13 with CUDA 13.2. The headless build also creates <code>-cu130</code> fallback tags for clusters undergoing driver validation. A multi-stage builder compiles the optimized backend for SM 86, 89, 90, 100, and 120; the slim runtime contains the extension but no toolkit or compiler. Run <code>python /app/cuda_smoke.py</code> with GPU passthrough before promoting either image; the smoke test requires the optimized backend for all three solvers.</p>
       </div>
-      <div class="callout"><span class="callout-label">GPU note</span> Install NVIDIA Container Toolkit or enable GPU support in Docker Desktop. Omit <code>--gpus all</code> for CPU-only runs.</div>
+      <div class="callout"><span class="callout-label">GPU note</span> Install NVIDIA Container Toolkit or enable GPU support in Docker Desktop. Driver 595.45.04 or newer is recommended for CUDA 13.2; CUDA 13.x compatibility on older 580-series cluster drivers must be validated before deployment. Omit <code>--gpus all</code> for CPU-only runs.</div>
     </section>
   </main>
   <footer class="site-footer"><a href="bilayers.html">Bilayers launcher</a> · <a href="omero.html">OMERO/BIOMERO</a></footer>

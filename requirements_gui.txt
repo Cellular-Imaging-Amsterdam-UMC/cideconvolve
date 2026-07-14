@@ -3,9 +3,11 @@
 # Python 3.11 recommended!!
 # ===========================================================================
 
-# PyTorch with CUDA 12.6 support
---extra-index-url https://download.pytorch.org/whl/cu126
-torch>=2.4
+# PyTorch 2.13 with the CUDA 13.2 runtime.  The local version suffix prevents
+# pip from silently selecting the default cu130 wheel from PyPI.
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.13.0+cu132
+ninja>=1.11
 
 # Core
 numpy>=1.26,<3

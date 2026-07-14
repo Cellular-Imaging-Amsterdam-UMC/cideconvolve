@@ -5,8 +5,10 @@ torch = pytest.importorskip("torch")
 
 from core.deconvolve import generate_psf
 from core.deconvolve_ci import (
+    _MAX_OPTIMIZED_CONTEXTS,
     _ci_deconvolve_tiled,
     _pick_dtype,
+    _scale_aware_auto_offset,
     ci_generate_psf,
     ci_rl_deconvolve,
     ci_sparse_hessian_deconvolve,
@@ -136,7 +138,7 @@ def test_release_cache_called_after_each_internal_tile(monkeypatch) -> None:
 
     monkeypatch.setattr("core.deconvolve_ci._release_cuda_cache", fake_release)
 
-    _ci_deconvolve_tiled(
+    out = _ci_deconvolve_tiled(
         np.ones((1, 12, 12), dtype=np.float32),
         np.ones((1, 1, 1), dtype=np.float32),
         n_tiles=4,
@@ -144,3 +146,45 @@ def test_release_cache_called_after_each_internal_tile(monkeypatch) -> None:
     )
 
     assert calls["count"] >= 4
+    np.testing.assert_array_equal(out["result"], np.ones((1, 12, 12), dtype=np.float32))
+
+
+def test_auto_offset_samples_large_volume_before_float64_percentiles(monkeypatch) -> None:
+    observed_sizes: list[int] = []
+    original_percentile = np.percentile
+
+    def recording_percentile(values, percentile, *args, **kwargs):
+        observed_sizes.append(np.asarray(values).size)
+        return original_percentile(values, percentile, *args, **kwargs)
+
+    monkeypatch.setattr(np, "percentile", recording_percentile)
+    image = np.linspace(0.0, 1000.0, 2_000_000, dtype=np.float32).reshape(20, 1000, 100)
+
+    offset = _scale_aware_auto_offset(image, None)
+
+    assert 0.0 < offset <= 5.0
+    assert observed_sizes
+    assert max(observed_sizes) <= 1_000_000
+
+
+def test_tiled_solver_groups_equal_geometries_for_single_arena_reuse() -> None:
+    shapes: list[tuple[int, ...]] = []
+
+    def solver(tile_img: np.ndarray, _psf: np.ndarray, **_kwargs):
+        shapes.append(tile_img.shape)
+        return {
+            "result": np.asarray(tile_img, dtype=np.float32),
+            "convergence": [],
+            "iterations_used": 1,
+        }
+
+    out = _ci_deconvolve_tiled(
+        np.ones((3, 120, 123), dtype=np.float32),
+        np.ones((3, 5, 5), dtype=np.float32),
+        n_tiles=9,
+        solver=solver,
+    )
+
+    assert out["tile_count"] == 9
+    assert shapes == sorted(shapes)
+    assert _MAX_OPTIMIZED_CONTEXTS == 1
