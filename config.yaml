@@ -6,7 +6,7 @@ citations:
 docker_image:
   org: cellularimagingcf
   name: w_cideconvolve
-  tag: latest
+  tag: v3.3.0
   platform: linux/amd64
 algorithm_folder_name: cideconvolve_inference
 exec_function:
