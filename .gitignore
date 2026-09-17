@@ -75,3 +75,6 @@ slurm_logs/
 launcher_settings.json
 gui/.last_settings.json
 gui/.gui_deconvolve_state.json
+
+# Local editable Q&A drafts
+q_and_a/

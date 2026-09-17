@@ -493,6 +493,7 @@ The return dictionary has the same structure as `ci_rl_deconvolve`, but the
 |---------|------------|
 | deconwolf | [github.com/elgw/deconwolf](https://github.com/elgw/deconwolf) |
 | DeconvolutionLab2 | [github.com/Biomedical-Imaging-Group/DeconvolutionLab2](https://github.com/Biomedical-Imaging-Group/DeconvolutionLab2) |
+| psf_generator | [github.com/Biomedical-Imaging-Group/psf_generator](https://github.com/Biomedical-Imaging-Group/psf_generator) |
 | sdeconv | [github.com/sylvainprigent/sdeconv](https://github.com/sylvainprigent/sdeconv) |
 
 ---

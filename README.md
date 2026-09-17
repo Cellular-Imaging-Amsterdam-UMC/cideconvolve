@@ -62,6 +62,17 @@ For full algorithmic details see [DECONVOLVE_CI.MD](docs/DECONVOLVE_CI.MD).
 
 ---
 
+## Third-Party Algorithm Acknowledgements
+
+CIDeconvolve's early prototype included selected source subsets from
+[psf_generator](https://github.com/Biomedical-Imaging-Group/psf_generator)
+and [sdeconv](https://github.com/sylvainprigent/sdeconv). The current core
+implementation is self-contained and does not import either package at
+runtime. See [DECONVOLVE_CI.MD](docs/DECONVOLVE_CI.MD) for related algorithm
+and source-code references.
+
+---
+
 ## GUI — Interactive Deconvolution (`gui_deconvolve_ci.py`)
 
 ![GUI Deconvolution Panel](docs/screenshots/gui_deconvolve_ci.png)
