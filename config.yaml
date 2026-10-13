@@ -94,6 +94,8 @@ outputs:
   type: measurement
   label: Benchmark Metrics
   description: Per-method timing and quality metrics in benchmark_metrics_*.csv in /data/out. Produced only in benchmark mode.
+  cli_tag: "None"
+  default: ""
   optional: true
   format: [csv]
   unique_string: [.csv]
@@ -105,6 +107,8 @@ outputs:
   type: file
   label: Processing Provenance
   description: Streaming processing sidecars (*.provenance.json) in /data/out containing source metadata, output path, settings, and summary. Produced when streaming deconvolution writes provenance.
+  cli_tag: "None"
+  default: ""
   optional: true
   format: [json]
   unique_string: [.provenance.json]
