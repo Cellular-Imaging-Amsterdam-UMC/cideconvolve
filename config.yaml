@@ -63,7 +63,7 @@ outputs:
 - name: output_dir
   type: image
   label: Deconvolved Outputs
-  description: Output folder containing OME-TIFF, OME-Zarr, benchmark CSV, and montage results.
+  description: Output folder containing deconvolved OME-TIFF or OME-Zarr images and benchmark montage images.
   cli_tag: --outfolder
   cli_order: 2
   default: directory
@@ -73,16 +73,12 @@ outputs:
   - tif
   - tiff
   - zarr
-  - csv
   - png
-  - json
   unique_string:
   - .ome.tiff
   - .ome.tif
   - .ome.zarr
-  - .csv
   - .png
-  - .json
   folder_name: /data/out
   file_count: multiple
   section_id: outputs
@@ -94,6 +90,32 @@ outputs:
   timepoints: true
   tiled: true
   pyramidal: true
+- name: benchmark_metrics_out
+  type: measurement
+  label: Benchmark Metrics
+  description: Per-method timing and quality metrics in benchmark_metrics_*.csv in /data/out. Produced only in benchmark mode.
+  cli_tag: "None"
+  default: ""
+  optional: true
+  format: [csv]
+  unique_string: [.csv]
+  folder_name: /data/out
+  file_count: multiple
+  section_id: outputs
+  mode: beginner
+- name: processing_provenance_out
+  type: file
+  label: Processing Provenance
+  description: Streaming processing sidecars (*.provenance.json) in /data/out containing source metadata, output path, settings, and summary. Produced when streaming deconvolution writes provenance.
+  cli_tag: "None"
+  default: ""
+  optional: true
+  format: [json]
+  unique_string: [.provenance.json]
+  folder_name: /data/out
+  file_count: multiple
+  section_id: outputs
+  mode: beginner
 display_only: []
 parameters:
 - name: method
