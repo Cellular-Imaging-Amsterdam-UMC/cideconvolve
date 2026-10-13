@@ -93,7 +93,7 @@ outputs:
 - name: benchmark_metrics_out
   type: measurement
   label: Benchmark Metrics
-  description: Per-method timing and quality metrics in benchmark_metrics_*.csv in /data/out. Produced only in benchmark mode. Import as an OMERO table in BIOMERO.
+  description: Per-method timing and quality metrics in benchmark_metrics_*.csv in /data/out. Produced only in benchmark mode.
   optional: true
   format: [csv]
   unique_string: [.csv]
@@ -104,7 +104,7 @@ outputs:
 - name: processing_provenance_out
   type: file
   label: Processing Provenance
-  description: Streaming processing sidecars (*.provenance.json) in /data/out containing source metadata, output path, settings, and summary. Attach as file annotations in BIOMERO when present.
+  description: Streaming processing sidecars (*.provenance.json) in /data/out containing source metadata, output path, settings, and summary. Produced when streaming deconvolution writes provenance.
   optional: true
   format: [json]
   unique_string: [.provenance.json]
